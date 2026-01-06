@@ -20,7 +20,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-_DEFAULT_BASE_URL = "https://weaver-console.nex-agi.com"
+_DEFAULT_BASE_URL = "https://weaver-console.nex-agi.cn"
 
 
 @dataclass(slots=True)

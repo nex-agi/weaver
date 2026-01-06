@@ -53,7 +53,7 @@ class ServiceClient:
         """Initialize ServiceClient.
 
         Args:
-            base_url: Base URL of the Weaver server. Defaults to https://weaver-console.nex-agi.com
+            base_url: Base URL of the Weaver server. Defaults to https://weaver-console.nex-agi.cn
             api_key: API key for authentication (starts with 'sk-'). Get from admin UI at /api-keys
             default_tags: Default tags for sessions
             session_id: Optional existing session ID to reuse
