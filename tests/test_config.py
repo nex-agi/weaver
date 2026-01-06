@@ -24,7 +24,7 @@ from weaver.config import WeaverConfig
 def test_config_defaults():
     """Test that config has sensible defaults."""
     config = WeaverConfig()
-    assert config.base_url == "https://weaver-console.nex-agi.com"
+    assert config.base_url == "https://weaver-console.nex-agi.cn"
     assert config.api_key is None
 
 
