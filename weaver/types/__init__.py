@@ -15,7 +15,7 @@
 """Public type helpers re-exported for ergonomic imports."""
 
 from .datum import Datum
-from .lora_config import LoraConfig
+from .train_config import LoraConfig, FullFTConfig
 from .model_input import ModelInput, ModelInputChunk
 from .optim import AdamParams
 from .sampling import SamplingParams
@@ -24,6 +24,7 @@ from .tensor import TensorData
 __all__ = [
     "AdamParams",
     "Datum",
+    "FullFTConfig",
     "LoraConfig",
     "ModelInput",
     "ModelInputChunk",

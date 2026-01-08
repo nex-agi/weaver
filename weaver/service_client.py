@@ -26,7 +26,7 @@ from ._http import APIClient
 from ._utils import extract_id, lookup_case_insensitive
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
-from .types import LoraConfig
+from .types import LoraConfig, FullFTConfig
 
 if TYPE_CHECKING:
     from .sampling_client import SamplingClient
@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 # Default LoRA configuration
 DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
+
+DEFAULT_FULL_FT_CONFIG = FullFTConfig()
 
 
 class ServiceClient:
@@ -53,7 +55,7 @@ class ServiceClient:
         """Initialize ServiceClient.
 
         Args:
-            base_url: Base URL of the Weaver server. Defaults to https://weaver-console.nex-agi.cn
+            base_url: Base URL of the Weaver server. Defaults to https://weaver-dev.xiaobei.top
             api_key: API key for authentication (starts with 'sk-'). Get from admin UI at /api-keys
             default_tags: Default tags for sessions
             session_id: Optional existing session ID to reuse
@@ -63,6 +65,7 @@ class ServiceClient:
             base_url=base_url,
             api_key=api_key,
         )
+        print(f"config: {self._config}")
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
         self._heartbeat_interval = heartbeat_interval
@@ -159,14 +162,17 @@ class ServiceClient:
         *,
         base_model: str,
         model_seq_id: Optional[int] = None,
+        training_mode: str = "lora",
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
+        full_ft_config: Union[FullFTConfig, Dict[str, Any]] = DEFAULT_FULL_FT_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
     ) -> "TrainingClient":
-        """Create a training model with LoRA configuration.
+        """Create a training model with LoRA or FullFT configuration.
 
         Args:
             base_model: Base model name (e.g., "Qwen/Qwen3-8B")
             model_seq_id: Optional model sequence ID
+            training_mode: Training mode (default: "lora")
             lora_config: LoRA configuration (default: LoraConfig(rank=32) with all layers enabled)
             user_metadata: Optional user metadata
 
@@ -198,12 +204,19 @@ class ServiceClient:
         payload: Dict[str, Any] = {
             "model_seq_id": model_seq_id,
             "base_model": base_model,
+            "training_mode": training_mode,
         }
 
-        if isinstance(lora_config, LoraConfig):
-            payload["lora_config"] = lora_config.to_payload()
+        if training_mode == "lora":
+
+            payload["lora_config"] = lora_config.to_payload() if isinstance(lora_config, LoraConfig) else lora_config
+
+        elif training_mode == "full_ft":
+
+            payload["full_ft_config"] = full_ft_config.to_payload() if isinstance(full_ft_config, FullFTConfig) else full_ft_config
+
         else:
-            payload["lora_config"] = lora_config
+            raise ValueError(f"Invalid training mode: {training_mode}")
 
         if user_metadata is not None:
             payload["user_metadata"] = user_metadata

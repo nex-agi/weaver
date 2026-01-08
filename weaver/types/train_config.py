@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""LoRA configuration helpers."""
+"""Training configuration helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 
 @dataclass(slots=True)
@@ -56,3 +56,25 @@ class LoraConfig:
         if self.seed is not None:
             payload["seed"] = self.seed
         return payload
+
+
+@dataclass(slots=True)
+class FullFTConfig:
+
+    learning_rate: float = 2e-6
+
+    lr_warmup_steps_ratio: float = 0.0
+
+    beta1: float = 0.9
+    beta2: float = 0.999
+
+    weight_decay: float = 0.01
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "learning_rate": self.learning_rate,
+            "lr_warmup_steps_ratio": self.lr_warmup_steps_ratio,
+            "beta1": self.beta1,
+            "beta2": self.beta2,
+            "weight_decay": self.weight_decay,
+        }
