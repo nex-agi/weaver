@@ -26,7 +26,7 @@ from ._http import APIClient
 from ._utils import extract_id, lookup_case_insensitive
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
-from .types import LoraConfig, FullFTConfig
+from .types import LoraConfig
 
 if TYPE_CHECKING:
     from .sampling_client import SamplingClient
@@ -38,8 +38,6 @@ logger = logging.getLogger(__name__)
 
 # Default LoRA configuration
 DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
-
-DEFAULT_FULL_FT_CONFIG = FullFTConfig()
 
 
 class ServiceClient:
@@ -55,7 +53,7 @@ class ServiceClient:
         """Initialize ServiceClient.
 
         Args:
-            base_url: Base URL of the Weaver server. Defaults to https://weaver-dev.xiaobei.top
+            base_url: Base URL of the Weaver server. Defaults to https://weaver-console.nex-agi.cn
             api_key: API key for authentication (starts with 'sk-'). Get from admin UI at /api-keys
             default_tags: Default tags for sessions
             session_id: Optional existing session ID to reuse
@@ -65,7 +63,6 @@ class ServiceClient:
             base_url=base_url,
             api_key=api_key,
         )
-        print(f"config: {self._config}")
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
         self._heartbeat_interval = heartbeat_interval
@@ -164,7 +161,6 @@ class ServiceClient:
         model_seq_id: Optional[int] = None,
         training_mode: str = "lora",
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
-        full_ft_config: Union[FullFTConfig, Dict[str, Any]] = DEFAULT_FULL_FT_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
     ) -> "TrainingClient":
         """Create a training model with LoRA or FullFT configuration.
