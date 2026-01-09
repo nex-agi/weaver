@@ -159,15 +159,18 @@ class ServiceClient:
         *,
         base_model: str,
         model_seq_id: Optional[int] = None,
+        training_mode: str = "lora",
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
     ) -> "TrainingClient":
-        """Create a training model with LoRA configuration.
+        """Create a training model with LoRA or FullFT configuration.
 
         Args:
             base_model: Base model name (e.g., "Qwen/Qwen3-8B")
             model_seq_id: Optional model sequence ID
+            training_mode: Training mode - "lora" or "full_ft" (default: "lora")
             lora_config: LoRA configuration (default: LoraConfig(rank=32) with all layers enabled)
+            full_ft_config: Full fine-tuning config dict (optional, for full_ft mode only)
             user_metadata: Optional user metadata
 
         Returns:
@@ -180,30 +183,27 @@ class ServiceClient:
             # Custom LoRA configuration
             client.create_model(
                 base_model="Qwen/Qwen3-8B",
+                training_mode="lora",
                 lora_config=LoraConfig(rank=16, seed=42)
             )
 
-            # Attention-only LoRA
+            # Full fine-tuning mode
             client.create_model(
                 base_model="Qwen/Qwen3-8B",
-                lora_config=LoraConfig(
-                    rank=32,
-                    train_attn=True,
-                    train_mlp=False,
-                    train_unembed=False,
-                )
+                training_mode="full_ft",
             )
         """
         model_seq_id = model_seq_id or self._next_model_seq()
         payload: Dict[str, Any] = {
             "model_seq_id": model_seq_id,
             "base_model": base_model,
+            "training_mode": training_mode,
         }
 
-        if isinstance(lora_config, LoraConfig):
-            payload["lora_config"] = lora_config.to_payload()
-        else:
-            payload["lora_config"] = lora_config
+        if training_mode == "lora":
+            payload["lora_config"] = (
+                lora_config.to_payload() if isinstance(lora_config, LoraConfig) else lora_config
+            )
 
         if user_metadata is not None:
             payload["user_metadata"] = user_metadata
