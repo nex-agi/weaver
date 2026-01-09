@@ -183,6 +183,7 @@ class ServiceClient:
             # Custom LoRA configuration
             client.create_model(
                 base_model="Qwen/Qwen3-8B",
+                training_mode="lora",
                 lora_config=LoraConfig(rank=16, seed=42)
             )
 
@@ -190,7 +191,6 @@ class ServiceClient:
             client.create_model(
                 base_model="Qwen/Qwen3-8B",
                 training_mode="full_ft",
-                full_ft_config={}
             )
         """
         model_seq_id = model_seq_id or self._next_model_seq()
