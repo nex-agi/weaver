@@ -26,8 +26,14 @@ from . import __version__
 from .config import WeaverConfig
 
 USER_AGENT: str = f"weaver-sdk/{__version__}"  # type: ignore[has-type]
-DEFAULT_TIMEOUT = httpx.Timeout(30.0)
+
+# default timeout is 1 minute
+DEFAULT_TIMEOUT = httpx.Timeout(timeout=60, connect=5.0)
 DEFAULT_MAX_RETRIES = 10
+DEFAULT_CONNECTION_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=20)
+
+INITIAL_RETRY_DELAY = 0.5
+MAX_RETRY_DELAY = 10.0
 
 logger = logging.getLogger(__name__)
 
@@ -56,16 +62,11 @@ class APIClient:
         if config.api_key:
             headers["X-WEAVER-API-KEY"] = config.api_key
 
-        # Use connection limits to avoid stale connections
-        limits = httpx.Limits(
-            max_keepalive_connections=20, max_connections=100, keepalive_expiry=30.0
-        )
-
         self._client = httpx.Client(
             base_url=base_url,
             timeout=timeout or DEFAULT_TIMEOUT,
             headers=headers,
-            limits=limits,
+            limits=DEFAULT_CONNECTION_LIMITS,
         )
         self._max_retries = max_retries
 
@@ -137,7 +138,7 @@ class APIClient:
                     raise
 
                 # Wait before retrying with exponential backoff
-                delay = 0.5 * (2**attempt)  # 0.5s, 1s, 2s, ...
+                delay = min(INITIAL_RETRY_DELAY * (2**attempt), MAX_RETRY_DELAY)
                 logger.debug("Retrying in %.1fs...", delay)
                 time.sleep(delay)
 
@@ -159,7 +160,12 @@ class APIClient:
         )
 
 
-def backoff_delays(initial: float = 0.5, factor: float = 1.5, maximum: float = 5.0):
+def backoff_delays(
+    initial: float = INITIAL_RETRY_DELAY,
+    factor: float = 2.0,
+    maximum: float = MAX_RETRY_DELAY,
+):
+    """Generate exponential backoff delays for retries."""
     delay = initial
     while True:
         yield delay
