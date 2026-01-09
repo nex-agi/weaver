@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training configuration helpers."""
+"""LoRA configuration helpers."""
 
 from __future__ import annotations
 
