@@ -49,6 +49,22 @@ def format_json_output(data: Any) -> None:
     console.print_json(json.dumps(data, default=str, ensure_ascii=False))
 
 
+def format_training_mode(
+    training_mode: Optional[str], lora_config: Optional[Dict[str, Any]] = None
+) -> str:
+    """Format training mode with LoRA rank if applicable."""
+    if not training_mode or training_mode == "N/A":
+        return "N/A"
+
+    # Check if it's a LoRA training mode
+    if training_mode.lower().startswith("lora"):
+        if lora_config and "rank" in lora_config:
+            rank = lora_config["rank"]
+            return f"{training_mode} (rank={rank})"
+
+    return training_mode
+
+
 def handle_error(e: Exception) -> None:
     """Handle and display errors gracefully."""
     if isinstance(e, WeaverAPIError):
@@ -65,15 +81,17 @@ def create_training_runs_table(items: List[Dict[str, Any]]) -> Table:
     table = Table(title="Training Runs", box=box.ROUNDED)
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Base Model", style="green")
-    table.add_column("LoRA Rank", justify="right")
+    table.add_column("Training Mode", style="blue")
     table.add_column("Last Request Time", style="magenta")
 
     for item in items:
-        lora_rank = str(item.get("lora_rank", "N/A")) if item.get("lora_rank") else "N/A"
+        training_mode = format_training_mode(
+            item.get("training_mode", "N/A"), item.get("lora_config")
+        )
         table.add_row(
             str(item.get("id", ""))[:8],
             item.get("base_model", ""),
-            lora_rank,
+            training_mode,
             format_date(item.get("last_request_at")),
         )
 
@@ -86,15 +104,20 @@ def create_models_table(items: List[Dict[str, Any]]) -> Table:
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Session ID", style="blue", no_wrap=True)
     table.add_column("Base Model", style="green")
+    table.add_column("Training Mode", style="blue")
     table.add_column("Status", style="yellow")
     table.add_column("Last Seq", justify="right")
     table.add_column("Created At", style="magenta")
 
     for item in items:
+        training_mode = format_training_mode(
+            item.get("training_mode", "N/A"), item.get("lora_config")
+        )
         table.add_row(
             str(item.get("id", ""))[:8],
             str(item.get("session_id", ""))[:8],
             item.get("base_model", ""),
+            training_mode,
             item.get("status", ""),
             str(item.get("last_seq_id", 0)),
             format_date(item.get("created_at")),
@@ -113,8 +136,8 @@ def display_training_run_detail(data: Dict[str, Any]) -> None:
     console.print(f"[bold]Model Seq ID:[/bold] {data.get('model_seq_id')}")
     console.print(f"[bold]Last Seq ID:[/bold] {data.get('last_seq_id')}")
 
-    if data.get("lora_rank"):
-        console.print(f"[bold]LoRA Rank:[/bold] {data.get('lora_rank')}")
+    training_mode = format_training_mode(data.get("training_mode", "N/A"), data.get("lora_config"))
+    console.print(f"[bold]Training Mode:[/bold] {training_mode}")
 
     console.print(f"[bold]Owner User ID:[/bold] {data.get('owner_user_id', 'N/A')}")
     console.print(f"[bold]Owner Tenant ID:[/bold] {data.get('owner_tenant_id', 'N/A')}")
@@ -148,11 +171,21 @@ def display_model_detail(data: Dict[str, Any]) -> None:
     console.print(f"[bold]Status:[/bold] {data.get('status')}")
     console.print(f"[bold]Model Seq ID:[/bold] {data.get('model_seq_id')}")
     console.print(f"[bold]Last Seq ID:[/bold] {data.get('last_seq_id')}")
+
+    training_mode = format_training_mode(data.get("training_mode", "N/A"), data.get("lora_config"))
+    console.print(f"[bold]Training Mode:[/bold] {training_mode}")
+
     console.print(f"[bold]Created At:[/bold] {format_date(data.get('created_at'))}")
     console.print(f"[bold]Updated At:[/bold] {format_date(data.get('updated_at'))}")
 
+    # Check if training mode starts with "lora" (includes "lora-r8", "lora", etc.)
+    is_lora = (
+        training_mode.lower().startswith("lora")
+        if training_mode and training_mode != "N/A"
+        else False
+    )
     lora_config = data.get("lora_config")
-    if lora_config:
+    if is_lora and lora_config:
         console.print("\n[bold cyan]LoRA Configuration:[/bold cyan]")
         console.print_json(json.dumps(lora_config, indent=2))
 
