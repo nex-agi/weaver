@@ -16,7 +16,7 @@
 
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import click
@@ -31,17 +31,37 @@ console = Console()
 
 
 def format_date(date_str: Any) -> str:
-    """Format ISO date string to readable format."""
+    """Format ISO date string to readable format in local timezone."""
     if not date_str:
         return "N/A"
     try:
         if isinstance(date_str, str):
-            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            # Handle various ISO formats: with Z, with timezone, or without
+            date_str_clean = date_str.replace("Z", "+00:00")
+            # Try parsing with timezone info
+            try:
+                dt = datetime.fromisoformat(date_str_clean)
+            except ValueError:
+                # Fallback: try without timezone (assume UTC)
+                dt = datetime.strptime(date_str.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+                # Assume UTC if no timezone info
+                dt = dt.replace(tzinfo=timezone.utc)
         else:
             dt = date_str
+
+        # Convert to local timezone if it has timezone info
+        if dt.tzinfo is not None:
+            # Use astimezone() without arguments to convert to system local timezone
+            # This automatically uses the system's timezone configuration
+            dt = dt.astimezone()
+
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, AttributeError):
-        return str(date_str)
+        # Fallback: return the first 19 chars (YYYY-MM-DD HH:MM:SS)
+        date_str_str = str(date_str)
+        if len(date_str_str) >= 19 and "T" in date_str_str:
+            return date_str_str[:10] + " " + date_str_str[11:19]
+        return date_str_str
 
 
 def format_json_output(data: Any) -> None:
