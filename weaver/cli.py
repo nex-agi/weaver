@@ -16,7 +16,7 @@
 
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import click
@@ -31,22 +31,58 @@ console = Console()
 
 
 def format_date(date_str: Any) -> str:
-    """Format ISO date string to readable format."""
+    """Format ISO date string to readable format in local timezone."""
     if not date_str:
         return "N/A"
     try:
         if isinstance(date_str, str):
-            dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+            # Handle various ISO formats: with Z, with timezone, or without
+            date_str_clean = date_str.replace("Z", "+00:00")
+            # Try parsing with timezone info
+            try:
+                dt = datetime.fromisoformat(date_str_clean)
+            except ValueError:
+                # Fallback: try without timezone (assume UTC)
+                dt = datetime.strptime(date_str.split(".")[0], "%Y-%m-%dT%H:%M:%S")
+                # Assume UTC if no timezone info
+                dt = dt.replace(tzinfo=timezone.utc)
         else:
             dt = date_str
+
+        # Convert to local timezone if it has timezone info
+        if dt.tzinfo is not None:
+            # Use astimezone() without arguments to convert to system local timezone
+            # This automatically uses the system's timezone configuration
+            dt = dt.astimezone()
+
         return dt.strftime("%Y-%m-%d %H:%M:%S")
     except (ValueError, AttributeError):
-        return str(date_str)
+        # Fallback: return the first 19 chars (YYYY-MM-DD HH:MM:SS)
+        date_str_str = str(date_str)
+        if len(date_str_str) >= 19 and "T" in date_str_str:
+            return date_str_str[:10] + " " + date_str_str[11:19]
+        return date_str_str
 
 
 def format_json_output(data: Any) -> None:
     """Pretty-print JSON data."""
     console.print_json(json.dumps(data, default=str, ensure_ascii=False))
+
+
+def format_training_mode(
+    training_mode: Optional[str], lora_config: Optional[Dict[str, Any]] = None
+) -> str:
+    """Format training mode with LoRA rank if applicable."""
+    if not training_mode or training_mode == "N/A":
+        return "N/A"
+
+    # Check if it's a LoRA training mode
+    if training_mode.lower().startswith("lora"):
+        if lora_config and "rank" in lora_config:
+            rank = lora_config["rank"]
+            return f"{training_mode} (rank={rank})"
+
+    return training_mode
 
 
 def handle_error(e: Exception) -> None:
@@ -65,15 +101,17 @@ def create_training_runs_table(items: List[Dict[str, Any]]) -> Table:
     table = Table(title="Training Runs", box=box.ROUNDED)
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Base Model", style="green")
-    table.add_column("LoRA Rank", justify="right")
+    table.add_column("Training Mode", style="blue")
     table.add_column("Last Request Time", style="magenta")
 
     for item in items:
-        lora_rank = str(item.get("lora_rank", "N/A")) if item.get("lora_rank") else "N/A"
+        training_mode = format_training_mode(
+            item.get("training_mode", "N/A"), item.get("lora_config")
+        )
         table.add_row(
             str(item.get("id", ""))[:8],
             item.get("base_model", ""),
-            lora_rank,
+            training_mode,
             format_date(item.get("last_request_at")),
         )
 
@@ -86,15 +124,20 @@ def create_models_table(items: List[Dict[str, Any]]) -> Table:
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Session ID", style="blue", no_wrap=True)
     table.add_column("Base Model", style="green")
+    table.add_column("Training Mode", style="blue")
     table.add_column("Status", style="yellow")
     table.add_column("Last Seq", justify="right")
     table.add_column("Created At", style="magenta")
 
     for item in items:
+        training_mode = format_training_mode(
+            item.get("training_mode", "N/A"), item.get("lora_config")
+        )
         table.add_row(
             str(item.get("id", ""))[:8],
             str(item.get("session_id", ""))[:8],
             item.get("base_model", ""),
+            training_mode,
             item.get("status", ""),
             str(item.get("last_seq_id", 0)),
             format_date(item.get("created_at")),
@@ -113,8 +156,8 @@ def display_training_run_detail(data: Dict[str, Any]) -> None:
     console.print(f"[bold]Model Seq ID:[/bold] {data.get('model_seq_id')}")
     console.print(f"[bold]Last Seq ID:[/bold] {data.get('last_seq_id')}")
 
-    if data.get("lora_rank"):
-        console.print(f"[bold]LoRA Rank:[/bold] {data.get('lora_rank')}")
+    training_mode = format_training_mode(data.get("training_mode", "N/A"), data.get("lora_config"))
+    console.print(f"[bold]Training Mode:[/bold] {training_mode}")
 
     console.print(f"[bold]Owner User ID:[/bold] {data.get('owner_user_id', 'N/A')}")
     console.print(f"[bold]Owner Tenant ID:[/bold] {data.get('owner_tenant_id', 'N/A')}")
@@ -148,11 +191,21 @@ def display_model_detail(data: Dict[str, Any]) -> None:
     console.print(f"[bold]Status:[/bold] {data.get('status')}")
     console.print(f"[bold]Model Seq ID:[/bold] {data.get('model_seq_id')}")
     console.print(f"[bold]Last Seq ID:[/bold] {data.get('last_seq_id')}")
+
+    training_mode = format_training_mode(data.get("training_mode", "N/A"), data.get("lora_config"))
+    console.print(f"[bold]Training Mode:[/bold] {training_mode}")
+
     console.print(f"[bold]Created At:[/bold] {format_date(data.get('created_at'))}")
     console.print(f"[bold]Updated At:[/bold] {format_date(data.get('updated_at'))}")
 
+    # Check if training mode starts with "lora" (includes "lora-r8", "lora", etc.)
+    is_lora = (
+        training_mode.lower().startswith("lora")
+        if training_mode and training_mode != "N/A"
+        else False
+    )
     lora_config = data.get("lora_config")
-    if lora_config:
+    if is_lora and lora_config:
         console.print("\n[bold cyan]LoRA Configuration:[/bold cyan]")
         console.print_json(json.dumps(lora_config, indent=2))
 
