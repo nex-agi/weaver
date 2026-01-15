@@ -35,7 +35,7 @@ disable=
     import-outside-toplevel
 
 [FORMAT]
-max-line-length=100
+max-line-length=120
 
 [BASIC]
 good-names=i,j,k,ex,_,id

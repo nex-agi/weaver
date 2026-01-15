@@ -159,7 +159,7 @@ class ServiceClient:
         *,
         base_model: str,
         model_seq_id: Optional[int] = None,
-        training_mode: str = "lora",
+        training_mode: Optional[str] = None,
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
     ) -> "TrainingClient":
@@ -168,7 +168,7 @@ class ServiceClient:
         Args:
             base_model: Base model name (e.g., "Qwen/Qwen3-8B")
             model_seq_id: Optional model sequence ID
-            training_mode: Training mode - "lora" or "full_ft" (default: "lora")
+            training_mode: Training mode - "lora" or "full_ft" (default: None -> server defaults to "lora")
             lora_config: LoRA configuration (default: LoraConfig(rank=32) with all layers enabled)
             full_ft_config: Full fine-tuning config dict (optional, for full_ft mode only)
             user_metadata: Optional user metadata
@@ -197,10 +197,13 @@ class ServiceClient:
         payload: Dict[str, Any] = {
             "model_seq_id": model_seq_id,
             "base_model": base_model,
-            "training_mode": training_mode,
         }
 
-        if training_mode == "lora":
+        if training_mode is not None:
+            payload["training_mode"] = training_mode
+
+        # If training_mode is omitted (None), the server defaults to "lora", so include lora_config.
+        if training_mode is None or training_mode == "lora":
             payload["lora_config"] = (
                 lora_config.to_payload() if isinstance(lora_config, LoraConfig) else lora_config
             )
