@@ -75,6 +75,7 @@ class ServiceClient:
         self._model_seq_counter = 1
         self._sampling_seq_counter = 1
         self._operation_seq_by_model: Dict[str, int] = {}
+        self._created_models: List[str] = []  # Track created model IDs for cleanup
 
     def __enter__(self) -> "ServiceClient":
         self.connect()
@@ -99,10 +100,43 @@ class ServiceClient:
             self.ensure_session()
         self._start_heartbeat()
 
+    def terminate_model(
+        self,
+        model_id: str,
+        instance_types: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Terminate trainer and/or inference instances for a model.
+
+        Args:
+            model_id: The model ID to terminate
+            instance_types: List of instance types to terminate (e.g., ["trainer", "inference"]).
+                          Defaults to both if not specified.
+
+        Returns:
+            Dictionary with termination results for each instance type
+        """
+        payload: Dict[str, Any] = {}
+        if instance_types is not None:
+            payload["instance_types"] = instance_types
+
+        return self.http.post(
+            f"/api/v1/models/{model_id}/terminate",
+            json=payload if payload else None,
+        )  # type: ignore[return-value]
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+
+        # Terminate all created models before closing
+        for model_id in self._created_models:
+            try:
+                logger.debug("Terminating model %s during cleanup", model_id)
+                self.terminate_model(model_id)
+            except Exception as exc:  # pragma: no cover - best effort cleanup
+                logger.debug("Failed to terminate model %s: %s", model_id, exc)
+
         if self._heartbeat_thread:
             self._heartbeat_stop_event.set()
             self._heartbeat_thread.join(timeout=5.0)
@@ -216,6 +250,10 @@ class ServiceClient:
             json=payload,
         )
         model_id = extract_id(response)
+
+        # Track created models for cleanup
+        self._created_models.append(model_id)
+
         from .training_client import TrainingClient  # avoid circular import
 
         return TrainingClient(

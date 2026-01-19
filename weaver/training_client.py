@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Sequence, overload
 
 from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
@@ -26,12 +26,11 @@ from .service_client import ServiceClient
 from .types import AdamParams, Datum
 
 if TYPE_CHECKING:
+    from typing import Literal
+
     from .sampling_client import SamplingClient
 
 logger = logging.getLogger(__name__)
-
-if TYPE_CHECKING:
-    from .sampling_client import SamplingClient
 
 
 class TrainingClient:
@@ -48,6 +47,26 @@ class TrainingClient:
 
     def _serialize_data(self, data: Sequence[Datum]) -> Sequence[Dict[str, Any]]:
         return [datum.to_payload() for datum in data]
+
+    @overload
+    def forward_backward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        *,
+        loss_fn_config: Mapping[str, float] | None = None,
+        wait: Literal[True] = True,
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    def forward_backward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        *,
+        loss_fn_config: Mapping[str, float] | None = None,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
 
     def forward_backward(
         self,
@@ -73,6 +92,12 @@ class TrainingClient:
         )
         return handle.result() if wait else handle
 
+    @overload
+    def optim_step(self, params: AdamParams, *, wait: Literal[True] = True) -> Dict[str, Any]: ...
+
+    @overload
+    def optim_step(self, params: AdamParams, *, wait: Literal[False]) -> OperationHandle: ...
+
     def optim_step(
         self, params: AdamParams, *, wait: bool = True
     ) -> OperationHandle | Dict[str, Any]:
@@ -86,6 +111,22 @@ class TrainingClient:
             {"payload": payload},
         )
         return handle.result() if wait else handle
+
+    @overload
+    def save_weights_for_sampler(
+        self,
+        *,
+        name: str | None = None,
+        wait: Literal[True] = True,
+    ) -> str: ...
+
+    @overload
+    def save_weights_for_sampler(
+        self,
+        *,
+        name: str | None = None,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
 
     def save_weights_for_sampler(
         self,
@@ -122,6 +163,22 @@ class TrainingClient:
         if not model_path:
             raise RuntimeError("Export response missing model path")
         return str(model_path)
+
+    @overload
+    def save_weights_and_get_sampling_client(
+        self,
+        *,
+        name: str | None = None,
+        wait: Literal[True] = True,
+    ) -> "SamplingClient": ...
+
+    @overload
+    def save_weights_and_get_sampling_client(
+        self,
+        *,
+        name: str | None = None,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
 
     def save_weights_and_get_sampling_client(
         self,
@@ -182,3 +239,15 @@ class TrainingClient:
 
     def get_tokenizer(self):  # Backwards compatible accessor
         return self.tokenizer
+
+    def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:
+        """Terminate trainer and/or inference instances for this model.
+
+        Args:
+            instance_types: List of instance types to terminate (e.g., ["trainer", "inference"]).
+                          Defaults to both if not specified.
+
+        Returns:
+            Dictionary with termination results for each instance type
+        """
+        return self._service.terminate_model(self.model_id, instance_types)
