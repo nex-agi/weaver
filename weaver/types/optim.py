@@ -25,7 +25,8 @@ class AdamParams:
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
-    grad_clip_norm: float = 0.0
+    weight_decay: float = 1e-2
+    grad_clip_norm: float = 1.0
 
     def to_payload(self) -> dict[str, float]:
         return {
@@ -33,5 +34,6 @@ class AdamParams:
             "beta1": self.beta1,
             "beta2": self.beta2,
             "eps": self.eps,
+            "weight_decay": self.weight_decay,
             "grad_clip_norm": self.grad_clip_norm,
         }
