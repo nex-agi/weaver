@@ -23,7 +23,7 @@ from typing import Any, Mapping, MutableMapping
 import re
 
 import httpx
-from opentelemetry import baggage, trace
+from opentelemetry import baggage, context, trace
 from opentelemetry.propagate import inject
 from opentelemetry.trace import Status, StatusCode
 
@@ -112,7 +112,7 @@ class APIClient:
         model_id = self._extract_model_id_from_path(path)
         
         # Set model_id in baggage if found (propagates automatically)
-        ctx = trace.get_current()
+        ctx = context.get_current()
         if model_id:
             ctx = baggage.set_baggage("model_id", model_id, context=ctx)
         
