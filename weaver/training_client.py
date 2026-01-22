@@ -35,12 +35,19 @@ logger = logging.getLogger(__name__)
 
 class TrainingClient:
     def __init__(
-        self, *, service: ServiceClient, model_id: str, base_model: str, session_id: str
+        self,
+        *,
+        service: ServiceClient,
+        model_id: str,
+        base_model: str,
+        session_id: str,
+        tokenizer_path: str | None = None,
     ) -> None:
         self._service = service
         self.model_id = model_id
         self.base_model = base_model
         self.session_id = session_id
+        self.tokenizer_path = tokenizer_path
 
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
@@ -222,12 +229,14 @@ class TrainingClient:
                 base_model=self.base_model,
                 model_id=self.model_id,
                 sampling_session_id=sampling_session_id,
+                tokenizer_path=self.tokenizer_path,
             )
         if model_path:
             return self._service.get_sampling_client(
                 model_path=str(model_path),
                 base_model=self.base_model,
                 model_id=self.model_id,
+                tokenizer_path=self.tokenizer_path,
             )
         raise RuntimeError("Export response missing sampling session id or model path")
 
@@ -235,7 +244,9 @@ class TrainingClient:
     def tokenizer(self):  # type: ignore[misc]
         from transformers import AutoTokenizer
 
-        return AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True)
+        # Use custom tokenizer_path if provided, otherwise use base_model
+        model_name_or_path = self.tokenizer_path if self.tokenizer_path else self.base_model
+        return AutoTokenizer.from_pretrained(model_name_or_path, trust_remote_code=True)
 
     def get_tokenizer(self):  # Backwards compatible accessor
         return self.tokenizer

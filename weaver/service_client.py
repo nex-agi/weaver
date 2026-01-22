@@ -256,11 +256,24 @@ class ServiceClient:
 
         from .training_client import TrainingClient  # avoid circular import
 
+        # Extract tokenizer_path from response if provided by server
+        tokenizer_path = lookup_case_insensitive(response, "tokenizer_path")
+
+        # If not in response, try to get it from supported models config
+        if not tokenizer_path:
+            model_config = self.get_supported_model_config(base_model)
+            if model_config:
+                config = model_config.get("config", {})
+                resource = config.get("resource", {})
+                tokenizer_config = resource.get("tokenizer", {})
+                tokenizer_path = tokenizer_config.get("path")
+
         return TrainingClient(
             service=self,
             model_id=model_id,
             base_model=lookup_case_insensitive(response, "base_model") or base_model,
             session_id=self.session_id,
+            tokenizer_path=tokenizer_path,
         )
 
     def _next_model_seq(self) -> int:
@@ -292,6 +305,7 @@ class ServiceClient:
         sampling_session_seq_id: Optional[int] = None,
         sampling_session_id: Optional[str] = None,
         model_id: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
     ) -> "SamplingClient":
         from .sampling_client import SamplingClient  # local import to avoid cycles
 
@@ -312,12 +326,25 @@ class ServiceClient:
                 json=body,
             )
             sampling_session_id = extract_id(session)
+            # Extract tokenizer_path from response if provided by server
+            if tokenizer_path is None:
+                tokenizer_path = lookup_case_insensitive(session, "tokenizer_path")
+
+            # If still not found and base_model is provided, try to get it from supported models config
+            if tokenizer_path is None and base_model:
+                model_config = self.get_supported_model_config(base_model)
+                if model_config:
+                    config = model_config.get("config", {})
+                    resource = config.get("resource", {})
+                    tokenizer_config = resource.get("tokenizer", {})
+                    tokenizer_path = tokenizer_config.get("path")
         return SamplingClient(
             service=self,
             sampling_session_id=sampling_session_id,
             base_model=base_model,
             model_path=model_path,
             model_id=model_id,
+            tokenizer_path=tokenizer_path,
         )
 
     def get_sampling_client(
@@ -327,6 +354,7 @@ class ServiceClient:
         base_model: Optional[str] = None,
         model_id: Optional[str] = None,
         sampling_session_id: Optional[str] = None,
+        tokenizer_path: Optional[str] = None,
     ) -> "SamplingClient":
         """Create a sampling client from an exported model path.
 
@@ -338,6 +366,7 @@ class ServiceClient:
             base_model: Base model name (e.g., "llama-3-8b")
             model_id: Optional model ID to associate with this sampling session
             sampling_session_id: Optional existing sampling session ID to reuse
+            tokenizer_path: Optional custom tokenizer path
 
         Returns:
             Configured SamplingClient ready for inference
@@ -347,6 +376,7 @@ class ServiceClient:
             base_model=base_model,
             model_id=model_id,
             sampling_session_id=sampling_session_id,
+            tokenizer_path=tokenizer_path,
         )
 
     def enqueue_operation(self, path: str, payload: Dict[str, Any]) -> OperationHandle:
@@ -372,6 +402,30 @@ class ServiceClient:
                 if name:
                     names.append(str(name))
         return names
+
+    def get_supported_model_config(self, base_model: str) -> Optional[Dict[str, Any]]:
+        """Get configuration for a specific supported model.
+
+        Args:
+            base_model: Base model name to look up
+
+        Returns:
+            Model configuration dict if found, None otherwise
+        """
+        payload = self.http.get("/api/v1/supported-models")
+        if not isinstance(payload, dict):
+            return None
+        items = payload.get("items")
+        if not isinstance(items, list):
+            return None
+
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = lookup_case_insensitive(item, "name")
+            if name and str(name) == base_model:
+                return item
+        return None
 
     def list_training_runs(
         self,

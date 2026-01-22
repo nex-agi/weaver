@@ -35,12 +35,14 @@ class SamplingClient:
         base_model: str | None = None,
         model_path: str | None = None,
         model_id: str | None = None,
+        tokenizer_path: str | None = None,
     ) -> None:
         self._service = service
         self.sampling_session_id = sampling_session_id
         self.base_model = base_model
         self.model_path = model_path
         self.model_id = model_id
+        self.tokenizer_path = tokenizer_path
         self._tokenizer: PreTrainedTokenizer | None = None
 
     def sample(
@@ -82,11 +84,16 @@ class SamplingClient:
     def _ensure_tokenizer(self) -> PreTrainedTokenizer:
         if self._tokenizer is not None:
             return self._tokenizer
-        base_model = self._ensure_base_model()
         from transformers import AutoTokenizer
 
+        # Use custom tokenizer_path if provided, otherwise use base_model
+        if self.tokenizer_path:
+            model_name_or_path = self.tokenizer_path
+        else:
+            model_name_or_path = self._ensure_base_model()
+
         self._tokenizer = AutoTokenizer.from_pretrained(
-            base_model,
+            model_name_or_path,
             trust_remote_code=True,
         )
         return self._tokenizer
