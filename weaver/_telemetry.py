@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 
 # Global tracer instance
 _tracer: Tracer | None = None
-_initialized = False
+_INITIALIZED = False
 
 
 def init_tracer(service_name: str = "weaver-sdk") -> Tracer:
@@ -59,9 +59,9 @@ def init_tracer(service_name: str = "weaver-sdk") -> Tracer:
     Note:
         This function is called automatically by the SDK. Users do not need to call it.
     """
-    global _tracer, _initialized
+    global _tracer, _INITIALIZED  # pylint: disable=global-statement
 
-    if _initialized and _tracer is not None:
+    if _INITIALIZED and _tracer is not None:
         return _tracer
 
     # Create resource with service information
@@ -79,7 +79,7 @@ def init_tracer(service_name: str = "weaver-sdk") -> Tracer:
 
     # Get tracer instance
     _tracer = trace.get_tracer(__name__)
-    _initialized = True
+    _INITIALIZED = True
 
     logger.debug("Weaver SDK tracer initialized (trace context generation enabled)")
 
@@ -96,4 +96,3 @@ def get_tracer() -> Tracer:
     if _tracer is None:
         return init_tracer()
     return _tracer
-
