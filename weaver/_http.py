@@ -17,12 +17,17 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Mapping, MutableMapping
 
 import httpx
+from opentelemetry import baggage, context, trace
+from opentelemetry.propagate import inject
+from opentelemetry.trace import Status, StatusCode
 
 from . import __version__
+from ._telemetry import get_tracer
 from .config import WeaverConfig
 
 USER_AGENT: str = f"weaver-sdk/{__version__}"  # type: ignore[has-type]
@@ -70,6 +75,9 @@ class APIClient:
         )
         self._max_retries = max_retries
 
+        # Initialize tracer for distributed tracing
+        self._tracer = get_tracer()
+
     def __enter__(self) -> "APIClient":
         return self
 
@@ -99,22 +107,112 @@ class APIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
     ) -> Any:
+        # Extract model_id from path if present (e.g., /api/v1/models/{model_id}/...)
+        model_id = self._extract_model_id_from_path(path)
+
+        # Set model_id in baggage if found (propagates automatically)
+        ctx = context.get_current()
+        if model_id:
+            ctx = baggage.set_baggage("model_id", model_id, context=ctx)
+
+        # Create a span for this API call with context
+        with self._tracer.start_as_current_span(
+            f"weaver.{method.lower()}",
+            context=ctx,
+            kind=trace.SpanKind.CLIENT,
+        ) as span:
+            # Add span attributes
+            span.set_attribute("http.method", method)
+            span.set_attribute("http.url", path)
+            span.set_attribute("http.user_agent", USER_AGENT)
+
+            # Add model_id as span attribute for easy filtering in APMPlus
+            if model_id:
+                span.set_attribute("model_id", model_id)
+                span.set_attribute("weaver.model_id", model_id)  # Alternative key
+
+            # Log trace_id and model_id for debugging
+            span_context = span.get_span_context()
+            if span_context.is_valid:
+                trace_id = format(span_context.trace_id, "032x")
+                if model_id:
+                    logger.debug("API request trace_id: %s, model_id: %s", trace_id, model_id)
+                else:
+                    logger.debug("API request trace_id: %s", trace_id)
+
+            # Execute the request with retries
+            return self._request_with_retries(span, method, path, params=params, json=json)
+
+    def _extract_model_id_from_path(self, path: str) -> str | None:
+        """
+        Extract model_id from API path.
+
+        Patterns:
+        - /api/v1/models/{model_id}/...
+        - /api/v1/models/{model_id}
+
+        Returns:
+            model_id if found, None otherwise
+        """
+        # Match /api/v1/models/{model_id}/... or /api/v1/models/{model_id}
+        match = re.match(r"/api/v\d+/models/([^/]+)", path)
+        if match:
+            return match.group(1)
+        return None
+
+    def _request_with_retries(
+        self,
+        span: trace.Span,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json: Any = None,
+    ) -> Any:
+        """Execute HTTP request with retry logic and trace context injection."""
         last_exception = None
 
         for attempt in range(self._max_retries):
             try:
-                response = self._client.request(method, path, params=params, json=json)
+                # Inject trace context into HTTP headers
+                headers = dict(self._client.headers or {})
+                inject(headers)  # Adds 'traceparent' header with trace context
+
+                # Make the HTTP request
+                response = self._client.request(
+                    method, path, params=params, json=json, headers=headers
+                )
+
+                # Record response status
+                span.set_attribute("http.status_code", response.status_code)
+
                 if response.is_success:
+                    span.set_status(Status(StatusCode.OK))
                     if response.status_code == httpx.codes.NO_CONTENT:
                         return None
                     if not response.content:
                         return None
                     return response.json()
+
+                # Non-success status
+                span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
                 self._raise_error(response)
+
+            except WeaverAPIError:
+                # Don't retry WeaverAPIError (4xx errors are not retryable)
+                span.set_status(Status(StatusCode.ERROR, "API error"))
+                raise
 
             except Exception as e:
                 last_exception = e
                 is_last_attempt = attempt == self._max_retries - 1
+
+                # Record error in span
+                span.record_exception(e)
+                if is_last_attempt:
+                    span.set_status(
+                        Status(StatusCode.ERROR, f"Failed after {self._max_retries} retries")
+                    )
 
                 # Log the error
                 logger.debug(

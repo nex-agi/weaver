@@ -34,7 +34,10 @@ dependencies = [
   "transformers>=4.40,<5",
   "typing-extensions>=4.8,<5",
   "click>=8.1,<9",
-  "rich>=13.0,<14"
+  "rich>=13.0,<14",
+  # OpenTelemetry for distributed tracing (lightweight, no exporters)
+  "opentelemetry-api>=1.22.0,<2.0",
+  "opentelemetry-sdk>=1.22.0,<2.0",
 ]
 
 [project.optional-dependencies]
