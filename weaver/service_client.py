@@ -321,10 +321,30 @@ class ServiceClient:
             if model_id:
                 body["model_id"] = model_id
 
-            session = self.http.post(
+            resp = self.http.post(
                 f"/api/v1/sessions/{self.session_id}/sampling-sessions",
                 json=body,
             )
+
+            # Handle async sync_weights response (202 Accepted):
+            # Response shape: {"sampling_session": {...}, "sync_operation": {...}}
+            sync_op_payload = (
+                lookup_case_insensitive(resp, "sync_operation") if isinstance(resp, dict) else None
+            )
+            if sync_op_payload and isinstance(sync_op_payload, dict):
+                session = lookup_case_insensitive(resp, "sampling_session") or {}
+                # Wait for the background sync_weights to finish
+                sync_handle = OperationHandle.from_payload(self.http, sync_op_payload)
+                logger.info(
+                    "Waiting for background weights sync (operation %s)...",
+                    sync_handle.operation_id,
+                )
+                sync_handle.wait()
+                logger.info("Weights sync completed.")
+            else:
+                # Standard 201 response: body is the SamplingSession directly
+                session = resp
+
             sampling_session_id = extract_id(session)
             # Extract tokenizer_path from response if provided by server
             if tokenizer_path is None:
