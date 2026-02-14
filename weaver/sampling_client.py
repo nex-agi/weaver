@@ -72,14 +72,39 @@ class SamplingClient:
         raw_result = handle.result()
         return self._normalize_sample_result(raw_result)  # type: ignore[return-value]
 
-    def compute_logprobs(self, *, prompt: ModelInput) -> List[float | None]:
-        body = {"prompt": prompt.to_payload()}
+    def compute_logprobs(
+        self,
+        *,
+        prompt: ModelInput,
+        router_replay_r2: bool = False,
+    ) -> List[float | None] | Dict[str, Any]:
+        """Compute log-probabilities for the given prompt.
+
+        Args:
+            prompt: The model input (tokens) to compute logprobs for.
+            router_replay_r2: If True, request expert IDs (fwd_expert_replay_data) for MoE
+                router replay. When True, returns a dict with "logprobs" and optionally
+                "fwd_expert_replay_data" (for use with forward_backward).
+
+        Returns:
+            When router_replay_r2=False: List[float|None] of per-token logprobs.
+            When router_replay_r2=True: Dict with "logprobs" and "fwd_expert_replay_data"
+                (None if not MoE or not available).
+        """
+        body: Dict[str, Any] = {"prompt": prompt.to_payload()}
+        if router_replay_r2:
+            body["router_replay_r2"] = True
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/logprobs",
             body,
         )
         payload = handle.result()
-        return self._normalize_prompt_logprobs(prompt, payload)
+        logprobs = self._normalize_prompt_logprobs(prompt, payload)
+        if not router_replay_r2:
+            return logprobs
+        result = self._result_payload(payload)
+        fwd_expert_replay_data = result.get("fwd_expert_replay_data")
+        return {"logprobs": logprobs, "fwd_expert_replay_data": fwd_expert_replay_data}
 
     def _ensure_tokenizer(self) -> PreTrainedTokenizer:
         if self._tokenizer is not None:
