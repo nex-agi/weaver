@@ -1,9 +1,9 @@
 ---
 name: code-review
-description: Review code changes against Weaver SDK project standards before committing. Use when reviewing code or preparing commits.
+description: Review code changes against Weaver SDK project standards before committing. Works in any worktree.
 ---
 
-# Weaver SDK Code Review Skill
+# Weaver SDK Code Review Skill (Worktree-Aware)
 
 ## How to Use
 
@@ -11,18 +11,20 @@ description: Review code changes against Weaver SDK project standards before com
 2. Invoke Task tool with `subagent_type="code-review"` (specialized agent)
 3. Agent reviews all changes against project standards
 
-## Review Process
+## Prerequisites
 
-1. **Get changes**: Run `git diff` to see all staged and unstaged changes
-2. **Analyze each file** against the review checklist
-3. **Report findings**: Provide clear, actionable feedback
+Verify you're in the correct worktree:
+```bash
+git rev-parse --show-toplevel
+git branch --show-current
+```
 
 ## Review Checklist
 
 ### 1. License Headers
 
 - [ ] Apache 2.0 header present in all new/modified `.py` files
-- [ ] Header matches exact format from `CONTRIBUTING.md`
+- [ ] Header matches exact format from `.claude/rules/core-development.md`
 
 ### 2. Python Code Quality
 
@@ -41,7 +43,7 @@ description: Review code changes against Weaver SDK project standards before com
 ### 4. Error Handling
 
 - [ ] Custom exceptions used (`WeaverAPIError`, `ValueError`)
-- [ ] Error messages include context (what was received vs expected)
+- [ ] Error messages include context
 - [ ] No bare `except:` clauses
 
 ### 5. Commit Content
@@ -49,15 +51,6 @@ description: Review code changes against Weaver SDK project standards before com
 - [ ] Only relevant changes included
 - [ ] No build artifacts (`dist/`, `*.egg-info`)
 - [ ] No sensitive information (tokens, API keys)
-- [ ] No temporary test files
-
-## Common Issues to Flag
-
-- **Missing license header** in new files
-- **Legacy type syntax**: `List[int]` instead of `list[int]`
-- **Missing type hints** on public methods
-- **Bare print()** for debugging
-- **Hardcoded URLs or credentials**
 
 ## Output Format
 
@@ -74,8 +67,3 @@ description: Review code changes against Weaver SDK project standards before com
 ### Approved Items
 [What looks good]
 ```
-
-## Related Skills
-
-- **`testing`** - Lint and test verification (runs in parallel)
-- **`git-commit`** - Complete commit workflow

@@ -1,13 +1,22 @@
 ---
 name: git-commit
-description: Complete git commit workflow for Weaver SDK including pre-commit review, staging, message generation, and verification. Use when creating commits or preparing changes for commit.
+description: Complete git commit workflow in a worktree. Includes review, staging, and message generation.
 ---
 
-# Weaver SDK Git Commit Workflow
+# Git Commit Workflow (Worktree-Aware)
 
 ## Prerequisites
 
-**Check what changed to determine which agents to run:**
+Verify you're in a worktree (not main clone):
+```bash
+# Should show a worktree path, not the main repo
+git rev-parse --show-toplevel
+git worktree list
+```
+
+## Workflow
+
+### Step 1: Analyze Changes
 
 ```bash
 git diff --name-only
@@ -23,64 +32,50 @@ git diff --cached --name-only
 | Config (`.yaml`, `.toml`, `.github/`) | Yes | Skip |
 | Mixed (code + docs/config) | Yes | Yes |
 
-**Launch appropriate agents IN PARALLEL:**
+### Step 2: Run Review & Tests
 
-- **`code-reviewer`** - ALWAYS run for all changes
-- **`testing`** - ONLY run if `.py` files changed
+Launch code-review and testing as appropriate (**in parallel** when possible).
 
-## Workflow
+### Step 3: Address Issues
 
-1. Analyze changed files to determine testing needs
-2. Launch code-review (always) and testing (if needed) in parallel
-3. Wait for agents to complete
-4. Address any issues found
-5. Stage changes
-6. Generate commit message
-7. Commit and verify
+Fix any problems found by review or testing before proceeding.
 
-## Stage Changes
+### Step 4: Stage Changes
 
 ```bash
-git add path/to/file1.py path/to/file2.py
+git add path/to/changed/files
 git diff --staged  # Review
 ```
 
-**Never stage**: Build artifacts (`dist/`, `*.egg-info`), `.env`, `__pycache__/`
+**Never stage:** Build artifacts (`dist/`, `*.egg-info`), `.env`, `__pycache__/`, coverage files
 
-## Commit Message Format
+### Step 5: Commit
 
-**Structure**: `type(scope): description` (72 chars max)
+Format: `type(scope): description` (72 chars max)
 
 **Types**: feat, fix, refactor, test, docs, style, chore, perf
 **Scope**: Module/component (client, types, cli, http, sampling)
-**Description**: Present tense, action verb, no period
+
+```bash
+git commit -m "type(scope): description
+
+Detailed explanation if needed.
+
+Fixes #ISSUE_NUMBER"
+```
 
 **Good examples:**
 ```text
 feat(client): add async export-sampler support
 fix(http): handle connection timeout gracefully
 test(types): add model input serialization tests
-docs(readme): update installation instructions
 ```
 
-## Co-Author Policy
+**No AI co-author lines.**
 
-**NEVER add AI co-author lines.** Commits reflect human authorship only.
-
-## Post-Commit Verification
+### Step 6: Verify
 
 ```bash
-git show HEAD              # View commit
-git log -1                 # Check message
-git show HEAD --name-only  # Verify files
+git show HEAD --name-only
+git log -1
 ```
-
-## Checklist
-
-- [ ] Changed files analyzed
-- [ ] Code review completed (license headers checked)
-- [ ] Tests passed (if code changed)
-- [ ] Only relevant files staged
-- [ ] No build artifacts or secrets
-- [ ] Message format: `type(scope): description` (72 chars, present tense)
-- [ ] No AI co-authors

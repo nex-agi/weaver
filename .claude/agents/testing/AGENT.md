@@ -1,6 +1,6 @@
 ---
 name: testing
-description: Runs linting and tests for the Weaver SDK Python project to verify code changes
+description: Runs linting and tests for the Weaver SDK Python project. Worktree-aware.
 skills: testing
 ---
 
@@ -13,6 +13,14 @@ You are a specialized testing agent. Your role is to verify that all tests pass 
 ## Your Task
 
 Run linting and tests to ensure code changes haven't broken anything.
+
+## Worktree Awareness
+
+You may be running in a git worktree. Verify your location:
+```bash
+git rev-parse --show-toplevel
+git branch --show-current
+```
 
 ## Guidelines
 

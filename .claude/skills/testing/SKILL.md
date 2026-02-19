@@ -1,15 +1,23 @@
 ---
 name: testing
-description: Run linting and tests for Weaver SDK. Use when running tests, checking coverage, or verifying changes.
+description: Run linting and tests for Weaver SDK. Works in any worktree.
 ---
 
-# Weaver SDK Testing Skill
+# Weaver SDK Testing Skill (Worktree-Aware)
 
 ## How to Use
 
 1. Read agent instructions at `.claude/agents/testing/AGENT.md`
 2. Invoke Task tool with `subagent_type="testing"` (specialized agent)
 3. Agent will lint and run all tests
+
+## Prerequisites
+
+Verify you're in the correct worktree:
+```bash
+git rev-parse --show-toplevel
+git branch --show-current
+```
 
 ## Testing Workflow
 
@@ -41,15 +49,6 @@ pytest tests/test_config.py::test_config_defaults -v
 
 # With coverage
 make test-cov
-```
-
-## Test Patterns
-
-```python
-def test_service_client_initialization():
-    """Test ServiceClient can be initialized with custom config."""
-    client = ServiceClient(base_url="https://test.example.com")
-    assert client._config.base_url == "https://test.example.com"
 ```
 
 ## Lint Commands
@@ -90,8 +89,3 @@ python tests/lint/check_license_header.py
 ### Recommendations
 [Actions to fix issues]
 ```
-
-## Related Skills
-
-- **`code-review`** - Code review (runs in parallel)
-- **`git-commit`** - Complete commit workflow

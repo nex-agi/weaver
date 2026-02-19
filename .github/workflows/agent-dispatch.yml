@@ -1,0 +1,194 @@
+name: Agent Dispatch
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  parse-command:
+    # Only run on issue comments (not PR comments), from non-bots, starting with /
+    if: |
+      !github.event.issue.pull_request &&
+      !contains(github.event.comment.user.login, '[bot]') &&
+      startsWith(github.event.comment.body, '/')
+    runs-on: ubuntu-latest
+    outputs:
+      command: ${{ steps.parse.outputs.command }}
+      args: ${{ steps.parse.outputs.args }}
+      issue_number: ${{ steps.parse.outputs.issue_number }}
+      issue_title: ${{ steps.parse.outputs.issue_title }}
+      actor: ${{ steps.parse.outputs.actor }}
+      should_run: ${{ steps.parse.outputs.should_run }}
+    steps:
+      - name: Parse command
+        id: parse
+        run: |
+          BODY=$(cat <<'COMMENT_EOF'
+          ${{ github.event.comment.body }}
+          COMMENT_EOF
+          )
+          CMD=$(echo "$BODY" | head -1 | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+          ARGS=$(echo "$BODY" | head -1 | sed 's|^/[^ ]* *||')
+          
+          echo "command=$CMD" >> $GITHUB_OUTPUT
+          echo "args=$ARGS" >> $GITHUB_OUTPUT
+          echo "issue_number=${{ github.event.issue.number }}" >> $GITHUB_OUTPUT
+          echo "issue_title=${{ github.event.issue.title }}" >> $GITHUB_OUTPUT
+          echo "actor=${{ github.event.comment.user.login }}" >> $GITHUB_OUTPUT
+          
+          # Only dispatch for recognized commands
+          case "$CMD" in
+            /start|/fix|/plan|/approve|/continue|/feedback|/retry)
+              echo "should_run=true" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+  agent-work:
+    needs: parse-command
+    if: needs.parse-command.outputs.should_run == 'true'
+    # Route to the commenter's self-hosted runner
+    runs-on:
+      - self-hosted
+      - ${{ format('runner:{0}', needs.parse-command.outputs.actor) }}
+    env:
+      ISSUE_NUM: ${{ needs.parse-command.outputs.issue_number }}
+      ISSUE_TITLE: ${{ needs.parse-command.outputs.issue_title }}
+      COMMAND: ${{ needs.parse-command.outputs.command }}
+      ARGS: ${{ needs.parse-command.outputs.args }}
+      ACTOR: ${{ needs.parse-command.outputs.actor }}
+      REPO_FULL: ${{ github.repository }}
+      AGENT_NAME: ${{ format('{0}/claude', needs.parse-command.outputs.actor) }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Acknowledge command
+        run: |
+          gh issue comment "$ISSUE_NUM" --repo "$REPO_FULL" --body "
+          🤖 **${AGENT_NAME}** received \`${COMMAND}\` from @${ACTOR}
+          Working on it...
+          "
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Fetch shared knowledge
+        run: |
+          REPO_ROOT=$(git rev-parse --show-toplevel)
+          SHARED="${REPO_ROOT}/../nex-taas-shared-knowledge"
+          if [ ! -d "$SHARED" ]; then
+            git clone https://github.com/china-qijizhifeng/nex-taas-shared-knowledge.git "$SHARED"
+          else
+            git -C "$SHARED" pull --ff-only 2>/dev/null || true
+          fi
+
+      - name: Update project status
+        run: |
+          REPO_ROOT=$(git rev-parse --show-toplevel)
+          SHARED="${REPO_ROOT}/../nex-taas-shared-knowledge"
+          
+          case "$COMMAND" in
+            /start|/fix)
+              bash "$SHARED/scripts/update-project-status.sh" "$REPO_FULL" "$ISSUE_NUM" "in-progress" "$AGENT_NAME"
+              ;;
+            /plan)
+              bash "$SHARED/scripts/update-project-status.sh" "$REPO_FULL" "$ISSUE_NUM" "plan" "$AGENT_NAME"
+              ;;
+            /continue|/feedback|/retry)
+              bash "$SHARED/scripts/update-project-status.sh" "$REPO_FULL" "$ISSUE_NUM" "in-progress" "$AGENT_NAME"
+              ;;
+          esac
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Claude Code
+        run: |
+          REPO_ROOT=$(git rev-parse --show-toplevel)
+          
+          # Build prompt based on command
+          ISSUE_BODY=$(gh issue view "$ISSUE_NUM" --repo "$REPO_FULL" --json body -q '.body')
+          
+          case "$COMMAND" in
+            /start|/fix)
+              PROMPT="You are an AI agent. Fix GitHub issue #${ISSUE_NUM} in this repo.
+
+          Issue title: ${ISSUE_TITLE}
+          Issue body:
+          ${ISSUE_BODY}
+
+          Follow the fix-issue skill in .claude/skills/fix-issue/SKILL.md.
+          Use git worktree for isolation. Create a PR when done.
+          Update the issue with your progress via comments.
+          If you get stuck, add the 'status:blocked' label and comment explaining why."
+              ;;
+            /plan)
+              PROMPT="You are an AI agent. Create an execution plan for GitHub issue #${ISSUE_NUM}.
+
+          Issue title: ${ISSUE_TITLE}
+          Issue body:
+          ${ISSUE_BODY}
+
+          Analyze the issue and post a detailed plan as an issue comment. Include:
+          1. Root cause analysis (for bugs) or design approach (for features)
+          2. Files that need changes
+          3. Implementation steps
+          4. Testing approach
+
+          Do NOT implement yet. Just post the plan and ask for approval."
+              ;;
+            /approve)
+              PROMPT="You are an AI agent. The plan for issue #${ISSUE_NUM} has been approved.
+
+          Issue title: ${ISSUE_TITLE}
+
+          Read the existing plan from the issue comments, then implement it.
+          Follow the fix-issue skill in .claude/skills/fix-issue/SKILL.md.
+          Use git worktree for isolation. Create a PR when done."
+              ;;
+            /continue|/retry)
+              PROMPT="You are an AI agent. Continue working on issue #${ISSUE_NUM}.
+
+          Issue title: ${ISSUE_TITLE}
+
+          Read the issue comments for context on what was done and what blocked you.
+          Resume the work. Follow .claude/skills/fix-issue/SKILL.md."
+              ;;
+            /feedback)
+              PROMPT="You are an AI agent working on issue #${ISSUE_NUM}.
+
+          Issue title: ${ISSUE_TITLE}
+
+          You received feedback: ${ARGS}
+
+          Read the issue comments for full context, apply the feedback, and continue working.
+          Follow .claude/skills/fix-issue/SKILL.md."
+              ;;
+          esac
+          
+          # Run Claude Code
+          claude -p "$PROMPT" --dangerously-skip-permissions --output-format text \
+            --max-turns 50 2>&1 | tee /tmp/claude-output.log || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Handle completion
+        if: always()
+        run: |
+          REPO_ROOT=$(git rev-parse --show-toplevel)
+          SHARED="${REPO_ROOT}/../nex-taas-shared-knowledge"
+          
+          # Check if a PR was created
+          BRANCH=$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || echo "")
+          PR_EXISTS=$(gh pr list --repo "$REPO_FULL" --head "agent/issue-${ISSUE_NUM}" --json url -q '.[0].url' 2>/dev/null || echo "")
+          
+          if [ -n "$PR_EXISTS" ]; then
+            bash "$SHARED/scripts/update-project-status.sh" "$REPO_FULL" "$ISSUE_NUM" "review" "$AGENT_NAME" 2>/dev/null || true
+            gh issue edit "$ISSUE_NUM" --repo "$REPO_FULL" \
+              --remove-label "status:in-progress" --add-label "status:review" 2>/dev/null || true
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
