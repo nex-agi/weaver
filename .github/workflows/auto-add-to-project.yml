@@ -1,0 +1,17 @@
+name: Auto-add to Project
+
+on:
+  issues:
+    types: [opened, reopened]
+  pull_request:
+    types: [opened, reopened]
+
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add to nex-taas project
+        uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: https://github.com/orgs/china-qijizhifeng/projects/3
+          github-token: ${{ secrets.PROJECT_TOKEN }}
