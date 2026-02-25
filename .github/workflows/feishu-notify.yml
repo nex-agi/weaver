@@ -1,0 +1,142 @@
+name: Notify Feishu on New Issue
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Feishu Card Notification
+        uses: actions/github-script@v7
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const author = issue.user.login;
+            const title = issue.title;
+            const url = issue.html_url;
+            const body = issue.body || '';
+            const labels = issue.labels.map(l => l.name);
+
+            // Determine if bug or feature based on issue type or title prefix
+            const isBug = title.startsWith('[Bug]') || labels.includes('bug');
+            const isFeature = title.startsWith('[FR]') || labels.includes('enhancement');
+
+            let cardHeader, cardColor, cardType, cardContent;
+
+            if (isBug) {
+              cardColor = 'red';
+              cardHeader = '😣问题反馈';
+              
+              // Parse bug report fields from body
+              let description = '';
+              const descMatch = body.match(/### 问题描述\s*\n\s*\n([\s\S]*?)(?=\n###|$)/);
+              if (descMatch) description = descMatch[1].trim();
+
+              cardContent = [
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": `问题反馈：\n反馈人：**${author}**\n**问题概述：${title.replace('[Bug] ', '')}**\n${description ? description.substring(0, 500) : ''}\n\n请及时查看并处理该问题。`
+                  }
+                },
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "问题详情🔍"
+                      },
+                      "url": url,
+                      "type": "default"
+                    }
+                  ]
+                },
+                { "tag": "hr" },
+                {
+                  "tag": "note",
+                  "elements": [
+                    {
+                      "tag": "lark_md",
+                      "content": "来自 [TaaS迭代](https://github.com/orgs/china-qijizhifeng/projects/3)"
+                    }
+                  ]
+                }
+              ];
+            } else {
+              cardColor = 'green';
+              cardHeader = '⏰新增需求';
+              
+              let description = '';
+              const descMatch = body.match(/### 功能描述\s*\n\s*\n([\s\S]*?)(?=\n###|$)/);
+              if (descMatch) description = descMatch[1].trim();
+
+              cardContent = [
+                {
+                  "tag": "div",
+                  "text": {
+                    "tag": "lark_md",
+                    "content": `新增需求：\n提需人：**${author}**\n**需求概述：${title.replace('[FR] ', '')}**\n${description ? description.substring(0, 500) : ''}\n\n请及时查看并处理该需求，如有疑问可与提需人沟通。`
+                  }
+                },
+                {
+                  "tag": "action",
+                  "actions": [
+                    {
+                      "tag": "button",
+                      "text": {
+                        "tag": "plain_text",
+                        "content": "需求详情🔍"
+                      },
+                      "url": url,
+                      "type": "default"
+                    }
+                  ]
+                },
+                { "tag": "hr" },
+                {
+                  "tag": "note",
+                  "elements": [
+                    {
+                      "tag": "lark_md",
+                      "content": "来自 [TaaS迭代](https://github.com/orgs/china-qijizhifeng/projects/3)"
+                    }
+                  ]
+                }
+              ];
+            }
+
+            const card = {
+              "msg_type": "interactive",
+              "card": {
+                "header": {
+                  "title": {
+                    "tag": "plain_text",
+                    "content": cardHeader
+                  },
+                  "template": cardColor
+                },
+                "elements": cardContent
+              }
+            };
+
+            const webhookUrl = process.env.FEISHU_WEBHOOK_URL;
+            if (!webhookUrl) {
+              console.log('FEISHU_WEBHOOK_URL not set, skipping notification');
+              return;
+            }
+
+            const response = await fetch(webhookUrl, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(card)
+            });
+
+            const result = await response.json();
+            console.log('Feishu response:', JSON.stringify(result));

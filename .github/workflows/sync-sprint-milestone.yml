@@ -1,0 +1,193 @@
+name: Sync Sprint to Milestone
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync Project Sprint to Repo Milestones
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          script: |
+            const PROJECT_NUMBER = 3;
+            const ORG = 'china-qijizhifeng';
+            const SPRINT_FIELD = 'Sprint';
+
+            // First, get Sprint field configuration (iterations with dates)
+            const fieldQuery = `
+              query($org: String!, $number: Int!) {
+                organization(login: $org) {
+                  projectV2(number: $number) {
+                    fields(first: 30) {
+                      nodes {
+                        ... on ProjectV2IterationField {
+                          id
+                          name
+                          configuration {
+                            iterations {
+                              id
+                              title
+                              startDate
+                              duration
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            const fieldResult = await github.graphql(fieldQuery, { org: ORG, number: PROJECT_NUMBER });
+            const sprintField = fieldResult.organization.projectV2.fields.nodes.find(
+              f => f.configuration && f.name === SPRINT_FIELD
+            );
+
+            if (!sprintField) {
+              console.log('Sprint field not found!');
+              return;
+            }
+
+            // Build iteration map: title -> { startDate, duration, endDate }
+            const iterationMap = {};
+            for (const iter of sprintField.configuration.iterations) {
+              const start = new Date(iter.startDate);
+              const end = new Date(start);
+              end.setDate(end.getDate() + iter.duration);
+              iterationMap[iter.title] = {
+                startDate: iter.startDate,
+                duration: iter.duration,
+                endDate: end.toISOString()
+              };
+              console.log(`Sprint "${iter.title}": ${iter.startDate} + ${iter.duration}d → due ${end.toISOString().split('T')[0]}`);
+            }
+
+            // Query all project items
+            const query = `
+              query($org: String!, $number: Int!, $cursor: String) {
+                organization(login: $org) {
+                  projectV2(number: $number) {
+                    items(first: 100, after: $cursor) {
+                      pageInfo { hasNextPage endCursor }
+                      nodes {
+                        fieldValues(first: 20) {
+                          nodes {
+                            ... on ProjectV2ItemFieldIterationValue {
+                              title
+                              field { ... on ProjectV2IterationField { name } }
+                            }
+                          }
+                        }
+                        content {
+                          ... on Issue {
+                            number
+                            repository { owner { login } name }
+                            milestone { title }
+                          }
+                          ... on PullRequest {
+                            number
+                            repository { owner { login } name }
+                            milestone { title }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+
+            let cursor = null;
+            let allItems = [];
+
+            while (true) {
+              const result = await github.graphql(query, {
+                org: ORG, number: PROJECT_NUMBER, cursor
+              });
+              const items = result.organization.projectV2.items;
+              allItems.push(...items.nodes);
+              if (!items.pageInfo.hasNextPage) break;
+              cursor = items.pageInfo.endCursor;
+            }
+
+            console.log(`\nFound ${allItems.length} items in project`);
+
+            // Cache for milestones per repo
+            const milestoneCache = {};
+
+            async function getOrCreateMilestone(owner, repo, title, dueOn) {
+              const key = `${owner}/${repo}`;
+              if (!milestoneCache[key]) {
+                const ms = await github.rest.issues.listMilestones({
+                  owner, repo, state: 'open', per_page: 100
+                });
+                milestoneCache[key] = ms.data;
+              }
+
+              let milestone = milestoneCache[key].find(m => m.title === title);
+
+              if (!milestone) {
+                // Create milestone if not exists
+                const created = await github.rest.issues.createMilestone({
+                  owner, repo, title, due_on: dueOn
+                });
+                milestone = created.data;
+                milestoneCache[key].push(milestone);
+                console.log(`📌 Created milestone "${title}" in ${key}`);
+              } else if (dueOn && milestone.due_on !== dueOn) {
+                // Update due date if different
+                const dueDateOnly = new Date(dueOn).toISOString().split('T')[0];
+                const currentDue = milestone.due_on ? new Date(milestone.due_on).toISOString().split('T')[0] : null;
+                if (dueDateOnly !== currentDue) {
+                  await github.rest.issues.updateMilestone({
+                    owner, repo, milestone_number: milestone.number, due_on: dueOn
+                  });
+                  console.log(`📅 Updated milestone "${title}" due date in ${key} → ${dueDateOnly}`);
+                }
+              }
+
+              return milestone;
+            }
+
+            let updated = 0;
+
+            for (const item of allItems) {
+              if (!item.content || !item.content.repository) continue;
+
+              const sprintValue = item.fieldValues.nodes.find(
+                f => f.field && f.field.name === SPRINT_FIELD
+              );
+              if (!sprintValue) continue;
+
+              const sprintTitle = sprintValue.title;
+              const currentMilestone = item.content.milestone?.title;
+
+              if (currentMilestone === sprintTitle) continue;
+
+              const owner = item.content.repository.owner.login;
+              const repo = item.content.repository.name;
+              const number = item.content.number;
+              const dueOn = iterationMap[sprintTitle]?.endDate;
+
+              const milestone = await getOrCreateMilestone(owner, repo, sprintTitle, dueOn);
+
+              try {
+                await github.rest.issues.update({
+                  owner, repo,
+                  issue_number: number,
+                  milestone: milestone.number
+                });
+                console.log(`✅ ${owner}/${repo}#${number}: milestone → ${sprintTitle}`);
+                updated++;
+              } catch (e) {
+                console.log(`❌ ${owner}/${repo}#${number}: ${e.message}`);
+              }
+            }
+
+            console.log(`\nDone! Updated ${updated} items.`);
