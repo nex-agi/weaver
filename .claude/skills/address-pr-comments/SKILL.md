@@ -1,32 +1,28 @@
 ---
 name: address-pr-comments
-description: Analyze and address GitHub PR review comments intelligently. Use when addressing PR feedback or review comments.
+description: Address GitHub PR review comments. Navigate to the correct worktree, make fixes, push updates.
 ---
 
-# Address PR Comments Workflow
-
-Triage PR review comments, address actionable feedback, and resolve informational comments.
+# Address PR Comments Workflow (Worktree-Aware)
 
 ## Input
 
-Accept PR number (`123`, `#123`) or branch name.
+PR number or branch name.
 
 ## Workflow
 
-1. Match input to PR
-2. Fetch unresolved comments
-3. Classify comments
-4. Get user confirmation (Category B)
-5. Address comments with code changes
-6. Reply and resolve threads
-
-## Step 1: Match Input to PR
+### Step 1: Find the Worktree
 
 ```bash
-gh pr view <number> --repo nex-agi/weaver --json number,title,headRefName,state
+# Get PR branch
+BRANCH=$(gh pr view <number> --repo nex-agi/weaver --json headRefName -q '.headRefName')
+
+# Find the worktree for this branch
+git worktree list | grep "$BRANCH"
+cd <worktree-path>
 ```
 
-## Step 2: Fetch Unresolved Comments
+### Step 2: Fetch Unresolved Comments
 
 ```bash
 gh api graphql -f query='
@@ -46,32 +42,22 @@ query {
 }'
 ```
 
-## Step 3: Classify Comments
+### Step 3: Classify & Address
 
-| Category | Description | Examples |
-|----------|-------------|----------|
-| **A: Actionable** | Code changes required | Bugs, missing validation |
-| **B: Discussable** | May skip if follows rules | Style preferences |
-| **C: Informational** | Resolve without changes | Acknowledgments |
+| Category | Description | Action |
+|----------|-------------|--------|
+| **A: Actionable** | Code changes required | Make changes |
+| **B: Discussable** | May skip if follows rules | Ask user |
+| **C: Informational** | Resolve without changes | Acknowledge |
 
-## Step 4: Get User Confirmation
+### Step 4: Commit & Push
 
-Use `AskUserQuestion` for Category B: Address / Skip / Discuss
+```bash
+git add -A
+git commit -m "chore(pr): address review comments for #<number>"
+git push origin "$BRANCH"
+```
 
-## Step 5: Address Comments
+### Step 5: Reply & Resolve Threads
 
-1. Read files, make changes
-2. Ensure license headers preserved
-3. Commit using `/git-commit`
-
-## Step 6: Resolve Comments
-
-Reply then resolve thread with GraphQL mutation.
-
-## Checklist
-
-- [ ] PR matched and validated
-- [ ] Comments classified
-- [ ] Category B reviewed with user
-- [ ] Changes made and committed
-- [ ] All comments resolved
+Reply to each comment via gh API, then resolve the thread.

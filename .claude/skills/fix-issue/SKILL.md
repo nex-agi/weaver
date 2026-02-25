@@ -1,98 +1,120 @@
 ---
 name: fix-issue
-description: Fix a GitHub issue by fetching content, creating a branch, planning the fix, and implementing it. Use when the user asks to fix a specific issue number.
+description: Fix a GitHub issue using git worktree for isolation. Fetches issue, creates worktree, plans and implements fix, then creates PR.
 ---
 
-# Weaver SDK Issue Fix Workflow
+# Fix Issue Workflow (Worktree-Based)
 
-Fetch GitHub issue, create branch, plan, and implement the fix.
+## Overview
+
+Each issue is worked on in an isolated git worktree. This allows multiple agents to work on the same repo simultaneously without conflicts.
 
 ## Workflow
 
-1. Check gh CLI authentication
-2. Fetch issue content
-3. Create issue branch
-4. Enter plan mode to design fix
-5. Implement the fix
-6. Run tests (use `testing` skill)
-7. Commit changes (use `git-commit` skill)
-
-## Step 1: Check gh CLI Authentication
+### Step 1: Verify Prerequisites
 
 ```bash
 gh auth status
 ```
 
-**If not authenticated**: Prompt user to run `gh auth login`. Stop here.
-
-## Step 2: Fetch Issue Content
+### Step 2: Fetch Issue
 
 ```bash
-gh issue view ISSUE_NUMBER --repo nex-agi/weaver
-gh issue view ISSUE_NUMBER --repo nex-agi/weaver --json number,title,body,state,labels
+ISSUE_NUM=<number>
+gh issue view $ISSUE_NUM --repo nex-agi/weaver --json number,title,body,state,labels
 ```
 
-**If issue is closed**: Ask user if they still want to work on it.
+If closed, confirm with user before proceeding.
 
-## Step 3: Create Issue Branch
+### Step 3: Update Issue Status
 
 ```bash
-git checkout main && git pull origin main
-BRANCH_NAME="issue-${ISSUE_NUM}-short-description"
-git checkout -b "$BRANCH_NAME"
+gh issue comment $ISSUE_NUM --repo nex-agi/weaver --body "🤖 Agent picking up this issue. Creating worktree branch \`agent/issue-${ISSUE_NUM}\`."
+
+# Add in-progress label (create if doesn't exist)
+gh issue edit $ISSUE_NUM --repo nex-agi/weaver --add-label "status:in-progress" 2>/dev/null || true
 ```
 
-## Step 4: Enter Plan Mode
+### Step 4: Fetch Shared Knowledge
 
-Use `EnterPlanMode` to design the fix. Plan should cover:
+Clone or update the shared knowledge repo for common scripts and docs.
 
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+SHARED_KNOWLEDGE="${REPO_ROOT}/../nex-taas-shared-knowledge"
+if [ ! -d "$SHARED_KNOWLEDGE" ]; then
+  git clone https://github.com/china-qijizhifeng/nex-taas-shared-knowledge.git "$SHARED_KNOWLEDGE"
+else
+  git -C "$SHARED_KNOWLEDGE" pull --ff-only 2>/dev/null || true
+fi
+```
+
+### Step 5: Create Worktree
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel)
+git fetch origin
+
+BRANCH="agent/issue-${ISSUE_NUM}"
+WORKTREE_DIR="${REPO_ROOT}/../worktrees/weaver-issue-${ISSUE_NUM}"
+
+# Create worktree with new branch from latest main
+git worktree add "$WORKTREE_DIR" -b "$BRANCH" "origin/main"
+
+cd "$WORKTREE_DIR"
+```
+
+### Step 6: Plan the Fix
+
+Enter plan mode. Consider:
 - Root cause analysis (for bugs)
 - Files that need changes
 - Implementation strategy
 - Testing approach
+- Impact on other components
 
-## Step 5: Implement the Fix
+### Step 7: Implement
 
-After plan approval, follow project conventions:
+Work in the worktree directory. Follow project rules in `.claude/rules/`:
+- Apache 2.0 license headers on all new `.py` files
+- Type hints on public APIs
+- Google-style docstrings
+- Run `make format` before committing
 
-1. Make code changes following `.claude/rules/`
-2. Add Apache 2.0 license headers to new files
-3. Add/update tests in `tests/`
-4. Run `make format` before committing
+### Step 8: Test
 
-## Step 6: Run Tests
-
-```text
-/testing
+Run project tests (use `testing` skill):
+```bash
+make ci  # lint + test
 ```
 
-Fix any failures before committing.
+### Step 9: Commit and PR
 
-## Step 7: Commit Changes
+Use `git-commit` skill, then `github-pr` skill.
 
-```text
-/git-commit
+The PR should reference the issue: `Fixes #ISSUE_NUM`
+
+### Step 10: Handle Blockers
+
+If blocked, update the issue:
+
+```bash
+gh issue edit $ISSUE_NUM --repo nex-agi/weaver \
+  --remove-label "status:in-progress" --add-label "status:blocked"
+
+gh issue comment $ISSUE_NUM --repo nex-agi/weaver --body "
+🚧 Blocked: <describe the problem>
+
+Need guidance on: <specific question>
+
+Progress so far: <what's been done>
+"
 ```
 
-**Commit message format:**
-```text
-fix(scope): Brief description
+### Step 11: Cleanup (after PR merged)
 
-Fixes #ISSUE_NUMBER
+```bash
+cd "$REPO_ROOT"
+git worktree remove "$WORKTREE_DIR"
+git branch -d "$BRANCH"
 ```
-
-## Step 8: Create PR (Optional)
-
-```text
-/github-pr
-```
-
-## Checklist
-
-- [ ] gh CLI authenticated
-- [ ] Issue content fetched and understood
-- [ ] Branch created from latest main
-- [ ] Plan created and approved
-- [ ] Fix implemented with license headers
-- [ ] Tests passing (`make ci`)
-- [ ] Changes committed with issue reference

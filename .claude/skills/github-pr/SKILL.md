@@ -1,71 +1,73 @@
 ---
 name: github-pr
-description: Create a GitHub pull request after committing and pushing changes. Use when the user asks to create a PR or submit changes for review.
+description: Create a GitHub PR from a worktree branch. Use after committing changes.
 ---
 
-# Weaver SDK GitHub Pull Request Workflow
+# GitHub PR Workflow (Worktree-Aware)
 
 ## Prerequisites
 
-Run `/git-commit` skill first to commit all changes.
+Changes committed via `git-commit` skill.
 
-## Workflow Steps
+## Workflow
 
-1. Check for existing PR (exit if found)
-2. Push to remote
-3. Create PR using gh CLI
-
-## Step 1: Check for Existing PR
+### Step 1: Verify Current Location
 
 ```bash
+# Ensure we're in a worktree, not the main clone
+git worktree list
+pwd
 BRANCH_NAME=$(git branch --show-current)
+echo "Current branch: $BRANCH_NAME"
+```
+
+### Step 2: Check for Existing PR
+
+```bash
 gh pr list --head "$BRANCH_NAME" --state open --repo nex-agi/weaver
 ```
 
-**If PR exists**: Display with `gh pr view` and exit immediately.
+If PR exists, show it with `gh pr view` and exit.
 
-## Step 2: Push
+### Step 3: Push Branch
 
 ```bash
-git push --set-upstream origin BRANCH_NAME
+git push --set-upstream origin "$BRANCH_NAME"
+# After rebase: git push --force-with-lease origin "$BRANCH_NAME"
 ```
 
-## Step 3: Create PR
+### Step 4: Create PR
 
 ```bash
 gh pr create \
   --repo nex-agi/weaver \
-  --title "Brief description of changes" \
-  --body "$(cat <<'EOF'
-## Summary
+  --base main \
+  --head "$BRANCH_NAME" \
+  --title "type(scope): description" \
+  --body "## Summary
 - Key change 1
 - Key change 2
 
 ## Testing
-- [ ] All tests pass (`make test`)
+- [ ] Tests pass (`make test`)
 - [ ] Linting clean (`make lint`)
 - [ ] License headers present
-- [ ] Code review completed
 
 ## Related Issues
-Fixes #ISSUE_NUMBER (if applicable)
-EOF
-)"
+Fixes #ISSUE_NUMBER"
 ```
 
-**Important**: Do NOT add AI branding footers.
+Auto-extract title/body from commit messages. No AI branding.
 
-## Common Issues
+### Step 5: Update Issue
 
-| Issue | Solution |
-|-------|----------|
-| PR already exists | `gh pr view` then exit |
-| Push rejected | `git push --force-with-lease` |
-| gh not authenticated | Tell user to run `gh auth login` |
-
-## Checklist
-
-- [ ] No existing PR for branch
-- [ ] Changes committed via git-commit
-- [ ] Pushed to remote
-- [ ] PR created with clear title/body
+```bash
+# Extract issue number from branch name if possible
+ISSUE_NUM=$(echo "$BRANCH_NAME" | grep -oP 'issue-\K\d+')
+if [ -n "$ISSUE_NUM" ]; then
+  gh issue edit "$ISSUE_NUM" --repo nex-agi/weaver \
+    --remove-label "status:in-progress" --add-label "status:review" 2>/dev/null || true
+  gh issue comment "$ISSUE_NUM" --repo nex-agi/weaver \
+    --body "✅ PR created: $(gh pr view --json url -q .url). Ready for review."
+fi
+```
