@@ -9,6 +9,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/add-to-project@v1.0.2
+        id: add
         with:
           project-url: https://github.com/orgs/china-qijizhifeng/projects/3
           github-token: ${{ secrets.PROJECT_TOKEN }}
+
+      - name: Set status to Backlog
+        if: steps.add.outputs.itemId
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            await github.graphql(`
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(input: {
+                  projectId: $projectId
+                  itemId: $itemId
+                  fieldId: $fieldId
+                  value: { singleSelectOptionId: $optionId }
+                }) {
+                  projectV2Item { id }
+                }
+              }
+            `, {
+              projectId: "PVT_kwDOCmnEdM4BPm6J",
+              itemId: "${{ steps.add.outputs.itemId }}",
+              fieldId: "PVTSSF_lADOCmnEdM4BPm6Jzg999w0",
+              optionId: "abaf745d"
+            });
+            console.log('✅ Status set to Backlog');
