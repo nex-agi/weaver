@@ -1,0 +1,38 @@
+name: Auto-label from issue form
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  auto-label:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Parse labels from issue body and apply
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+            // Match the "标签" section in the issue form
+            const match = body.match(/### 标签\s*\n\s*\n([\s\S]*?)(?:\n\s*\n###|\s*$)/);
+            if (!match) {
+              console.log('No label section found');
+              return;
+            }
+            const selected = match[1]
+              .split(/,\s*|\n/)
+              .map(s => s.trim())
+              .filter(s => s && s !== '_No response_' && s !== 'None');
+            if (selected.length === 0) {
+              console.log('No labels selected');
+              return;
+            }
+            console.log('Adding labels:', selected);
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: selected
+            });
