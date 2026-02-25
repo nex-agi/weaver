@@ -1,0 +1,150 @@
+name: Auto-fill Linked Feature on PR
+
+on:
+  pull_request:
+    types: [opened, edited]
+
+jobs:
+  link-feature:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fill Linked Feature field in Project
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const pr = context.payload.pull_request;
+            const body = pr.body || '';
+
+            // Parse all issue references from closes/fixes/resolves keywords
+            const patterns = [
+              /(?:closes?|fixes?|resolves?)\s+(?:([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+))?#(\d+)/gi,
+              /(?:closes?|fixes?|resolves?)\s+https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/gi
+            ];
+
+            const linkedIssues = [];
+            for (const pattern of patterns) {
+              let match;
+              while ((match = pattern.exec(body)) !== null) {
+                const owner = match[1] || context.repo.owner;
+                const repo = match[2] || context.repo.repo;
+                const number = parseInt(match[3]);
+                linkedIssues.push({ owner, repo, number });
+              }
+            }
+
+            if (linkedIssues.length === 0) {
+              console.log('No linked issues found in PR body');
+              return;
+            }
+
+            // For each linked issue, find its parent issue (the feature in nex-taas-feedback)
+            // or use the issue itself as the feature reference
+            const featureRefs = [];
+
+            for (const issue of linkedIssues) {
+              // Check if this issue has a parent
+              try {
+                const result = await github.graphql(`
+                  query($owner: String!, $repo: String!, $number: Int!) {
+                    repository(owner: $owner, name: $repo) {
+                      issue(number: $number) {
+                        title
+                        url
+                        parent {
+                          title
+                          url
+                          repository { nameWithOwner }
+                          number
+                        }
+                      }
+                    }
+                  }
+                `, { owner: issue.owner, repo: issue.repo, number: issue.number });
+
+                const issueData = result.repository.issue;
+                // Use the issue itself as feature ref
+                featureRefs.push(`${issue.owner}/${issue.repo}#${issue.number}`);
+
+              } catch (e) {
+                console.log(`Failed to query ${issue.owner}/${issue.repo}#${issue.number}: ${e.message}`);
+                featureRefs.push(`${issue.owner}/${issue.repo}#${issue.number}`);
+              }
+            }
+
+            if (featureRefs.length === 0) return;
+
+            const featureText = [...new Set(featureRefs)].join(', ');
+            console.log(`Linked features: ${featureText}`);
+
+            // Find this PR in the project
+            const PROJECT_ID = 'PVT_kwDOCmnEdM4BPm6J';
+            const FIELD_ID = 'PVTF_lADOCmnEdM4BPm6Jzg-UJsE';
+
+            // Get PR node ID
+            const prResult = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $number) {
+                    id
+                    projectItems(first: 10) {
+                      nodes {
+                        id
+                        project { id }
+                      }
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: pr.number
+            });
+
+            const prData = prResult.repository.pullRequest;
+            const projectItem = prData.projectItems.nodes.find(
+              item => item.project.id === PROJECT_ID
+            );
+
+            if (!projectItem) {
+              console.log('PR not yet in project, adding it first...');
+              // Add PR to project
+              const addResult = await github.graphql(`
+                mutation($projectId: ID!, $contentId: ID!) {
+                  addProjectV2ItemById(input: { projectId: $projectId, contentId: $contentId }) {
+                    item { id }
+                  }
+                }
+              `, { projectId: PROJECT_ID, contentId: prData.id });
+
+              const itemId = addResult.addProjectV2ItemById.item.id;
+
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { text: $text }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }
+              `, { projectId: PROJECT_ID, itemId, fieldId: FIELD_ID, text: featureText });
+            } else {
+              await github.graphql(`
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $text: String!) {
+                  updateProjectV2ItemFieldValue(input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { text: $text }
+                  }) {
+                    projectV2Item { id }
+                  }
+                }
+              `, { projectId: PROJECT_ID, itemId: projectItem.id, fieldId: FIELD_ID, text: featureText });
+            }
+
+            console.log(`✅ Set "Linked feature" to: ${featureText}`);
