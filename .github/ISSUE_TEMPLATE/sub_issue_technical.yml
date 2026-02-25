@@ -1,0 +1,105 @@
+name: 🔧 Feature（开发用）
+description: 基于用户 Issue 拆解的技术实现方案（开发人员使用）
+title: "[Feature] "
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        此模板供开发人员使用，用于将用户提交的 Issue 转换为具体的技术实现方案。
+
+  - type: input
+    id: parent_issue
+    attributes:
+      label: 关联 Issue
+      description: 对应的 nex-taas-feedback 用户 Issue（格式：china-qijizhifeng/nex-taas-feedback#123）
+      placeholder: "china-qijizhifeng/nex-taas-feedback#123"
+    validations:
+      required: true
+
+  - type: textarea
+    id: technical_design
+    attributes:
+      label: 技术方案
+      description: 完整的技术实现方案
+      placeholder: |
+        ## 背景分析
+        - 当前系统现状：...
+        - 存在的问题/差距：...
+        - 可复用的现有能力：...
+
+        ## 竞品分析
+        | 竞品/方案 | 实现方式 | 优点 | 缺点 | 适用场景 |
+        |-----------|----------|------|------|----------|
+        | 方案 A    |          |      |      |          |
+        | 方案 B    |          |      |      |          |
+
+        选型建议：...
+
+        ## 整体架构
+        （附架构图或 Mermaid 流程图）
+
+        ## 核心组件及职责
+        - 组件 A：负责...
+        - 组件 B：负责...
+
+        ## 关键接口定义
+        ```python
+        class XXX:
+            def method(self, ...) -> ...:
+                """..."""
+        ```
+
+        ## 数据流与调用关系
+        数据输入 -> 处理 A -> 处理 B -> 输出
+
+        ## 文件变更清单
+        - **新建** `path/to/new_file.py` — 描述
+        - **修改** `path/to/existing.py` — 修改内容
+
+        ## API / 配置变更
+        - 新增 API: ...
+        - 配置变更: ...
+
+        ## 依赖与兼容性
+        - 新增依赖：...
+        - 向后兼容性：...
+
+        ## 风险评估
+        | 风险 | 影响 | 概率 | 应对措施 |
+        |------|------|------|----------|
+
+        ## 里程碑与排期
+        - [ ] 阶段 1：xxx（预计 x 天）
+        - [ ] 阶段 2：xxx（预计 x 天）
+    validations:
+      required: true
+
+  - type: textarea
+    id: test_plan
+    attributes:
+      label: 测试方案
+      description: 完整的验证与测试计划
+      placeholder: |
+        ## 单元测试
+        - 测试用例 1：...
+        - 测试用例 2：...
+
+        ## 集成测试
+        - 端到端测试场景：...
+        - 测试数据准备：...
+
+        ## 性能验证
+        - 基准指标：...
+        - 预期表现：...
+        - 压测方案：...
+
+        ## 验收标准
+        - [ ] 标准 1
+        - [ ] 标准 2
+
+        ## 回归测试
+        - 影响范围：...
+        - 需要回归的模块：...
+    validations:
+      required: true
