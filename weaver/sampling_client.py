@@ -23,7 +23,7 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
-from .types import ModelInput, SamplingParams
+from .types import LogprobsParams, ModelInput, SamplingParams
 
 
 class SamplingClient:
@@ -76,35 +76,36 @@ class SamplingClient:
         self,
         *,
         prompt: ModelInput,
-        router_replay_r2: bool = False,
+        logprobs_params: LogprobsParams | None = None,
     ) -> List[float | None] | Dict[str, Any]:
         """Compute log-probabilities for the given prompt.
 
         Args:
             prompt: The model input (tokens) to compute logprobs for.
-            router_replay_r2: If True, request expert IDs (fwd_expert_replay_data) for MoE
-                router replay. When True, returns a dict with "logprobs" and optionally
-                "fwd_expert_replay_data" (for use with forward_backward).
+            logprobs_params: Optional parameters (e.g. return_rollout_token_expert for MoE router replay).
+                When None, uses defaults.
 
         Returns:
-            When router_replay_r2=False: List[float|None] of per-token logprobs.
-            When router_replay_r2=True: Dict with "logprobs" and "fwd_expert_replay_data"
-                (None if not MoE or not available).
+            When logprobs_params.return_rollout_token_expert=False: List[float|None] of per-token logprobs.
+            When logprobs_params.return_rollout_token_expert=True: Dict with "logprobs" and
+                "return_rollout_token_expert_data" (None if not MoE or not available).
         """
-        body: Dict[str, Any] = {"prompt": prompt.to_payload()}
-        if router_replay_r2:
-            body["router_replay_r2"] = True
+        params = logprobs_params or LogprobsParams()
+        body: Dict[str, Any] = {"prompt": prompt.to_payload(), **params.to_payload()}
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/logprobs",
             body,
         )
         payload = handle.result()
         logprobs = self._normalize_prompt_logprobs(prompt, payload)
-        if not router_replay_r2:
+        if not params.return_rollout_token_expert:
             return logprobs
         result = self._result_payload(payload)
-        fwd_expert_replay_data = result.get("fwd_expert_replay_data")
-        return {"logprobs": logprobs, "fwd_expert_replay_data": fwd_expert_replay_data}
+        return_rollout_token_expert_data = result.get("return_rollout_token_expert_data")
+        return {
+            "logprobs": logprobs,
+            "return_rollout_token_expert_data": return_rollout_token_expert_data,
+        }
 
     def _ensure_tokenizer(self) -> PreTrainedTokenizer:
         if self._tokenizer is not None:
