@@ -1,0 +1,60 @@
+name: "Project: Auto Cancel on Not-Planned Close"
+
+on:
+  issues:
+    types: [closed]
+
+jobs:
+  set-cancelled:
+    # Covers both "Close as not planned" and "Close as duplicate"
+    if: github.event.issue.state_reason == 'not_planned'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set Status to Cancelled
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_PAT }}
+        run: |
+          PROJECT_NUMBER=3
+          ORG="china-qijizhifeng"
+          PROJECT_ID="PVT_kwDOCmnEdM4BPm6J"
+          STATUS_FIELD_ID="PVTSSF_lADOCmnEdM4BPm6Jzg999w0"
+          CANCELLED_OPTION_ID="0aca0ff6"
+          ISSUE_NODE_ID="${{ github.event.issue.node_id }}"
+
+          # Get the project item ID for this issue using node lookup
+          ITEM_ID=$(gh api graphql -f query='
+            query($issueId: ID!) {
+              node(id: $issueId) {
+                ... on Issue {
+                  projectItems(first: 10) {
+                    nodes {
+                      id
+                      project { id }
+                    }
+                  }
+                }
+              }
+            }
+          ' -f issueId="$ISSUE_NODE_ID" \
+            --jq ".data.node.projectItems.nodes[] | select(.project.id == \"$PROJECT_ID\") | .id")
+
+          if [ -z "$ITEM_ID" ]; then
+            echo "Issue not found in project nex-taas, skipping"
+            exit 0
+          fi
+
+          # Set status to Cancelled
+          gh api graphql -f query='
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId
+                itemId: $itemId
+                fieldId: $fieldId
+                value: { singleSelectOptionId: $optionId }
+              }) {
+                projectV2Item { id }
+              }
+            }
+          ' -f projectId="$PROJECT_ID" -f itemId="$ITEM_ID" -f fieldId="$STATUS_FIELD_ID" -f optionId="$CANCELLED_OPTION_ID"
+
+          echo "✅ Set issue #${{ github.event.issue.number }} status to Cancelled"
