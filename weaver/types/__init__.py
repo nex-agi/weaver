@@ -14,6 +14,7 @@
 
 """Public type helpers re-exported for ergonomic imports."""
 
+from .checkpoint import Checkpoint
 from .datum import Datum
 from .lora_config import LoraConfig
 from .model_input import ModelInput, ModelInputChunk
@@ -23,6 +24,7 @@ from .tensor import TensorData
 
 __all__ = [
     "AdamParams",
+    "Checkpoint",
     "Datum",
     "LoraConfig",
     "ModelInput",

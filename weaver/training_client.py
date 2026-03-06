@@ -24,6 +24,7 @@ from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
+from .types.checkpoint import Checkpoint
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -250,6 +251,172 @@ class TrainingClient:
 
     def get_tokenizer(self):  # Backwards compatible accessor
         return self.tokenizer
+
+    # ------------------------------------------------------------------
+    # Checkpoint management
+    # ------------------------------------------------------------------
+
+    @overload
+    def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "training",
+        wait: Literal[True] = True,
+    ) -> str: ...
+
+    @overload
+    def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "training",
+        wait: Literal[False],
+    ) -> OperationHandle: ...
+
+    def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "training",
+        wait: bool = True,
+    ) -> str | OperationHandle:
+        """Save the current model weights as a checkpoint.
+
+        Args:
+            name: Optional checkpoint name. The server generates one if omitted.
+            checkpoint_type: ``"training"`` (default) or ``"training_with_optimizer"``.
+            wait: If True (default), blocks until the checkpoint is saved and
+                returns the checkpoint path. If False, returns an
+                :class:`OperationHandle` immediately.
+
+        Returns:
+            Checkpoint path (str) when *wait* is True, else an
+            :class:`OperationHandle`.
+
+        Raises:
+            RuntimeError: If the response is missing the checkpoint path.
+        """
+        body: Dict[str, Any] = {
+            "seq_id": self._next_seq(),
+            "checkpoint_type": checkpoint_type,
+        }
+        if name is not None:
+            body["name"] = name
+        handle = self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/checkpoints",
+            body,
+        )
+        if not wait:
+            return handle
+        result = handle.result()
+        path = lookup_case_insensitive(result or {}, "path")
+        if not path:
+            raise RuntimeError("Checkpoint response missing path")
+        return str(path)
+
+    @overload
+    def load_state(
+        self,
+        path: str,
+        *,
+        wait: Literal[True] = True,
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    def load_state(
+        self,
+        path: str,
+        *,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
+
+    def load_state(
+        self,
+        path: str,
+        *,
+        wait: bool = True,
+    ) -> OperationHandle | Dict[str, Any]:
+        """Restore model weights from a checkpoint (optimizer state is **not** restored).
+
+        Args:
+            path: Checkpoint path, as returned by :meth:`save_state` or
+                :meth:`list_checkpoints`.
+            wait: If True (default), blocks until the load completes.
+
+        Returns:
+            Server response dict when *wait* is True, else an
+            :class:`OperationHandle`.
+        """
+        body: Dict[str, Any] = {
+            "seq_id": self._next_seq(),
+            "path": path,
+            "include_optimizer": False,
+        }
+        handle = self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/load",
+            body,
+        )
+        return handle.result() if wait else handle
+
+    @overload
+    def load_state_with_optimizer(
+        self,
+        path: str,
+        *,
+        wait: Literal[True] = True,
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    def load_state_with_optimizer(
+        self,
+        path: str,
+        *,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
+
+    def load_state_with_optimizer(
+        self,
+        path: str,
+        *,
+        wait: bool = True,
+    ) -> OperationHandle | Dict[str, Any]:
+        """Restore model weights **and** optimizer state from a checkpoint.
+
+        This enables true resume-from-checkpoint training where Adam momentum
+        and other optimizer statistics are preserved.
+
+        Args:
+            path: Checkpoint path, as returned by :meth:`save_state` or
+                :meth:`list_checkpoints`.
+            wait: If True (default), blocks until the load completes.
+
+        Returns:
+            Server response dict when *wait* is True, else an
+            :class:`OperationHandle`.
+        """
+        body: Dict[str, Any] = {
+            "seq_id": self._next_seq(),
+            "path": path,
+            "include_optimizer": True,
+        }
+        handle = self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/load",
+            body,
+        )
+        return handle.result() if wait else handle
+
+    def list_checkpoints(self) -> list[Checkpoint]:
+        """List all checkpoints for this model.
+
+        Returns:
+            A list of :class:`~weaver.types.Checkpoint` objects.
+        """
+        response = self._service.http.get(
+            f"/api/v1/models/{self.model_id}/checkpoints",
+        )
+        items = (response or {}).get("items", []) if isinstance(response, dict) else []
+        return [Checkpoint.from_payload(item) for item in items if isinstance(item, dict)]
 
     def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:
         """Terminate trainer and/or inference instances for this model.
