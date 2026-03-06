@@ -54,7 +54,11 @@ class Checkpoint:
             id=str(lookup_case_insensitive(payload, "id") or ""),
             path=str(lookup_case_insensitive(payload, "path") or ""),
             name=_str_or_none(lookup_case_insensitive(payload, "name")),
-            checkpoint_type=str(lookup_case_insensitive(payload, "checkpoint_type") or "training"),
+            checkpoint_type=str(
+                lookup_case_insensitive(payload, "checkpoint_type")
+                or lookup_case_insensitive(payload, "type")
+                or "training"
+            ),
             status=_str_or_none(lookup_case_insensitive(payload, "status")),
         )
 

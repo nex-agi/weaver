@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -55,50 +55,52 @@ def _make_handle(result: Dict[str, Any] | None = None) -> MagicMock:
 
 
 class TestSaveState:
-    def test_save_state_wait_returns_path(self):
+    def test_save_state_returns_checkpoint(self):
         tc = _make_training_client()
-        handle = _make_handle({"path": "weaver://run/weights/ckpt-001"})
-        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.post.return_value = {
+            "id": "ckpt-1",
+            "path": "weaver://after-3-steps",
+            "type": "training",
+        }
 
-        path = tc.save_state(name="iter-100")
+        ckpt = tc.save_state(name="after-3-steps")
 
-        assert path == "weaver://run/weights/ckpt-001"
-        tc._service.enqueue_operation.assert_called_once()
-        args = tc._service.enqueue_operation.call_args
-        assert args[0][0] == "/api/v1/models/mdl-123/checkpoints"
-        body = args[0][1]
-        assert body["name"] == "iter-100"
-        assert body["checkpoint_type"] == "training"
+        assert isinstance(ckpt, Checkpoint)
+        assert ckpt.id == "ckpt-1"
+        assert ckpt.path == "weaver://after-3-steps"
+        tc._service.http.post.assert_called_once_with(
+            "/api/v1/models/mdl-123/checkpoints",
+            json={"type": "training", "path": "after-3-steps"},
+        )
 
-    def test_save_state_custom_checkpoint_type(self):
+    def test_save_state_custom_type(self):
         tc = _make_training_client()
-        handle = _make_handle({"path": "weaver://run/weights/ckpt-002"})
-        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.post.return_value = {
+            "id": "ckpt-2",
+            "path": "weaver://ckpt-2",
+            "type": "training_with_optimizer",
+        }
 
-        path = tc.save_state(checkpoint_type="training_with_optimizer")
+        ckpt = tc.save_state(checkpoint_type="training_with_optimizer")
 
-        body = tc._service.enqueue_operation.call_args[0][1]
-        assert body["checkpoint_type"] == "training_with_optimizer"
-        assert "name" not in body
-        assert path == "weaver://run/weights/ckpt-002"
+        body = tc._service.http.post.call_args
+        assert body[1]["json"]["type"] == "training_with_optimizer"
+        assert "path" not in body[1]["json"]
+        assert ckpt.checkpoint_type == "training_with_optimizer"
 
-    def test_save_state_no_wait_returns_handle(self):
+    def test_save_state_no_name(self):
         tc = _make_training_client()
-        handle = _make_handle()
-        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.post.return_value = {
+            "id": "ckpt-3",
+            "path": "weaver://auto-generated",
+            "type": "training",
+        }
 
-        result = tc.save_state(wait=False)
+        ckpt = tc.save_state()
 
-        assert result is handle
-        handle.result.assert_not_called()
-
-    def test_save_state_missing_path_raises(self):
-        tc = _make_training_client()
-        handle = _make_handle({})
-        tc._service.enqueue_operation.return_value = handle
-
-        with pytest.raises(RuntimeError, match="missing path"):
-            tc.save_state()
+        body = tc._service.http.post.call_args[1]["json"]
+        assert "path" not in body
+        assert ckpt.path == "weaver://auto-generated"
 
 
 # ---------------------------------------------------------------------------
@@ -107,18 +109,30 @@ class TestSaveState:
 
 
 class TestLoadState:
-    def test_load_state_wait(self):
+    def test_load_state_with_checkpoint_object(self):
         tc = _make_training_client()
         handle = _make_handle({"status": "done"})
         tc._service.enqueue_operation.return_value = handle
 
-        result = tc.load_state("weaver://run/weights/ckpt-001")
+        ckpt = Checkpoint(id="ckpt-1", path="weaver://ckpt-1")
+        result = tc.load_state(ckpt)
 
         assert result == {"status": "done"}
         args = tc._service.enqueue_operation.call_args
         assert args[0][0] == "/api/v1/models/mdl-123/load"
         body = args[0][1]
-        assert body["path"] == "weaver://run/weights/ckpt-001"
+        assert body["checkpoint_id"] == "ckpt-1"
+        assert body["include_optimizer"] is False
+
+    def test_load_state_with_string_id(self):
+        tc = _make_training_client()
+        handle = _make_handle({"status": "done"})
+        tc._service.enqueue_operation.return_value = handle
+
+        result = tc.load_state("ckpt-abc-123")
+
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["checkpoint_id"] == "ckpt-abc-123"
         assert body["include_optimizer"] is False
 
     def test_load_state_no_wait(self):
@@ -126,7 +140,7 @@ class TestLoadState:
         handle = _make_handle()
         tc._service.enqueue_operation.return_value = handle
 
-        result = tc.load_state("weaver://run/weights/ckpt-001", wait=False)
+        result = tc.load_state("ckpt-1", wait=False)
 
         assert result is handle
         handle.result.assert_not_called()
@@ -143,12 +157,12 @@ class TestLoadStateWithOptimizer:
         handle = _make_handle({"status": "done"})
         tc._service.enqueue_operation.return_value = handle
 
-        result = tc.load_state_with_optimizer("weaver://run/weights/ckpt-001")
+        ckpt = Checkpoint(id="ckpt-1", path="weaver://ckpt-1")
+        result = tc.load_state_with_optimizer(ckpt)
 
         assert result == {"status": "done"}
-        args = tc._service.enqueue_operation.call_args
-        body = args[0][1]
-        assert body["path"] == "weaver://run/weights/ckpt-001"
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["checkpoint_id"] == "ckpt-1"
         assert body["include_optimizer"] is True
 
     def test_load_state_with_optimizer_no_wait(self):
@@ -156,7 +170,7 @@ class TestLoadStateWithOptimizer:
         handle = _make_handle()
         tc._service.enqueue_operation.return_value = handle
 
-        result = tc.load_state_with_optimizer("weaver://run/weights/ckpt-001", wait=False)
+        result = tc.load_state_with_optimizer("ckpt-1", wait=False)
 
         assert result is handle
         handle.result.assert_not_called()
@@ -174,17 +188,14 @@ class TestListCheckpoints:
             "items": [
                 {
                     "id": "ckpt-1",
-                    "path": "weaver://run/weights/ckpt-1",
-                    "name": "iter-100",
-                    "checkpoint_type": "training",
+                    "path": "weaver://ckpt-1",
+                    "type": "training",
                     "status": "completed",
                 },
                 {
                     "id": "ckpt-2",
-                    "path": "weaver://run/weights/ckpt-2",
-                    "name": None,
-                    "checkpoint_type": "training_with_optimizer",
-                    "status": "completed",
+                    "path": "weaver://ckpt-2",
+                    "type": "training_with_optimizer",
                 },
             ]
         }
@@ -194,8 +205,7 @@ class TestListCheckpoints:
         assert len(checkpoints) == 2
         assert isinstance(checkpoints[0], Checkpoint)
         assert checkpoints[0].id == "ckpt-1"
-        assert checkpoints[0].path == "weaver://run/weights/ckpt-1"
-        assert checkpoints[0].name == "iter-100"
+        assert checkpoints[0].path == "weaver://ckpt-1"
         assert checkpoints[1].checkpoint_type == "training_with_optimizer"
         tc._service.http.get.assert_called_once_with(
             "/api/v1/models/mdl-123/checkpoints",
@@ -204,18 +214,12 @@ class TestListCheckpoints:
     def test_list_checkpoints_empty(self):
         tc = _make_training_client()
         tc._service.http.get.return_value = {"items": []}
-
-        checkpoints = tc.list_checkpoints()
-
-        assert checkpoints == []
+        assert tc.list_checkpoints() == []
 
     def test_list_checkpoints_none_response(self):
         tc = _make_training_client()
         tc._service.http.get.return_value = None
-
-        checkpoints = tc.list_checkpoints()
-
-        assert checkpoints == []
+        assert tc.list_checkpoints() == []
 
 
 # ---------------------------------------------------------------------------
@@ -227,20 +231,18 @@ class TestCheckpointType:
     def test_from_payload(self):
         payload = {
             "id": "ckpt-x",
-            "path": "weaver://run/weights/ckpt-x",
-            "name": "my-ckpt",
-            "checkpoint_type": "training",
+            "path": "weaver://ckpt-x",
+            "type": "training",
             "status": "completed",
         }
         ckpt = Checkpoint.from_payload(payload)
         assert ckpt.id == "ckpt-x"
-        assert ckpt.path == "weaver://run/weights/ckpt-x"
-        assert ckpt.name == "my-ckpt"
+        assert ckpt.path == "weaver://ckpt-x"
         assert ckpt.checkpoint_type == "training"
         assert ckpt.status == "completed"
 
     def test_from_payload_minimal(self):
-        payload = {"id": "ckpt-y", "path": "weaver://run/weights/ckpt-y"}
+        payload = {"id": "ckpt-y", "path": "weaver://ckpt-y"}
         ckpt = Checkpoint.from_payload(payload)
         assert ckpt.id == "ckpt-y"
         assert ckpt.name is None

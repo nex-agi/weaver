@@ -256,69 +256,37 @@ class TrainingClient:
     # Checkpoint management
     # ------------------------------------------------------------------
 
-    @overload
     def save_state(
         self,
         *,
         name: str | None = None,
         checkpoint_type: str = "training",
-        wait: Literal[True] = True,
-    ) -> str: ...
-
-    @overload
-    def save_state(
-        self,
-        *,
-        name: str | None = None,
-        checkpoint_type: str = "training",
-        wait: Literal[False],
-    ) -> OperationHandle: ...
-
-    def save_state(
-        self,
-        *,
-        name: str | None = None,
-        checkpoint_type: str = "training",
-        wait: bool = True,
-    ) -> str | OperationHandle:
+    ) -> Checkpoint:
         """Save the current model weights as a checkpoint.
 
         Args:
-            name: Optional checkpoint name. The server generates one if omitted.
-            checkpoint_type: ``"training"`` (default) or ``"training_with_optimizer"``.
-            wait: If True (default), blocks until the checkpoint is saved and
-                returns the checkpoint path. If False, returns an
-                :class:`OperationHandle` immediately.
+            name: Checkpoint path/name. The server prefixes it with
+                ``weaver://`` automatically.
+            checkpoint_type: ``"training"`` (default) or
+                ``"training_with_optimizer"``.
 
         Returns:
-            Checkpoint path (str) when *wait* is True, else an
-            :class:`OperationHandle`.
-
-        Raises:
-            RuntimeError: If the response is missing the checkpoint path.
+            A :class:`~weaver.types.Checkpoint` with the saved checkpoint
+            metadata (including ``id`` and ``path``).
         """
-        body: Dict[str, Any] = {
-            "seq_id": self._next_seq(),
-            "checkpoint_type": checkpoint_type,
-        }
+        body: Dict[str, Any] = {"type": checkpoint_type}
         if name is not None:
-            body["name"] = name
-        handle = self._service.enqueue_operation(
+            body["path"] = name
+        response = self._service.http.post(
             f"/api/v1/models/{self.model_id}/checkpoints",
-            body,
+            json=body,
         )
-        if not wait:
-            return handle
-        result = handle.result()
-        path = lookup_case_insensitive(result or {}, "path")
-        if not path:
-            raise RuntimeError("Checkpoint response missing path")
-        return str(path)
+        return Checkpoint.from_payload(response or {})
 
     @overload
     def load_state(
         self,
-        path: str,
+        checkpoint: str | Checkpoint,
         *,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
@@ -326,43 +294,35 @@ class TrainingClient:
     @overload
     def load_state(
         self,
-        path: str,
+        checkpoint: str | Checkpoint,
         *,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
     def load_state(
         self,
-        path: str,
+        checkpoint: str | Checkpoint,
         *,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         """Restore model weights from a checkpoint (optimizer state is **not** restored).
 
         Args:
-            path: Checkpoint path, as returned by :meth:`save_state` or
-                :meth:`list_checkpoints`.
+            checkpoint: A :class:`~weaver.types.Checkpoint` object (from
+                :meth:`save_state` or :meth:`list_checkpoints`), or a raw
+                checkpoint ID string.
             wait: If True (default), blocks until the load completes.
 
         Returns:
             Server response dict when *wait* is True, else an
             :class:`OperationHandle`.
         """
-        body: Dict[str, Any] = {
-            "seq_id": self._next_seq(),
-            "path": path,
-            "include_optimizer": False,
-        }
-        handle = self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/load",
-            body,
-        )
-        return handle.result() if wait else handle
+        return self._load_checkpoint(checkpoint, include_optimizer=False, wait=wait)
 
     @overload
     def load_state_with_optimizer(
         self,
-        path: str,
+        checkpoint: str | Checkpoint,
         *,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
@@ -370,14 +330,14 @@ class TrainingClient:
     @overload
     def load_state_with_optimizer(
         self,
-        path: str,
+        checkpoint: str | Checkpoint,
         *,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
     def load_state_with_optimizer(
         self,
-        path: str,
+        checkpoint: str | Checkpoint,
         *,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
@@ -387,18 +347,27 @@ class TrainingClient:
         and other optimizer statistics are preserved.
 
         Args:
-            path: Checkpoint path, as returned by :meth:`save_state` or
-                :meth:`list_checkpoints`.
+            checkpoint: A :class:`~weaver.types.Checkpoint` object or a raw
+                checkpoint ID string.
             wait: If True (default), blocks until the load completes.
 
         Returns:
             Server response dict when *wait* is True, else an
             :class:`OperationHandle`.
         """
+        return self._load_checkpoint(checkpoint, include_optimizer=True, wait=wait)
+
+    def _load_checkpoint(
+        self,
+        checkpoint: str | Checkpoint,
+        *,
+        include_optimizer: bool,
+        wait: bool,
+    ) -> OperationHandle | Dict[str, Any]:
+        checkpoint_id = checkpoint.id if isinstance(checkpoint, Checkpoint) else checkpoint
         body: Dict[str, Any] = {
-            "seq_id": self._next_seq(),
-            "path": path,
-            "include_optimizer": True,
+            "checkpoint_id": checkpoint_id,
+            "include_optimizer": include_optimizer,
         }
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/load",
