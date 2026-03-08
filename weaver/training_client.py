@@ -308,11 +308,8 @@ class TrainingClient:
         )
         if not wait:
             return handle
-        payload = handle.wait()
-        result = handle.response
-        if isinstance(result, dict):
-            return Checkpoint.from_payload(result)
-        return Checkpoint.from_payload(payload)
+        result = handle.result()
+        return Checkpoint.from_payload(result if isinstance(result, dict) else {})
 
     @overload
     def load_state(
