@@ -1,19 +1,19 @@
-## 前置准备
+## Prerequisites
 
 ```bash
-# 每次测试前确认服务状态
+# Verify service status before each test
 conda activate weaver
-# 记录 weaver-server 当前版本
+# Record the current weaver-server version
 curl -s http://<WEAVER_SERVER>/health
 ```
 
-**Pod 查询约定**（贯穿全文）：
-- 使用 `nex-taas-shared-knowledge` 里的 **infrawaves** skill，按 `model_id` 查询 pod
-- 使用 **volc-tls** skill 查询 provisioner 日志
+**Pod query conventions** (used throughout):
+- Use the **infrawaves** skill from `nex-taas-shared-knowledge` to query pods by `model_id`
+- Use the **volc-tls** skill to query provisioner logs
 
-**命名规则速查**：
-| 类型 | 命名格式 | 示例 |
-|------|----------|------|
+**Naming convention reference**:
+| Type | Naming format | Example |
+|------|---------------|---------|
 | full_ft trainer | `{USER}-trainer-full_ft-{model_id}` | `sunpeng-trainer-full_ft-{uuid}` |
 | full_ft inference | `fullft-{model_id}` | `fullft-{uuid}` |
 | LoRA trainer | `trainer-lora-weaver-{base_model}` | `trainer-lora-weaver-qwen-qwen3-8b` |
@@ -21,214 +21,214 @@ curl -s http://<WEAVER_SERVER>/health
 
 ---
 
-## GROUP 1：Full FT 基础场景（F1 ~ F2）
+## GROUP 1: Full FT Basic Scenarios (F1 - F2)
 
-### F1：首次启动单个 full_ft 任务
+### F1: First full_ft launch
 
-**目的**：验证 full_ft 首次 auto-provision 正常，任务结束后 pod 自动终止。
+**Goal**: Verify full_ft auto-provision works on first launch, and pods auto-terminate after training completes.
 
-**步骤**：
-1. 启动训练脚本：
+**Steps**:
+1. Start the training script:
    ```bash
    conda activate weaver
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_f1.log
    ```
-2. 等待日志中出现 `Model ID: <uuid>`，记录该 `model_id`（以下称 `MODEL_F1`）。
+2. Wait for `Model ID: <uuid>` to appear in logs and record the `model_id` (referred to as `MODEL_F1` below).
 
-**预期行为**：
-- [ ] 日志中出现 `Model ID: MODEL_F1`
-- [ ] 集群上能看到 `sunpeng-trainer-full_ft-MODEL_F1` 和 `fullft-MODEL_F1` 两个 pod 均正常运行
-- [ ] loss 从约 4.x 开始持续下降至 0.1 附近
-- [ ] 训练结束后，两个 pod 均自动终止（约 2min 内消失）
+**Expected behavior**:
+- [ ] Logs show `Model ID: MODEL_F1`
+- [ ] Cluster shows both `sunpeng-trainer-full_ft-MODEL_F1` and `fullft-MODEL_F1` pods running normally
+- [ ] Loss starts around 4.x and decreases steadily to ~0.1
+- [ ] After training completes, both pods auto-terminate (disappear within ~2 minutes)
 
-**验证命令**：
+**Verification commands**:
 ```bash
-# 查询 pod（使用 infrawaves skill）
-# 按 model_id = MODEL_F1 查
+# Query pods (using infrawaves skill)
+# Search by model_id = MODEL_F1
 
-# 任务结束后确认 pod 已清理
-# 如 pod 残留，使用 volc-tls skill 查 provisioner 日志
+# After training completes, confirm pods are cleaned up
+# If pods remain, use volc-tls skill to check provisioner logs
 ```
 
-**如有问题**：使用 volc-tls skill 检查 weaver provisioner 日志，结合 `internal/services/instance_orchestrator.go` 的 terminate 逻辑分析原因。
+**If issues arise**: Use the volc-tls skill to check weaver provisioner logs. Cross-reference with the terminate logic in `internal/services/instance_orchestrator.go`.
 
 ---
 
-### F2：第二次启动（新 model_id，同 base_model）
+### F2: Second launch (new model_id, same base_model)
 
-**目的**：验证 full_ft 每次新建独立 trainer/inference，不复用前一次。
+**Goal**: Verify that each full_ft creates independent trainer/inference pods and does not reuse the previous ones.
 
-**步骤**：
-1. 确认 F1 的 pod 已全部终止。
-2. 再次启动：
+**Steps**:
+1. Confirm all F1 pods have terminated.
+2. Launch again:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_f2.log
    ```
-3. 记录新的 `model_id`（称 `MODEL_F2`）。
+3. Record the new `model_id` (referred to as `MODEL_F2`).
 
-**预期行为**：
-- [ ] `MODEL_F2 ≠ MODEL_F1`（新 UUID）
-- [ ] 新创建 `sunpeng-trainer-full_ft-MODEL_F2` 和 `fullft-MODEL_F2`，与 F1 命名完全不同
-- [ ] 训练正常完成，pod 自动终止
-
----
-
-> ⏳ **等待 2 分钟后开始下一组**
+**Expected behavior**:
+- [ ] `MODEL_F2 != MODEL_F1` (new UUID)
+- [ ] New pods `sunpeng-trainer-full_ft-MODEL_F2` and `fullft-MODEL_F2` are created, with completely different names from F1
+- [ ] Training completes normally, pods auto-terminate
 
 ---
 
-## GROUP 2：Full FT 并发场景（F3 ~ F4）
+> Wait 2 minutes before starting the next group
 
-### F3：并发 2 个 full_ft（核心场景）
+---
 
-**目的**：验证两个 full_ft 并发完全隔离、互不影响。
+## GROUP 2: Full FT Concurrent Scenarios (F3 - F4)
 
-**步骤**：
-1. 在 Terminal A 启动第一个：
+### F3: 2 concurrent full_ft jobs (core scenario)
+
+**Goal**: Verify two concurrent full_ft jobs are fully isolated and do not interfere with each other.
+
+**Steps**:
+1. In Terminal A, start the first job:
    ```bash
    conda activate weaver
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_f3a.log
    ```
-2. 等待约 10 秒（第一个正在运行），在 Terminal B 启动第二个：
+2. Wait ~10 seconds (first job is running), then start the second in Terminal B:
    ```bash
    conda activate weaver
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_f3b.log
    ```
-3. 分别记录两个 `model_id`（称 `MODEL_F3A`、`MODEL_F3B`）。
+3. Record both `model_id` values (referred to as `MODEL_F3A` and `MODEL_F3B`).
 
-**预期行为**：
-- [ ] 两个脚本都输出各自的 `Model ID`，两个 UUID 不同
-- [ ] 集群上能同时看到 **4 个 pod**：
+**Expected behavior**:
+- [ ] Both scripts output their own `Model ID` with different UUIDs
+- [ ] Cluster shows **4 pods** simultaneously:
   - `sunpeng-trainer-full_ft-MODEL_F3A`
   - `fullft-MODEL_F3A`
   - `sunpeng-trainer-full_ft-MODEL_F3B`
   - `fullft-MODEL_F3B`
-- [ ] 两边 loss 各自独立从 4.x 下降，不互相干扰
-- [ ] 任务结束后，4 个 pod 全部自动终止
+- [ ] Both loss curves decrease independently from ~4.x without interfering with each other
+- [ ] After completion, all 4 pods auto-terminate
 
 ---
 
-### F4：并发 3 个 full_ft（压力场景）
+### F4: 3 concurrent full_ft jobs (stress test)
 
-**目的**：验证 provisioner 在高并发下无竞态、无丢失。
+**Goal**: Verify the provisioner has no race conditions or lost requests under high concurrency.
 
-**步骤**：
-1. Terminal A 启动：
+**Steps**:
+1. Terminal A:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_f4a.log
    ```
-2. 约 5 秒后 Terminal B：
+2. ~5 seconds later, Terminal B:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_f4b.log
    ```
-3. 约 5 秒后 Terminal C：
+3. ~5 seconds later, Terminal C:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_f4c.log
    ```
 
-**预期行为**：
-- [ ] 3 个脚本都成功获得不同的 `Model ID`
-- [ ] 集群上最终存在 **6 个 pod**（3 组 trainer + inference）
-- [ ] 3 个 loss 曲线各自独立下降
-- [ ] 结束后 6 个 pod 均自动清理
+**Expected behavior**:
+- [ ] All 3 scripts obtain different `Model ID` values
+- [ ] Cluster shows **6 pods** total (3 sets of trainer + inference)
+- [ ] All 3 loss curves decrease independently
+- [ ] After completion, all 6 pods are automatically cleaned up
 
 ---
 
-> ⏳ **等待 2 分钟后开始下一组**
+> Wait 2 minutes before starting the next group
 
 ---
 
-## GROUP 3：LoRA 基础 & 共享场景（L1 ~ L4）
+## GROUP 3: LoRA Basic & Sharing Scenarios (L1 - L4)
 
-### L1：首次启动单个 LoRA 任务
+### L1: First LoRA launch
 
-**目的**：验证 LoRA 首次 auto-provision，命名为 `weaver-{base_model}`。
+**Goal**: Verify LoRA auto-provision works, with pods named as `weaver-{base_model}`.
 
-**步骤**：
+**Steps**:
 ```bash
 conda activate weaver
 python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_lora.py 2>&1 | tee /tmp/test_l1.log
 ```
 
-**预期行为**：
-- [ ] 日志中出现 `Model ID: MODEL_L1`
-- [ ] 集群上 trainer pod 名为 `trainer-lora-weaver-<base_model>`（**非** model_id）
-- [ ] inference pod 名为 `weaver-<base_model>`
-- [ ] loss 正常下降
-- [ ] 任务结束后 pod 自动终止（LoRA 任务结束触发 terminate，与 full_ft 相同）
+**Expected behavior**:
+- [ ] Logs show `Model ID: MODEL_L1`
+- [ ] Trainer pod is named `trainer-lora-weaver-<base_model>` (**not** model_id)
+- [ ] Inference pod is named `weaver-<base_model>`
+- [ ] Loss decreases normally
+- [ ] Pods auto-terminate after training completes (same terminate behavior as full_ft)
 
 ---
 
-### L2：第二次 LoRA 启动（共享验证，核心）
+### L2: Second LoRA launch (shared trainer verification, core test)
 
-**目的**：验证相同 base_model 的第二个 LoRA 不新建 pod，复用已有 trainer/inference。
+**Goal**: Verify that a second LoRA with the same base_model does not create new pods but reuses the existing trainer/inference.
 
-**步骤**：
-1. **L1 的 pod 仍在运行时**，或 L1 结束后重新启动：
+**Steps**:
+1. **While L1 pods are still running**, or after L1 ends and pods restart:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_lora.py 2>&1 | tee /tmp/test_l2.log
    ```
-2. 记录新的 `MODEL_L2`。
+2. Record the new `MODEL_L2`.
 
-**预期行为**：
-- [ ] `MODEL_L2 ≠ MODEL_L1`（新 UUID）
-- [ ] **不产生新的 pod**，仍是 `trainer-lora-weaver-<base_model>` 那一个
-- [ ] 集群上 pod 数量不变（没有新增）
-- [ ] 训练正常完成
+**Expected behavior**:
+- [ ] `MODEL_L2 != MODEL_L1` (new UUID)
+- [ ] **No new pods created** — still uses the same `trainer-lora-weaver-<base_model>` pod
+- [ ] Pod count on the cluster remains unchanged (no additions)
+- [ ] Training completes normally
 
-> ⚠️ 若 L1 结束后 pod 已终止，L2 会触发新的 provision——这是正常行为（idle cleanup 后重建）。此场景重点测 L1 **结束前** 立即启动 L2。
+> Note: If L1 pods have already terminated, L2 will trigger a new provision — this is expected (rebuild after idle cleanup). The key scenario to test is launching L2 **before** L1 finishes.
 
 ---
 
-### L3：并发 2 个 LoRA（相同 base_model，去重验证）
+### L3: 2 concurrent LoRA jobs (same base_model, dedup verification)
 
-**目的**：验证 `checkExistingLoRATrainer` 去重逻辑，并发时只创建一组 pod。
+**Goal**: Verify the `checkExistingLoRATrainer` dedup logic — only one set of pods should be created under concurrent launches.
 
-**步骤**：
-1. Terminal A：
+**Steps**:
+1. Terminal A:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_lora.py 2>&1 | tee /tmp/test_l3a.log
    ```
-2. **立即**（同一时刻）Terminal B：
+2. **Immediately** (at the same time) in Terminal B:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_lora.py 2>&1 | tee /tmp/test_l3b.log
    ```
 
-**预期行为**：
-- [ ] 两个脚本都获得各自的 `Model ID`
-- [ ] 集群上**只有 1 组 pod**（trainer + inference），命名为 `weaver-{base_model}` 系列
-- [ ] 没有出现重复 provision 的 pod
-- [ ] 两个训练任务都正常运行（共享同一 trainer）
+**Expected behavior**:
+- [ ] Both scripts obtain their own `Model ID`
+- [ ] Cluster shows **only 1 set of pods** (trainer + inference), named `weaver-{base_model}`
+- [ ] No duplicate provisioned pods appear
+- [ ] Both training jobs run normally (sharing the same trainer)
 
 ---
 
-### L4：并发 2 个 LoRA（不同 base_model，独立 provision）
+### L4: 2 concurrent LoRA jobs (different base_model, independent provision)
 
-**目的**：验证不同 base_model 的 LoRA 各自独立 provision。
+**Goal**: Verify that LoRA jobs with different base_models provision independently.
 
-**步骤**：
-1. Terminal A（base_model A，如 Qwen3-8B）：
+**Steps**:
+1. Terminal A (base_model A, e.g., Qwen3-8B):
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_lora.py 2>&1 | tee /tmp/test_l4a.log
    ```
-2. Terminal B（base_model B，如 Qwen3-14B，如有）：
+2. Terminal B (base_model B, e.g., Qwen3-14B, if available):
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_lora_14b.py 2>&1 | tee /tmp/test_l4b.log
    ```
 
-**预期行为**：
-- [ ] 集群上出现 **2 组不同命名的 pod**（`weaver-qwen3-8b` 系列 + `weaver-qwen3-14b` 系列）
-- [ ] 两者互不干扰，各自 loss 下降
+**Expected behavior**:
+- [ ] Cluster shows **2 differently named pod sets** (`weaver-qwen3-8b` series + `weaver-qwen3-14b` series)
+- [ ] Both run without interfering with each other, each with decreasing loss
 
 ---
 
-> ⏳ **等待 2 分钟后开始下一组**
+> Wait 2 minutes before starting the next group
 
 ---
 
-## GROUP 4：Debug Mode Auto（DA1 ~ DA4）
+## GROUP 4: Debug Mode Auto (DA1 - DA4)
 
-> **前置**：注册一个 `debug_mode: "auto"` 的 supported model（见 PR #28 示例）
+> **Prerequisite**: Register a supported model with `debug_mode: "auto"` (see PR #28 for example)
 
 ```bash
 curl -X PUT http://<WEAVER_SERVER>/api/v1/supported-models \
@@ -246,79 +246,79 @@ curl -X PUT http://<WEAVER_SERVER>/api/v1/supported-models \
 
 ---
 
-### DA1：首次启动 debug auto
+### DA1: First debug auto launch
 
-**步骤**：
+**Steps**:
 ```bash
 python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft_debug_auto.py 2>&1 | tee /tmp/test_da1.log
 ```
 
-**预期行为**：
-- [ ] 正常 provision（torchrun 自动运行）
-- [ ] 训练完成后 **pod 不终止**（debug 模式禁用 auto-termination）
-- [ ] 集群上 `sunpeng-trainer-full_ft-<model_id>` 和 `fullft-<model_id>` 仍存活
+**Expected behavior**:
+- [ ] Provisions normally (torchrun starts automatically)
+- [ ] After training completes, **pods do NOT terminate** (debug mode disables auto-termination)
+- [ ] Cluster shows `sunpeng-trainer-full_ft-<model_id>` and `fullft-<model_id>` still alive
 
 ---
 
-### DA2：第二次启动（pod 仍在）
+### DA2: Second launch (pods still running)
 
-**步骤**（DA1 结束后，pod 仍存活时立即执行）：
+**Steps** (execute immediately after DA1 finishes, while pods are still alive):
 ```bash
 python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft_debug_auto.py 2>&1 | tee /tmp/test_da2.log
 ```
 
-**预期行为**：
-- [ ] **跳过 provision**，不新建 pod（日志中应有 debug skip 相关输出）
-- [ ] `seq_id` 被重置，训练从头开始
-- [ ] 复用 GPU 内存中的模型权重（无 checkpoint 加载）
-- [ ] pod 数量不变
+**Expected behavior**:
+- [ ] **Skips provision** — no new pods created (logs should show debug skip output)
+- [ ] `seq_id` is reset, training starts from the beginning
+- [ ] Reuses model weights already in GPU memory (no checkpoint loading)
+- [ ] Pod count remains unchanged
 
 ---
 
-### DA3：第二次启动（pod 已崩溃）
+### DA3: Second launch (pods have crashed)
 
-**步骤**：
-1. 手动删除 DA1 创建的 pod：
+**Steps**:
+1. Manually delete the pods created by DA1:
    ```bash
    kubectl delete job sunpeng-trainer-full_ft-<da1_model_id> -n <namespace>
    ```
-2. 启动脚本：
+2. Launch the script:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft_debug_auto.py 2>&1 | tee /tmp/test_da3.log
    ```
 
-**预期行为**：
-- [ ] 检测到 pod 不存在，**重新触发 provision**
-- [ ] 新的 pod 创建并正常运行
-- [ ] 训练正常完成
+**Expected behavior**:
+- [ ] Detects that pods no longer exist, **triggers re-provision**
+- [ ] New pods are created and run normally
+- [ ] Training completes successfully
 
 ---
 
-### DA4：并发 2 次 debug auto（竞态验证）
+### DA4: 2 concurrent debug auto launches (race condition verification)
 
-**目的**：验证并发情况下不产生重复 provision。
+**Goal**: Verify no duplicate provision occurs under concurrent launches.
 
-**步骤**：两个 Terminal 同时运行（间隔 < 1s）
+**Steps**: Run in two terminals simultaneously (< 1 second apart)
 ```bash
-# Terminal A & B 同时执行
+# Terminal A & B run at the same time
 python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft_debug_auto.py 2>&1 | tee /tmp/test_da4a.log
 python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft_debug_auto.py 2>&1 | tee /tmp/test_da4b.log
 ```
 
-**预期行为**：
-- [ ] **只创建一组 pod**（不重复 provision）
-- [ ] 两个脚本都能正常运行（一个 provision、一个跳过）
-- [ ] 无重复 pod 出现
+**Expected behavior**:
+- [ ] **Only one set of pods** is created (no duplicate provision)
+- [ ] Both scripts run successfully (one provisions, the other skips)
+- [ ] No duplicate pods appear
 
 ---
 
-> ⏳ **等待 2 分钟后开始下一组**
+> Wait 2 minutes before starting the next group
 
 ---
 
-## GROUP 5：Debug Mode Manual（DM1 ~ DM3）
+## GROUP 5: Debug Mode Manual (DM1 - DM3)
 
-> **前置**：注册 `debug_mode: "manual"` 的 supported model
+> **Prerequisite**: Register a supported model with `debug_mode: "manual"`
 
 ```bash
 curl -X PUT http://<WEAVER_SERVER>/api/v1/supported-models \
@@ -336,11 +336,11 @@ curl -X PUT http://<WEAVER_SERVER>/api/v1/supported-models \
 
 ---
 
-### DM1：create_model 验证 debug_info（不触发 provision）
+### DM1: Verify debug_info from create_model (no provision triggered)
 
-**目的**：验证 `create_model` 只创建模型记录并返回 `debug_info`，**不会触发 provision**。Provision 由后续的 `forward_backward` 或 `forward` 调用触发。
+**Goal**: Verify that `create_model` only creates a model record and returns `debug_info`, **without triggering provision**. Provision is triggered by subsequent `forward_backward` or `forward` calls.
 
-**步骤**：
+**Steps**:
 ```bash
 curl -X POST http://<WEAVER_SERVER>/api/v1/sessions/<session_id>/models \
   -H "X-WEAVER-API-KEY: <key>" \
@@ -348,169 +348,169 @@ curl -X POST http://<WEAVER_SERVER>/api/v1/sessions/<session_id>/models \
   -d '{"base_model": "debug-manual/pig-latin", "training_mode": "full_ft", "model_seq_id": 1}'
 ```
 
-**预期行为**：
-- [ ] Response 中包含 `debug_info` 字段，内容包括：
+**Expected behavior**:
+- [ ] Response contains a `debug_info` field with:
   - `debug_mode: "manual"`
   - `job_name: "sunpeng-trainer-full_ft-<model_id>"`
   - `namespace`
   - `kubectl_exec: "kubectl exec -it sunpeng-trainer-full_ft-<model_id>-master-0 -n <ns> -- /bin/bash"`
   - `config_file: "/tmp/trainer.env"`
-- [ ] **此时集群上没有 pod 创建**（`create_model` 不触发 provision）
+- [ ] **No pods are created on the cluster at this point** (`create_model` does not trigger provision)
 
 ---
 
-### DM2：forward_backward 触发 provision，手动运行 torchrun
+### DM2: forward_backward triggers provision, manually run torchrun
 
-**目的**：验证调用 `forward_backward`（或 `forward`）时才触发 provision，manual 模式下 pod 运行 `sleep infinity`。
+**Goal**: Verify that provision is triggered only when `forward_backward` (or `forward`) is called, and in manual mode the pod runs `sleep infinity`.
 
-**步骤**：
-1. 使用 SDK 调用 `forward_backward`（或 `forward`），触发 provision：
+**Steps**:
+1. Use the SDK to call `forward_backward` (or `forward`) to trigger provision:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft_debug_manual.py 2>&1 | tee /tmp/test_dm2.log
    ```
-2. 等待 pod 创建完成，确认 pod 运行 `sleep infinity`（不是 torchrun）：
+2. Wait for pod creation, then confirm the pod is running `sleep infinity` (not torchrun):
    ```bash
    kubectl get pod -n <namespace> | grep sunpeng-trainer-full_ft-<model_id>
    ```
-3. 根据 DM1 返回的 `kubectl_exec` 命令进入 pod：
+3. Exec into the pod using the `kubectl_exec` command from DM1:
    ```bash
    kubectl exec -it sunpeng-trainer-full_ft-<model_id>-master-0 -n <namespace> -- /bin/bash
    ```
-4. 验证配置文件：
+4. Verify the config file:
    ```bash
    cat /tmp/trainer.env
    ```
-5. 手动运行 torchrun：
+5. Manually start torchrun:
    ```bash
    torchrun --nnodes=$WORLD_SIZE --nproc_per_node=8 --node_rank=$RANK \
      --rdzv_backend=c10d --rdzv_endpoint=$MASTER_ADDR:29500 \
      -m weaver-trainer.worker_process --env-file /tmp/trainer.env
    ```
 
-**预期行为**：
-- [ ] `forward_backward`/`forward` 调用后才触发 provision，pod 开始创建
-- [ ] Pod 启动后运行 `sleep infinity`（不是 torchrun）
-- [ ] `kubectl get pod` 确认 pod 处于 Running 状态
-- [ ] `/tmp/trainer.env` 内容正确（包含 model 配置、server_url、api_key 等）
-- [ ] 手动 torchrun 正常启动，loss 开始下降
+**Expected behavior**:
+- [ ] Provision is triggered only after `forward_backward`/`forward` is called — pods start creating
+- [ ] Pod starts running `sleep infinity` (not torchrun)
+- [ ] `kubectl get pod` confirms pod is in Running state
+- [ ] `/tmp/trainer.env` contains correct content (model config, server_url, api_key, etc.)
+- [ ] Manual torchrun starts successfully and loss begins decreasing
 
 ---
 
-### DM3：第二次 forward_backward（pod 仍在，跳过 provision）
+### DM3: Second forward_backward (pods still running, skip provision)
 
-**步骤**（DM2 结束后 pod 仍存活）：
-1. 再次调用 `create_model`：
+**Steps** (while DM2 pods are still alive):
+1. Call `create_model` again:
    ```bash
    curl -X POST http://<WEAVER_SERVER>/api/v1/sessions/<session_id>/models \
      -H "X-WEAVER-API-KEY: <key>" \
      -H "Content-Type: application/json" \
      -d '{"base_model": "debug-manual/pig-latin", "training_mode": "full_ft", "model_seq_id": 2}'
    ```
-2. 再次调用 `forward_backward`（或 `forward`）触发训练。
+2. Call `forward_backward` (or `forward`) again to trigger training.
 
-**预期行为**：
-- [ ] `create_model` 返回 `debug_info`（复用已有 pod 的信息）
-- [ ] `forward_backward`/`forward` 时 **跳过 provision**，不新建 pod
-- [ ] `kubectl exec` 命令仍然有效（pod 未变）
-
----
-
-> ⏳ **等待 2 分钟后开始下一组**
+**Expected behavior**:
+- [ ] `create_model` returns `debug_info` (reusing existing pod information)
+- [ ] `forward_backward`/`forward` **skips provision** — no new pods created
+- [ ] `kubectl exec` command still works (pod has not changed)
 
 ---
 
-## GROUP 6：边界 & 异常场景（E1 ~ E4）
+> Wait 2 minutes before starting the next group
 
-### E1：full_ft pod 中途 crash，验证 stale 恢复
+---
 
-**步骤**：
-1. 启动 full_ft 任务，等待 pod 创建：
+## GROUP 6: Edge & Error Scenarios (E1 - E4)
+
+### E1: full_ft pod mid-training crash, verify stale recovery
+
+**Steps**:
+1. Start a full_ft job and wait for pods to be created:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py &
    ```
-2. pod 创建后立即 kill：
+2. Once pods are created, kill the trainer pod:
    ```bash
    kubectl delete pod sunpeng-trainer-full_ft-<model_id>-master-0 -n <namespace>
    ```
 
-**预期行为**：
-- [ ] provisioner 检测到 stale instance（instance 状态异常）
-- [ ] 使用 volc-tls skill 查看 provisioner 日志，确认有 stale 检测和重新 provision 的日志
+**Expected behavior**:
+- [ ] Provisioner detects the stale instance (abnormal instance state)
+- [ ] Use the volc-tls skill to check provisioner logs and confirm stale detection and re-provision log entries
 
 ---
 
-### E2：LoRA pod 消失后重启
+### E2: LoRA pod disappears, verify restart
 
-**步骤**：
-1. LoRA 任务运行中，删除 trainer pod。
-2. 下次启动新的 LoRA 任务（同 base_model）。
+**Steps**:
+1. While a LoRA job is running, delete the trainer pod.
+2. Start a new LoRA job with the same base_model.
 
-**预期行为**：
-- [ ] `checkExistingLoRATrainer` 检测到 pod 不健康
-- [ ] 重新触发 provision（不复用已死的 pod）
-- [ ] 新 pod 正常创建
+**Expected behavior**:
+- [ ] `checkExistingLoRATrainer` detects the pod is unhealthy
+- [ ] Re-triggers provision (does not reuse the dead pod)
+- [ ] New pod is created normally
 
 ---
 
-### E3：不存在的 base_model 启动
+### E3: Launch with non-existent base_model
 
-**步骤**：
+**Steps**:
 ```bash
 curl -X POST http://<WEAVER_SERVER>/api/v1/sessions/<session_id>/models \
   -H "X-WEAVER-API-KEY: <key>" \
   -d '{"base_model": "nonexistent/model-xyz", "training_mode": "full_ft"}'
 ```
 
-**预期行为**：
-- [ ] 返回 4xx 错误（不是 500）
-- [ ] **不产生悬空的 instance 记录**（数据库中无孤立记录）
+**Expected behavior**:
+- [ ] Returns a 4xx error (not 500)
+- [ ] **No orphaned instance records** are left in the database
 
 ---
 
-### E4：full_ft + LoRA 同 base_model 混合并发
+### E4: Concurrent full_ft + LoRA with the same base_model
 
-**步骤**：
-1. Terminal A 启动 full_ft：
+**Steps**:
+1. Terminal A — start full_ft:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_fullft.py 2>&1 | tee /tmp/test_e4a.log
    ```
-2. Terminal B 同时启动 LoRA：
+2. Terminal B — simultaneously start LoRA:
    ```bash
    python3 /gpfs/users/sunpeng/code/bp/NexWeave/weaver/examples/pig_latin_lora.py 2>&1 | tee /tmp/test_e4b.log
    ```
 
-**预期行为**：
-- [ ] full_ft 产生 `sunpeng-trainer-full_ft-<model_id>` 和 `fullft-<model_id>`
-- [ ] LoRA 产生 `trainer-lora-weaver-<base_model>` 和 `weaver-<base_model>`
-- [ ] 两组 pod 互不干扰，各自正常运行
-- [ ] 命名完全不同，无混淆
+**Expected behavior**:
+- [ ] full_ft creates `sunpeng-trainer-full_ft-<model_id>` and `fullft-<model_id>`
+- [ ] LoRA creates `trainer-lora-weaver-<base_model>` and `weaver-<base_model>`
+- [ ] Both pod sets run without interfering with each other
+- [ ] Naming is completely different with no confusion
 
 ---
 
-## 问题排查流程（全局）
+## Troubleshooting Guide (Global)
 
-任何 case 出现异常时，按以下顺序排查：
+When any test case encounters issues, follow this troubleshooting order:
 
-1. **查看脚本日志**：`/tmp/test_*.log`
-2. **查 pod 状态**（infrawaves skill，按 model_id）
-3. **查 provisioner 日志**（volc-tls skill）：
-   - 关键词：`provisioning`, `terminate`, `skip`, `debug`, `stale`, `lora dedup`
-4. **查 weaver-server 代码**：
-   - auto-provision 逻辑：`internal/services/instance_orchestrator.go`
-   - LoRA 去重：`checkExistingLoRATrainer()`
-   - debug mode：`extractDebugMode()`, `provisionNewTrainer()`
-   - terminate：`HandleTerminate()` → `getTrainingMode() == "lora"` 时跳过
-5. **定位问题后**：在 `china-qijizhifeng/weaver-server` 创建 bug issue，关联 feedback repo
+1. **Check script logs**: `/tmp/test_*.log`
+2. **Check pod status** (infrawaves skill, search by model_id)
+3. **Check provisioner logs** (volc-tls skill):
+   - Keywords: `provisioning`, `terminate`, `skip`, `debug`, `stale`, `lora dedup`
+4. **Check weaver-server code**:
+   - Auto-provision logic: `internal/services/instance_orchestrator.go`
+   - LoRA dedup: `checkExistingLoRATrainer()`
+   - Debug mode: `extractDebugMode()`, `provisionNewTrainer()`
+   - Terminate: `HandleTerminate()` — skipped when `getTrainingMode() == "lora"`
+5. **After identifying the issue**: Create a bug issue in `china-qijizhifeng/weaver-server` and link it to the feedback repo
 
 ---
 
-## 测试完成标准
+## Completion Criteria
 
-| 分组 | Case 数 | 全通条件 |
-|------|---------|----------|
-| Full FT 基础 | F1, F2 | pod 正确命名、loss 下降、自动终止 |
-| Full FT 并发 | F3, F4 | 所有 pod 独立存在、无干扰 |
-| LoRA | L1~L4 | 共享去重正确、命名符合规范 |
-| Debug Auto | DA1~DA4 | 首次正常、二次跳过、并发不重复 |
-| Debug Manual | DM1~DM3 | create_model 不触发 provision、forward_backward 触发 provision、sleep infinity、跳过复用 |
-| 边界异常 | E1~E4 | 错误处理正确、无数据污染 |
+| Group | Test Cases | Pass Criteria |
+|-------|------------|---------------|
+| Full FT Basic | F1, F2 | Pods correctly named, loss decreasing, auto-terminated |
+| Full FT Concurrent | F3, F4 | All pods exist independently, no interference |
+| LoRA | L1-L4 | Shared trainer dedup works correctly, naming follows convention |
+| Debug Auto | DA1-DA4 | First launch normal, second skips provision, concurrent no duplicates |
+| Debug Manual | DM1-DM3 | create_model does not trigger provision, forward_backward triggers provision, sleep infinity, skip and reuse |
+| Edge Cases | E1-E4 | Correct error handling, no data pollution |
