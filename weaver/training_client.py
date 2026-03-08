@@ -256,13 +256,35 @@ class TrainingClient:
     # Checkpoint management
     # ------------------------------------------------------------------
 
+    @overload
     def save_state(
         self,
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
-    ) -> Checkpoint:
+        wait: Literal[True] = True,
+    ) -> Checkpoint: ...
+
+    @overload
+    def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "weight",
+        wait: Literal[False],
+    ) -> OperationHandle: ...
+
+    def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "weight",
+        wait: bool = True,
+    ) -> Checkpoint | OperationHandle:
         """Save the current model weights as a checkpoint.
+
+        The server dispatches an async save task to the trainer, which
+        writes weight files to disk at a server-generated path.
 
         Args:
             name: Human-readable checkpoint label (e.g. ``"step-100"``).
@@ -270,19 +292,27 @@ class TrainingClient:
                 the model ID automatically.
             checkpoint_type: ``"weight"`` (default) or
                 ``"weight_and_optimizer"``.
+            wait: If True (default), blocks until the save completes and
+                returns a :class:`~weaver.types.Checkpoint`.
 
         Returns:
-            A :class:`~weaver.types.Checkpoint` with ``id``, ``path``
-            (server-generated), and ``name``.
+            A :class:`~weaver.types.Checkpoint` when *wait* is True, else
+            an :class:`OperationHandle`.
         """
         body: Dict[str, Any] = {"type": checkpoint_type}
         if name is not None:
             body["name"] = name
-        response = self._service.http.post(
+        handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/checkpoints",
-            json=body,
+            body,
         )
-        return Checkpoint.from_payload(response or {})
+        if not wait:
+            return handle
+        payload = handle.wait()
+        result = handle.response
+        if isinstance(result, dict):
+            return Checkpoint.from_payload(result)
+        return Checkpoint.from_payload(payload)
 
     @overload
     def load_state(

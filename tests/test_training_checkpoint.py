@@ -57,50 +57,70 @@ def _make_handle(result: Dict[str, Any] | None = None) -> MagicMock:
 class TestSaveState:
     def test_save_state_returns_checkpoint(self):
         tc = _make_training_client()
-        tc._service.http.post.return_value = {
-            "id": "ckpt-1",
-            "path": "weaver://after-3-steps",
-            "type": "weight",
-        }
+        handle = _make_handle(
+            {
+                "id": "ckpt-1",
+                "path": "weaver://mdl-123/checkpoints/after-3-steps",
+                "name": "after-3-steps",
+                "type": "weight",
+            }
+        )
+        tc._service.enqueue_operation.return_value = handle
 
         ckpt = tc.save_state(name="after-3-steps")
 
         assert isinstance(ckpt, Checkpoint)
         assert ckpt.id == "ckpt-1"
-        assert ckpt.path == "weaver://after-3-steps"
-        tc._service.http.post.assert_called_once_with(
-            "/api/v1/models/mdl-123/checkpoints",
-            json={"type": "weight", "name": "after-3-steps"},
-        )
+        assert ckpt.path == "weaver://mdl-123/checkpoints/after-3-steps"
+        assert ckpt.name == "after-3-steps"
+        args = tc._service.enqueue_operation.call_args
+        assert args[0][0] == "/api/v1/models/mdl-123/checkpoints"
+        assert args[0][1] == {"type": "weight", "name": "after-3-steps"}
 
     def test_save_state_custom_type(self):
         tc = _make_training_client()
-        tc._service.http.post.return_value = {
-            "id": "ckpt-2",
-            "path": "weaver://ckpt-2",
-            "type": "weight_and_optimizer",
-        }
+        handle = _make_handle(
+            {
+                "id": "ckpt-2",
+                "path": "weaver://mdl-123/checkpoints/ckpt-2",
+                "type": "weight_and_optimizer",
+            }
+        )
+        tc._service.enqueue_operation.return_value = handle
 
         ckpt = tc.save_state(checkpoint_type="weight_and_optimizer")
 
-        body = tc._service.http.post.call_args
-        assert body[1]["json"]["type"] == "weight_and_optimizer"
-        assert "name" not in body[1]["json"]
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["type"] == "weight_and_optimizer"
+        assert "name" not in body
         assert ckpt.checkpoint_type == "weight_and_optimizer"
 
     def test_save_state_no_name(self):
         tc = _make_training_client()
-        tc._service.http.post.return_value = {
-            "id": "ckpt-3",
-            "path": "weaver://auto-generated",
-            "type": "weight",
-        }
+        handle = _make_handle(
+            {
+                "id": "ckpt-3",
+                "path": "weaver://mdl-123/checkpoints/auto",
+                "type": "weight",
+            }
+        )
+        tc._service.enqueue_operation.return_value = handle
 
         ckpt = tc.save_state()
 
-        body = tc._service.http.post.call_args[1]["json"]
+        body = tc._service.enqueue_operation.call_args[0][1]
         assert "name" not in body
-        assert ckpt.path == "weaver://auto-generated"
+        assert ckpt.path == "weaver://mdl-123/checkpoints/auto"
+
+    def test_save_state_no_wait(self):
+        tc = _make_training_client()
+        handle = _make_handle()
+        tc._service.enqueue_operation.return_value = handle
+
+        result = tc.save_state(name="step-100", wait=False)
+
+        assert result is handle
+        handle.result.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
