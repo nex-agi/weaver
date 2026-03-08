@@ -265,18 +265,19 @@ class TrainingClient:
         """Save the current model weights as a checkpoint.
 
         Args:
-            name: Checkpoint path/name. The server prefixes it with
-                ``weaver://`` automatically.
+            name: Human-readable checkpoint label (e.g. ``"step-100"``).
+                The server generates the full storage path incorporating
+                the model ID automatically.
             checkpoint_type: ``"training"`` (default) or
                 ``"training_with_optimizer"``.
 
         Returns:
-            A :class:`~weaver.types.Checkpoint` with the saved checkpoint
-            metadata (including ``id`` and ``path``).
+            A :class:`~weaver.types.Checkpoint` with ``id``, ``path``
+            (server-generated), and ``name``.
         """
         body: Dict[str, Any] = {"type": checkpoint_type}
         if name is not None:
-            body["path"] = name
+            body["name"] = name
         response = self._service.http.post(
             f"/api/v1/models/{self.model_id}/checkpoints",
             json=body,
@@ -308,9 +309,10 @@ class TrainingClient:
         """Restore model weights from a checkpoint (optimizer state is **not** restored).
 
         Args:
-            checkpoint: A :class:`~weaver.types.Checkpoint` object (from
-                :meth:`save_state` or :meth:`list_checkpoints`), or a raw
-                checkpoint ID string.
+            checkpoint: A :class:`~weaver.types.Checkpoint` object returned by
+                :meth:`save_state` / :meth:`list_checkpoints`, or a checkpoint
+                ``id`` string (UUID).  The ``id`` is used to identify the
+                checkpoint on the server; users should never pass a path.
             wait: If True (default), blocks until the load completes.
 
         Returns:
@@ -347,8 +349,8 @@ class TrainingClient:
         and other optimizer statistics are preserved.
 
         Args:
-            checkpoint: A :class:`~weaver.types.Checkpoint` object or a raw
-                checkpoint ID string.
+            checkpoint: A :class:`~weaver.types.Checkpoint` object or a
+                checkpoint ``id`` string (UUID).
             wait: If True (default), blocks until the load completes.
 
         Returns:

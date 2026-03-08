@@ -25,9 +25,11 @@ class Checkpoint:
     """Represents a saved model checkpoint.
 
     Attributes:
-        id: Unique checkpoint identifier.
-        path: Checkpoint path (e.g. ``weaver://run-id/weights/checkpoint-001``).
-        name: Optional human-readable name.
+        id: Unique checkpoint identifier (UUID, server-generated).
+        path: Server-generated storage path
+            (e.g. ``weaver://{model_id}/checkpoints/step-100``).
+            Read-only — never used as an API input.
+        name: Human-readable label provided at save time.
         checkpoint_type: ``"training"`` or ``"training_with_optimizer"``.
         status: Current status of the checkpoint (e.g. ``"completed"``).
     """

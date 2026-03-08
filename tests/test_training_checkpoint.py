@@ -70,7 +70,7 @@ class TestSaveState:
         assert ckpt.path == "weaver://after-3-steps"
         tc._service.http.post.assert_called_once_with(
             "/api/v1/models/mdl-123/checkpoints",
-            json={"type": "training", "path": "after-3-steps"},
+            json={"type": "training", "name": "after-3-steps"},
         )
 
     def test_save_state_custom_type(self):
@@ -85,7 +85,7 @@ class TestSaveState:
 
         body = tc._service.http.post.call_args
         assert body[1]["json"]["type"] == "training_with_optimizer"
-        assert "path" not in body[1]["json"]
+        assert "name" not in body[1]["json"]
         assert ckpt.checkpoint_type == "training_with_optimizer"
 
     def test_save_state_no_name(self):
@@ -99,7 +99,7 @@ class TestSaveState:
         ckpt = tc.save_state()
 
         body = tc._service.http.post.call_args[1]["json"]
-        assert "path" not in body
+        assert "name" not in body
         assert ckpt.path == "weaver://auto-generated"
 
 
