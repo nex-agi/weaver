@@ -21,7 +21,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, Any, Dict, Mapping, Sequence, overload
 
 from ._utils import lookup_case_insensitive
-from .operations import OperationHandle, build_operation_handle
+from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
@@ -302,18 +302,14 @@ class TrainingClient:
         body: Dict[str, Any] = {"type": checkpoint_type}
         if name is not None:
             body["name"] = name
-        response = self._service.http.post(
+        handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/checkpoints",
-            json=body,
+            body,
         )
-        response = response or {}
-        checkpoint_data = lookup_case_insensitive(response, "checkpoint") or {}
-        operation_data = lookup_case_insensitive(response, "operation") or response
-        handle = build_operation_handle(self._service.http, operation_data)
         if not wait:
             return handle
-        handle.wait()
-        return Checkpoint.from_payload(checkpoint_data)
+        result = handle.result()
+        return Checkpoint.from_payload(result if isinstance(result, dict) else {})
 
     @overload
     def load_state(
