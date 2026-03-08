@@ -113,9 +113,9 @@ def main() -> None:
         checkpoints = tc.list_checkpoints()
         print(f"  Total checkpoints for model: {len(checkpoints)}")
 
-        saved_checkpoint_id = checkpoint.id
+        saved_checkpoint_path = checkpoint.path
 
-    print(f"\n  Phase 1 complete. Saved checkpoint_id: {saved_checkpoint_id}")
+    print(f"\n  Phase 1 complete. Saved checkpoint path: {saved_checkpoint_path}")
 
     # ==================================================================
     # Phase 2: Brand new session & model — load checkpoint, train 3 more
@@ -140,8 +140,8 @@ def main() -> None:
         print(f"  Provisioning done (warmup loss={warmup_loss:.6f})")
 
         # Load the checkpoint from phase 1
-        print(f"  Loading checkpoint: {saved_checkpoint_id}")
-        load_result = tc2.load_state(saved_checkpoint_id, wait=True)
+        print(f"  Loading checkpoint: {saved_checkpoint_path}")
+        load_result = tc2.load_state(saved_checkpoint_path, wait=True)
         print(f"  Load result: {load_result}")
 
         adam = types.AdamParams(learning_rate=LR)

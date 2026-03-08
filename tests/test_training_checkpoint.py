@@ -114,25 +114,25 @@ class TestLoadState:
         handle = _make_handle({"status": "done"})
         tc._service.enqueue_operation.return_value = handle
 
-        ckpt = Checkpoint(id="ckpt-1", path="weaver://ckpt-1")
+        ckpt = Checkpoint(id="ckpt-1", path="weaver://mdl-123/checkpoints/step-3")
         result = tc.load_state(ckpt)
 
         assert result == {"status": "done"}
         args = tc._service.enqueue_operation.call_args
         assert args[0][0] == "/api/v1/models/mdl-123/load"
         body = args[0][1]
-        assert body["checkpoint_id"] == "ckpt-1"
+        assert body["path"] == "weaver://mdl-123/checkpoints/step-3"
         assert body["include_optimizer"] is False
 
-    def test_load_state_with_string_id(self):
+    def test_load_state_with_string_path(self):
         tc = _make_training_client()
         handle = _make_handle({"status": "done"})
         tc._service.enqueue_operation.return_value = handle
 
-        result = tc.load_state("ckpt-abc-123")
+        result = tc.load_state("weaver://mdl-123/checkpoints/step-3")
 
         body = tc._service.enqueue_operation.call_args[0][1]
-        assert body["checkpoint_id"] == "ckpt-abc-123"
+        assert body["path"] == "weaver://mdl-123/checkpoints/step-3"
         assert body["include_optimizer"] is False
 
     def test_load_state_no_wait(self):
@@ -140,7 +140,7 @@ class TestLoadState:
         handle = _make_handle()
         tc._service.enqueue_operation.return_value = handle
 
-        result = tc.load_state("ckpt-1", wait=False)
+        result = tc.load_state("weaver://ckpt-path", wait=False)
 
         assert result is handle
         handle.result.assert_not_called()
@@ -157,12 +157,12 @@ class TestLoadStateWithOptimizer:
         handle = _make_handle({"status": "done"})
         tc._service.enqueue_operation.return_value = handle
 
-        ckpt = Checkpoint(id="ckpt-1", path="weaver://ckpt-1")
+        ckpt = Checkpoint(id="ckpt-1", path="weaver://mdl-123/checkpoints/step-3")
         result = tc.load_state_with_optimizer(ckpt)
 
         assert result == {"status": "done"}
         body = tc._service.enqueue_operation.call_args[0][1]
-        assert body["checkpoint_id"] == "ckpt-1"
+        assert body["path"] == "weaver://mdl-123/checkpoints/step-3"
         assert body["include_optimizer"] is True
 
     def test_load_state_with_optimizer_no_wait(self):
@@ -170,7 +170,7 @@ class TestLoadStateWithOptimizer:
         handle = _make_handle()
         tc._service.enqueue_operation.return_value = handle
 
-        result = tc.load_state_with_optimizer("ckpt-1", wait=False)
+        result = tc.load_state_with_optimizer("weaver://ckpt-path", wait=False)
 
         assert result is handle
         handle.result.assert_not_called()

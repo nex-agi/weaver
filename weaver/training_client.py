@@ -287,7 +287,7 @@ class TrainingClient:
     @overload
     def load_state(
         self,
-        checkpoint: str | Checkpoint,
+        path: str | Checkpoint,
         *,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
@@ -295,36 +295,35 @@ class TrainingClient:
     @overload
     def load_state(
         self,
-        checkpoint: str | Checkpoint,
+        path: str | Checkpoint,
         *,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
     def load_state(
         self,
-        checkpoint: str | Checkpoint,
+        path: str | Checkpoint,
         *,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         """Restore model weights from a checkpoint (optimizer state is **not** restored).
 
         Args:
-            checkpoint: A :class:`~weaver.types.Checkpoint` object returned by
-                :meth:`save_state` / :meth:`list_checkpoints`, or a checkpoint
-                ``id`` string (UUID).  The ``id`` is used to identify the
-                checkpoint on the server; users should never pass a path.
+            path: Checkpoint storage path (``weaver://...`` URI returned by
+                :meth:`save_state`), or a :class:`~weaver.types.Checkpoint`
+                object whose ``.path`` will be used.
             wait: If True (default), blocks until the load completes.
 
         Returns:
             Server response dict when *wait* is True, else an
             :class:`OperationHandle`.
         """
-        return self._load_checkpoint(checkpoint, include_optimizer=False, wait=wait)
+        return self._load_checkpoint(path, include_optimizer=False, wait=wait)
 
     @overload
     def load_state_with_optimizer(
         self,
-        checkpoint: str | Checkpoint,
+        path: str | Checkpoint,
         *,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
@@ -332,14 +331,14 @@ class TrainingClient:
     @overload
     def load_state_with_optimizer(
         self,
-        checkpoint: str | Checkpoint,
+        path: str | Checkpoint,
         *,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
     def load_state_with_optimizer(
         self,
-        checkpoint: str | Checkpoint,
+        path: str | Checkpoint,
         *,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
@@ -349,26 +348,26 @@ class TrainingClient:
         and other optimizer statistics are preserved.
 
         Args:
-            checkpoint: A :class:`~weaver.types.Checkpoint` object or a
-                checkpoint ``id`` string (UUID).
+            path: Checkpoint storage path (``weaver://...`` URI), or a
+                :class:`~weaver.types.Checkpoint` object.
             wait: If True (default), blocks until the load completes.
 
         Returns:
             Server response dict when *wait* is True, else an
             :class:`OperationHandle`.
         """
-        return self._load_checkpoint(checkpoint, include_optimizer=True, wait=wait)
+        return self._load_checkpoint(path, include_optimizer=True, wait=wait)
 
     def _load_checkpoint(
         self,
-        checkpoint: str | Checkpoint,
+        path: str | Checkpoint,
         *,
         include_optimizer: bool,
         wait: bool,
     ) -> OperationHandle | Dict[str, Any]:
-        checkpoint_id = checkpoint.id if isinstance(checkpoint, Checkpoint) else checkpoint
+        checkpoint_path = path.path if isinstance(path, Checkpoint) else path
         body: Dict[str, Any] = {
-            "checkpoint_id": checkpoint_id,
+            "path": checkpoint_path,
             "include_optimizer": include_optimizer,
         }
         handle = self._service.enqueue_operation(
