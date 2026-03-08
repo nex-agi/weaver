@@ -260,7 +260,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        checkpoint_type: str = "training",
+        checkpoint_type: str = "weight",
     ) -> Checkpoint:
         """Save the current model weights as a checkpoint.
 
@@ -268,8 +268,8 @@ class TrainingClient:
             name: Human-readable checkpoint label (e.g. ``"step-100"``).
                 The server generates the full storage path incorporating
                 the model ID automatically.
-            checkpoint_type: ``"training"`` (default) or
-                ``"training_with_optimizer"``.
+            checkpoint_type: ``"weight"`` (default) or
+                ``"weight_and_optimizer"``.
 
         Returns:
             A :class:`~weaver.types.Checkpoint` with ``id``, ``path``

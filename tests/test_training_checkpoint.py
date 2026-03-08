@@ -60,7 +60,7 @@ class TestSaveState:
         tc._service.http.post.return_value = {
             "id": "ckpt-1",
             "path": "weaver://after-3-steps",
-            "type": "training",
+            "type": "weight",
         }
 
         ckpt = tc.save_state(name="after-3-steps")
@@ -70,7 +70,7 @@ class TestSaveState:
         assert ckpt.path == "weaver://after-3-steps"
         tc._service.http.post.assert_called_once_with(
             "/api/v1/models/mdl-123/checkpoints",
-            json={"type": "training", "name": "after-3-steps"},
+            json={"type": "weight", "name": "after-3-steps"},
         )
 
     def test_save_state_custom_type(self):
@@ -78,22 +78,22 @@ class TestSaveState:
         tc._service.http.post.return_value = {
             "id": "ckpt-2",
             "path": "weaver://ckpt-2",
-            "type": "training_with_optimizer",
+            "type": "weight_and_optimizer",
         }
 
-        ckpt = tc.save_state(checkpoint_type="training_with_optimizer")
+        ckpt = tc.save_state(checkpoint_type="weight_and_optimizer")
 
         body = tc._service.http.post.call_args
-        assert body[1]["json"]["type"] == "training_with_optimizer"
+        assert body[1]["json"]["type"] == "weight_and_optimizer"
         assert "name" not in body[1]["json"]
-        assert ckpt.checkpoint_type == "training_with_optimizer"
+        assert ckpt.checkpoint_type == "weight_and_optimizer"
 
     def test_save_state_no_name(self):
         tc = _make_training_client()
         tc._service.http.post.return_value = {
             "id": "ckpt-3",
             "path": "weaver://auto-generated",
-            "type": "training",
+            "type": "weight",
         }
 
         ckpt = tc.save_state()
@@ -189,13 +189,13 @@ class TestListCheckpoints:
                 {
                     "id": "ckpt-1",
                     "path": "weaver://ckpt-1",
-                    "type": "training",
+                    "type": "weight",
                     "status": "completed",
                 },
                 {
                     "id": "ckpt-2",
                     "path": "weaver://ckpt-2",
-                    "type": "training_with_optimizer",
+                    "type": "weight_and_optimizer",
                 },
             ]
         }
@@ -206,7 +206,7 @@ class TestListCheckpoints:
         assert isinstance(checkpoints[0], Checkpoint)
         assert checkpoints[0].id == "ckpt-1"
         assert checkpoints[0].path == "weaver://ckpt-1"
-        assert checkpoints[1].checkpoint_type == "training_with_optimizer"
+        assert checkpoints[1].checkpoint_type == "weight_and_optimizer"
         tc._service.http.get.assert_called_once_with(
             "/api/v1/models/mdl-123/checkpoints",
         )
@@ -232,13 +232,13 @@ class TestCheckpointType:
         payload = {
             "id": "ckpt-x",
             "path": "weaver://ckpt-x",
-            "type": "training",
+            "type": "weight",
             "status": "completed",
         }
         ckpt = Checkpoint.from_payload(payload)
         assert ckpt.id == "ckpt-x"
         assert ckpt.path == "weaver://ckpt-x"
-        assert ckpt.checkpoint_type == "training"
+        assert ckpt.checkpoint_type == "weight"
         assert ckpt.status == "completed"
 
     def test_from_payload_minimal(self):
@@ -246,7 +246,7 @@ class TestCheckpointType:
         ckpt = Checkpoint.from_payload(payload)
         assert ckpt.id == "ckpt-y"
         assert ckpt.name is None
-        assert ckpt.checkpoint_type == "training"
+        assert ckpt.checkpoint_type == "weight"
         assert ckpt.status is None
 
     def test_checkpoint_is_frozen(self):

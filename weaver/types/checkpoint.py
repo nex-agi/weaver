@@ -30,14 +30,14 @@ class Checkpoint:
             (e.g. ``weaver://{model_id}/checkpoints/step-100``).
             Read-only — never used as an API input.
         name: Human-readable label provided at save time.
-        checkpoint_type: ``"training"`` or ``"training_with_optimizer"``.
+        checkpoint_type: ``"weight"`` or ``"weight_and_optimizer"``.
         status: Current status of the checkpoint (e.g. ``"completed"``).
     """
 
     id: str
     path: str
     name: str | None = None
-    checkpoint_type: str = "training"
+    checkpoint_type: str = "weight"
     status: str | None = None
 
     @classmethod
@@ -59,7 +59,7 @@ class Checkpoint:
             checkpoint_type=str(
                 lookup_case_insensitive(payload, "checkpoint_type")
                 or lookup_case_insensitive(payload, "type")
-                or "training"
+                or "weight"
             ),
             status=_str_or_none(lookup_case_insensitive(payload, "status")),
         )
