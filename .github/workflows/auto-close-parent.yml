@@ -1,0 +1,78 @@
+name: Auto-close parent when all sub-issues closed
+
+on:
+  issues:
+    types: [closed]
+
+jobs:
+  close-parent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check and close parent issue
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            // Get current issue's parent (via sub-issue relationship)
+            const result = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    id
+                    parentIssue {
+                      id
+                      number
+                      state
+                      repository {
+                        owner { login }
+                        name
+                      }
+                      subIssues(first: 100) {
+                        nodes {
+                          id
+                          state
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: context.issue.number
+            });
+
+            const parent = result.repository.issue.parentIssue;
+            if (!parent) {
+              console.log('No parent issue found, skipping');
+              return;
+            }
+
+            const parentRef = `${parent.repository.owner.login}/${parent.repository.name}#${parent.number}`;
+            console.log(`Parent: ${parentRef} (state: ${parent.state})`);
+
+            if (parent.state === 'CLOSED') {
+              console.log('Parent already closed, skipping');
+              return;
+            }
+
+            const allClosed = parent.subIssues.nodes.every(s => s.state === 'CLOSED');
+            console.log(`Sub-issues: ${parent.subIssues.nodes.length} total, all closed: ${allClosed}`);
+
+            if (!allClosed) {
+              const open = parent.subIssues.nodes.filter(s => s.state !== 'CLOSED').length;
+              console.log(`${open} sub-issue(s) still open, skipping`);
+              return;
+            }
+
+            // All sub-issues closed, close the parent
+            await github.rest.issues.update({
+              owner: parent.repository.owner.login,
+              repo: parent.repository.name,
+              issue_number: parent.number,
+              state: 'closed',
+              state_reason: 'completed'
+            });
+
+            console.log(`✅ Closed parent ${parentRef} - all sub-issues are done`);
