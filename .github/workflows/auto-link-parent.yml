@@ -1,0 +1,88 @@
+name: Auto-link as Sub-issue
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  link-parent:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Link as sub-issue to parent
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.PROJECT_TOKEN }}
+          script: |
+            const body = context.payload.issue.body || '';
+
+            // Parse "关联 Issue" field - matches formats like:
+            // china-qijizhifeng/nex-taas-feedback#123
+            // https://github.com/china-qijizhifeng/nex-taas-feedback/issues/123
+            let parentOwner, parentRepo, parentNumber;
+
+            // Try URL format first
+            const urlMatch = body.match(/https:\/\/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
+            if (urlMatch) {
+              [, parentOwner, parentRepo, parentNumber] = urlMatch;
+            } else {
+              // Try org/repo#number format
+              const refMatch = body.match(/([a-zA-Z0-9_.-]+)\/([a-zA-Z0-9_.-]+)#(\d+)/);
+              if (refMatch) {
+                [, parentOwner, parentRepo, parentNumber] = refMatch;
+              }
+            }
+
+            if (!parentNumber) {
+              console.log('No parent issue reference found, skipping');
+              return;
+            }
+
+            parentNumber = parseInt(parentNumber);
+            console.log(`Found parent: ${parentOwner}/${parentRepo}#${parentNumber}`);
+
+            // Get parent issue node ID
+            const parentResult = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    id
+                  }
+                }
+              }
+            `, { owner: parentOwner, repo: parentRepo, number: parentNumber });
+
+            const parentId = parentResult.repository.issue.id;
+
+            // Get current issue node ID
+            const childResult = await github.graphql(`
+              query($owner: String!, $repo: String!, $number: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  issue(number: $number) {
+                    id
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              number: context.issue.number
+            });
+
+            const childId = childResult.repository.issue.id;
+
+            // Add as sub-issue
+            try {
+              await github.graphql(`
+                mutation($parentId: ID!, $childId: ID!) {
+                  addSubIssue(input: { issueId: $parentId, subIssueId: $childId }) {
+                    issue {
+                      id
+                    }
+                  }
+                }
+              `, { parentId, childId });
+
+              console.log(`✅ Linked ${context.repo.owner}/${context.repo.repo}#${context.issue.number} as sub-issue of ${parentOwner}/${parentRepo}#${parentNumber}`);
+            } catch (e) {
+              console.log(`❌ Failed to link: ${e.message}`);
+            }
