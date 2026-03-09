@@ -43,12 +43,14 @@ class TrainingClient:
         base_model: str,
         session_id: str,
         tokenizer_path: str | None = None,
+        debug_info: Dict[str, Any] | None = None,
     ) -> None:
         self._service = service
         self.model_id = model_id
         self.base_model = base_model
         self.session_id = session_id
         self.tokenizer_path = tokenizer_path
+        self.debug_info = debug_info
 
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)

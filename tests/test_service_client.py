@@ -14,6 +14,8 @@
 
 """Tests for the ServiceClient."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 
 from weaver.service_client import ServiceClient
@@ -113,3 +115,50 @@ def test_service_client_close_is_idempotent():
     client.close()
     client.close()  # Should not raise
     assert client._closed is True
+
+
+def test_create_model_passes_debug_info():
+    """Test create_model extracts debug_info from response and passes to TrainingClient."""
+    debug_info = {
+        "debug_mode": "manual",
+        "model_id": "abc-123",
+        "job_name": "user-trainer-full_ft-abc-123",
+        "namespace": "qiji",
+        "kubectl_exec": "kubectl exec -it user-trainer-full_ft-abc-123-master-0 -n qiji -- /bin/bash",
+        "config_file": "/tmp/trainer.env",
+    }
+    mock_response = {
+        "id": "abc-123",
+        "base_model": "Qwen/Qwen3-8B",
+        "debug_info": debug_info,
+    }
+
+    client = ServiceClient(api_key="sk-test-key")
+    client._session_id = "session-1"
+    client._http = MagicMock()
+    client._http.post.return_value = mock_response
+    client._http.get.return_value = {"items": []}  # for get_supported_model_config
+
+    training = client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
+
+    assert training.debug_info == debug_info
+    assert training.debug_info["kubectl_exec"].startswith("kubectl exec")
+    assert training.model_id == "abc-123"
+
+
+def test_create_model_debug_info_none_when_absent():
+    """Test create_model sets debug_info=None when server response has no debug_info."""
+    mock_response = {
+        "id": "abc-123",
+        "base_model": "Qwen/Qwen3-8B",
+    }
+
+    client = ServiceClient(api_key="sk-test-key")
+    client._session_id = "session-1"
+    client._http = MagicMock()
+    client._http.post.return_value = mock_response
+    client._http.get.return_value = {"items": []}
+
+    training = client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
+
+    assert training.debug_info is None
