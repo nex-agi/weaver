@@ -148,6 +148,10 @@ class SamplingClient:
                 }
                 if "logprobs" in raw and isinstance(raw["logprobs"], list):
                     sequence["logprobs"] = raw["logprobs"]
+                if "old_logprobs" in raw and isinstance(raw["old_logprobs"], list):
+                    sequence["old_logprobs"] = raw["old_logprobs"]
+                if "sampling_masks" in raw and raw["sampling_masks"] is not None:
+                    sequence["sampling_masks"] = raw["sampling_masks"]
                 sequences.append(sequence)
             return [seq for seq in sequences if seq["tokens"]]
 
