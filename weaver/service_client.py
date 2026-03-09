@@ -268,12 +268,16 @@ class ServiceClient:
                 tokenizer_config = resource.get("tokenizer", {})
                 tokenizer_path = tokenizer_config.get("path")
 
+        # Extract debug_info for manual debug mode
+        debug_info = lookup_case_insensitive(response, "debug_info")
+
         return TrainingClient(
             service=self,
             model_id=model_id,
             base_model=lookup_case_insensitive(response, "base_model") or base_model,
             session_id=self.session_id,
             tokenizer_path=tokenizer_path,
+            debug_info=debug_info,
         )
 
     def _next_model_seq(self) -> int:

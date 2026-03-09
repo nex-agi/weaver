@@ -29,6 +29,36 @@ def test_training_client_seq_ids_are_monotonic():
     assert [training._next_seq() for _ in range(3)] == [1, 2, 3]
 
 
+def test_training_client_debug_info_default_none():
+    training = TrainingClient(
+        service=ServiceClient(),
+        model_id="model-123",
+        base_model="Qwen/Qwen2.5-0.5B-Instruct",
+        session_id="session-1",
+    )
+    assert training.debug_info is None
+
+
+def test_training_client_debug_info_stored():
+    info = {
+        "debug_mode": "manual",
+        "model_id": "abc-123",
+        "job_name": "user-trainer-full_ft-abc-123",
+        "namespace": "qiji",
+        "kubectl_exec": "kubectl exec -it user-trainer-full_ft-abc-123-master-0 -n qiji -- /bin/bash",
+        "config_file": "/tmp/trainer.env",
+    }
+    training = TrainingClient(
+        service=ServiceClient(),
+        model_id="model-123",
+        base_model="Qwen/Qwen2.5-0.5B-Instruct",
+        session_id="session-1",
+        debug_info=info,
+    )
+    assert training.debug_info == info
+    assert training.debug_info["kubectl_exec"].startswith("kubectl exec")
+
+
 def test_service_client_seq_counters_are_monotonic():
     service = ServiceClient()
 
