@@ -41,7 +41,7 @@ jobs:
                   "tag": "div",
                   "text": {
                     "tag": "lark_md",
-                    "content": `问题反馈：\n反馈人：**${author}**\n**问题概述：${title.replace('[Bug] ', '')}**\n${description ? description.substring(0, 500) : ''}\n\n请及时查看并处理该问题。`
+                    "content": `反馈人：**${author}**\n**问题概述：${title.replace('[Bug] ', '')}**\n${description ? description.substring(0, 500) : ''}\n\n请及时查看并处理该问题。`
                   }
                 },
                 {
@@ -82,7 +82,7 @@ jobs:
                   "tag": "div",
                   "text": {
                     "tag": "lark_md",
-                    "content": `新增需求：\n提需人：**${author}**\n**需求概述：${title.replace('[FR] ', '')}**\n${description ? description.substring(0, 500) : ''}\n\n请及时查看并处理该需求，如有疑问可与提需人沟通。`
+                    "content": `提需人：**${author}**\n**需求概述：${title.replace('[FR] ', '')}**\n${description ? description.substring(0, 500) : ''}\n\n请及时查看并处理该需求，如有疑问可与提需人沟通。`
                   }
                 },
                 {
