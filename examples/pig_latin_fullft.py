@@ -83,6 +83,7 @@ def main() -> None:
             base_model=base_model,
             training_mode="full_ft",
         )
+        print(f"Model ID: {training_client.model_id}")
         tokenizer = training_client.get_tokenizer()
 
         processed_examples = [process_example(example, tokenizer) for example in EXAMPLES]
