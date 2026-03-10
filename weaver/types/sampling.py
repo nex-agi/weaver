@@ -28,8 +28,6 @@ class SamplingParams:
     top_k: int = -1
     stop: List[str] = field(default_factory=list)
     seed: Optional[int] = None
-    return_sampling_mask: bool = False
-    return_old_logprob: bool = False
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -43,8 +41,4 @@ class SamplingParams:
             payload["stop"] = self.stop
         if self.seed is not None:
             payload["seed"] = self.seed
-        if self.return_sampling_mask:
-            payload["return_sampling_mask"] = True
-        if self.return_old_logprob:
-            payload["return_old_logprob"] = True
         return payload
