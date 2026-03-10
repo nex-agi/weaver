@@ -53,16 +53,22 @@ class SamplingClient:
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
+        return_sampling_mask: bool = False,
+        return_old_logprob: bool = False,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         params = sampling_params or SamplingParams()
-        body = {
+        body: Dict[str, Any] = {
             "prompt": prompt.to_payload(),
             "sampling_params": params.to_payload(),
             "num_samples": num_samples,
             "prompt_logprobs": include_prompt_logprobs,
             "topk_prompt_logprobs": topk_prompt_logprobs,
         }
+        if return_sampling_mask:
+            body["return_sampling_mask"] = True
+        if return_old_logprob:
+            body["return_old_logprob"] = True
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
             body,
@@ -174,6 +180,10 @@ class SamplingClient:
                 }
                 if "logprobs" in raw and isinstance(raw["logprobs"], list):
                     sequence["logprobs"] = raw["logprobs"]
+                if "old_logprobs" in raw and isinstance(raw["old_logprobs"], list):
+                    sequence["old_logprobs"] = raw["old_logprobs"]
+                if "sampling_masks" in raw and raw["sampling_masks"] is not None:
+                    sequence["sampling_masks"] = raw["sampling_masks"]
                 sequences.append(sequence)
             return [seq for seq in sequences if seq["tokens"]]
 
