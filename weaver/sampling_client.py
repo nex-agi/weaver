@@ -23,7 +23,7 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
-from .types import ModelInput, SamplingParams
+from .types import LogprobsParams, ModelInput, SamplingParams
 
 
 class SamplingClient:
@@ -72,14 +72,40 @@ class SamplingClient:
         raw_result = handle.result()
         return self._normalize_sample_result(raw_result)  # type: ignore[return-value]
 
-    def compute_logprobs(self, *, prompt: ModelInput) -> List[float | None]:
-        body = {"prompt": prompt.to_payload()}
+    def compute_logprobs(
+        self,
+        *,
+        prompt: ModelInput,
+        logprobs_params: LogprobsParams | None = None,
+    ) -> List[float | None] | Dict[str, Any]:
+        """Compute log-probabilities for the given prompt.
+
+        Args:
+            prompt: The model input (tokens) to compute logprobs for.
+            logprobs_params: Optional parameters (e.g. return_rollout_token_expert for MoE router replay).
+                When None, uses defaults.
+
+        Returns:
+            When logprobs_params.return_rollout_token_expert=False: List[float|None] of per-token logprobs.
+            When logprobs_params.return_rollout_token_expert=True: Dict with "logprobs" and
+                "return_rollout_token_expert_data" (None if not MoE or not available).
+        """
+        params = logprobs_params or LogprobsParams()
+        body: Dict[str, Any] = {"prompt": prompt.to_payload(), **params.to_payload()}
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/logprobs",
             body,
         )
         payload = handle.result()
-        return self._normalize_prompt_logprobs(prompt, payload)
+        logprobs = self._normalize_prompt_logprobs(prompt, payload)
+        if not params.return_rollout_token_expert:
+            return logprobs
+        result = self._result_payload(payload)
+        return_rollout_token_expert_data = result.get("return_rollout_token_expert_data")
+        return {
+            "logprobs": logprobs,
+            "return_rollout_token_expert_data": return_rollout_token_expert_data,
+        }
 
     def _ensure_tokenizer(self) -> PreTrainedTokenizer:
         if self._tokenizer is not None:

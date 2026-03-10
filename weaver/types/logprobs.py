@@ -12,25 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Public type helpers re-exported for ergonomic imports."""
+"""Logprobs related helper types."""
 
-from .checkpoint import Checkpoint
-from .datum import Datum
-from .logprobs import LogprobsParams
-from .lora_config import LoraConfig
-from .model_input import ModelInput, ModelInputChunk
-from .optim import AdamParams
-from .sampling import SamplingParams
-from .tensor import TensorData
+from __future__ import annotations
 
-__all__ = [
-    "AdamParams",
-    "Checkpoint",
-    "Datum",
-    "LoraConfig",
-    "LogprobsParams",
-    "ModelInput",
-    "ModelInputChunk",
-    "SamplingParams",
-    "TensorData",
-]
+from dataclasses import dataclass
+
+
+@dataclass(slots=True)
+class LogprobsParams:
+    """Parameters for compute_logprobs requests."""
+
+    return_rollout_token_expert: bool = False
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {}
+        if self.return_rollout_token_expert:
+            payload["return_rollout_token_expert"] = True
+        return payload
