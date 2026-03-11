@@ -90,8 +90,8 @@ class APIClient:
     def get(self, path: str, *, params: Mapping[str, Any] | None = None) -> Any:
         return self._request("GET", path, params=params)
 
-    def post(self, path: str, *, json: Any = None) -> Any:
-        return self._request("POST", path, json=json)
+    def post(self, path: str, *, json: Any = None, max_retries: int | None = None) -> Any:
+        return self._request("POST", path, json=json, max_retries=max_retries)
 
     def patch(self, path: str, *, json: Any) -> Any:
         return self._request("PATCH", path, json=json)
@@ -106,6 +106,7 @@ class APIClient:
         *,
         params: Mapping[str, Any] | None = None,
         json: Any = None,
+        max_retries: int | None = None,
     ) -> Any:
         # Extract model_id from path if present (e.g., /api/v1/models/{model_id}/...)
         model_id = self._extract_model_id_from_path(path)
@@ -141,7 +142,9 @@ class APIClient:
                     logger.debug("API request trace_id: %s", trace_id)
 
             # Execute the request with retries
-            return self._request_with_retries(span, method, path, params=params, json=json)
+            return self._request_with_retries(
+                span, method, path, params=params, json=json, max_retries=max_retries
+            )
 
     def _extract_model_id_from_path(self, path: str) -> str | None:
         """
@@ -168,11 +171,23 @@ class APIClient:
         *,
         params: Mapping[str, Any] | None = None,
         json: Any = None,
+        max_retries: int | None = None,
     ) -> Any:
-        """Execute HTTP request with retry logic and trace context injection."""
+        """Execute HTTP request with retry logic and trace context injection.
+
+        Args:
+            span: OpenTelemetry span for tracing.
+            method: HTTP method (GET, POST, etc.).
+            path: API path.
+            params: Query parameters.
+            json: JSON body.
+            max_retries: Per-request override for maximum number of attempts.
+                When provided, overrides the client-level ``self._max_retries``.
+        """
+        effective_max_retries = max_retries if max_retries is not None else self._max_retries
         last_exception = None
 
-        for attempt in range(self._max_retries):
+        for attempt in range(effective_max_retries):
             try:
                 # Inject trace context into HTTP headers
                 headers = dict(self._client.headers or {})
@@ -205,20 +220,20 @@ class APIClient:
 
             except Exception as e:
                 last_exception = e
-                is_last_attempt = attempt == self._max_retries - 1
+                is_last_attempt = attempt == effective_max_retries - 1
 
                 # Record error in span
                 span.record_exception(e)
                 if is_last_attempt:
                     span.set_status(
-                        Status(StatusCode.ERROR, f"Failed after {self._max_retries} retries")
+                        Status(StatusCode.ERROR, f"Failed after {effective_max_retries} retries")
                     )
 
                 # Log the error
                 logger.debug(
                     "HTTP request failed (attempt %d/%d): %s %s - %s: %s",
                     attempt + 1,
-                    self._max_retries,
+                    effective_max_retries,
                     method,
                     path,
                     type(e).__name__,
@@ -228,7 +243,7 @@ class APIClient:
                 if is_last_attempt:
                     logger.error(
                         "HTTP request failed after %d retries: %s %s - %s",
-                        self._max_retries,
+                        effective_max_retries,
                         method,
                         path,
                         str(e),
