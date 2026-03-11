@@ -404,7 +404,10 @@ class ServiceClient:
         )
 
     def enqueue_operation(self, path: str, payload: Dict[str, Any]) -> OperationHandle:
-        response = self.http.post(path, json=payload)
+        # max_retries=1 means a single attempt with no retries.  Operations
+        # like save_state are non-idempotent POSTs — retrying after a timeout
+        # would create duplicate server-side operations.
+        response = self.http.post(path, json=payload, max_retries=1)
         return build_operation_handle(self.http, response)
 
     def list_supported_models(self) -> List[str]:
