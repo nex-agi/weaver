@@ -18,7 +18,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nex-weaver"
-version = "1.4.1"
+version = "1.4.2"
 description = "Python SDK for the Weaver platform"
 readme = "README.md"
 authors = [
@@ -34,7 +34,7 @@ dependencies = [
   "transformers>=4.40,<5",
   "typing-extensions>=4.8,<5",
   "click>=8.1,<9",
-  "rich>=13.0,<14",
+  "rich>=13.0",
   # OpenTelemetry for distributed tracing (lightweight, no exporters)
   "opentelemetry-api>=1.22.0,<2.0",
   "opentelemetry-sdk>=1.22.0,<2.0",
