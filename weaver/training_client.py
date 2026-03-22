@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from functools import cached_property
-from typing import TYPE_CHECKING, Any, Dict, Mapping, Sequence, overload
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
 from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
@@ -28,6 +28,8 @@ from .types.checkpoint import Checkpoint
 
 if TYPE_CHECKING:
     from typing import Literal
+
+    import torch
 
     from .sampling_client import SamplingClient
 
@@ -101,6 +103,95 @@ class TrainingClient:
             {"payload": payload},
         )
         return handle.result() if wait else handle
+
+    def forward_backward_custom(
+        self,
+        data: Sequence[Datum],
+        loss_fn: Callable[
+            [Sequence[Datum], List["torch.Tensor"]], Tuple["torch.Tensor", Dict[str, Any]]
+        ],
+    ) -> Dict[str, Any]:
+        """Run a custom loss function with surrogate-based gradient propagation.
+
+        This orchestrates two sequential server calls:
+        1. A forward pass to obtain per-token logprobs.
+        2. A surrogate backward pass that applies user-computed gradients.
+
+        The user-supplied *loss_fn* receives the original data and the
+        logprob tensors (with ``requires_grad=True``), and must return
+        ``(scalar_loss, metrics_dict)``.  Gradients flow back through
+        ``loss.backward()`` into the logprob tensors, whose ``.grad``
+        fields are then sent to the trainer as surrogate weights.
+
+        Args:
+            data: Sequence of training data.
+            loss_fn: ``(data, logprob_tensors) -> (loss, metrics)``
+        """
+        import torch
+
+        # Step A: forward pass to get logprobs
+        fwd_result = self.forward_backward(data, "forward_logprob", wait=True)
+
+        # Step B: parse logprobs from response
+        outputs = fwd_result.get("result", {}).get("loss_fn_outputs", [])
+        if not outputs:
+            raise ValueError("Forward pass returned no loss_fn_outputs")
+        if len(outputs) != len(data):
+            raise ValueError(f"Expected {len(data)} loss_fn_outputs, got {len(outputs)}")
+
+        logprob_tensors: List[torch.Tensor] = []
+        for output in outputs:
+            lp = output.get("logprobs") or output.get("Logprobs")
+            if isinstance(lp, dict):
+                lp = lp["data"]
+            if lp is None:
+                raise ValueError("Missing logprobs in forward/backward output")
+            t = torch.tensor(lp, dtype=torch.float32).requires_grad_(True)
+            logprob_tensors.append(t)
+
+        # Step C: run user's loss function
+        try:
+            loss, metrics = loss_fn(data, logprob_tensors)
+        except Exception as exc:
+            raise RuntimeError(f"User loss_fn failed: {exc}") from exc
+
+        if loss.dim() != 0:
+            raise ValueError(f"loss_fn must return a scalar loss, got shape {loss.shape}")
+
+        # Step D: backprop through user graph into logprob tensors
+        loss.backward()
+
+        for i, t in enumerate(logprob_tensors):
+            if t.grad is None:
+                raise ValueError(f"logprob_tensors[{i}] has no gradient after backward")
+
+        # Step E: build surrogate Datum objects
+        surrogate_data: List[Datum] = []
+        for datum, logprob_tensor in zip(data, logprob_tensors):
+            raw_targets = datum.loss_fn_inputs.get("target_tokens")
+            if raw_targets is None:
+                resolved_targets: List[Any] = datum.model_input.to_ints()
+            elif hasattr(raw_targets, "tolist"):
+                resolved_targets = raw_targets.tolist()
+            else:
+                resolved_targets = list(raw_targets)
+
+            grad = logprob_tensor.grad
+            assert grad is not None  # validated above
+            surrogate_datum = Datum.from_raw(
+                model_input=datum.model_input,
+                loss_fn_inputs={
+                    "target_tokens": resolved_targets,
+                    "surrogate_weights": grad.detach().tolist(),
+                },
+            )
+            surrogate_data.append(surrogate_datum)
+
+        # Step F: surrogate backward pass
+        self.forward_backward(surrogate_data, "surrogate", wait=True)
+
+        # Step G: return loss and metrics
+        return {"loss": loss.detach(), "metrics": metrics}
 
     @overload
     def optim_step(self, params: AdamParams, *, wait: Literal[True] = True) -> Dict[str, Any]: ...
