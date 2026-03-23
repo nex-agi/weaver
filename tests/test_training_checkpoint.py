@@ -241,6 +241,35 @@ class TestListCheckpoints:
         tc._service.http.get.return_value = None
         assert tc.list_checkpoints() == []
 
+    def test_list_checkpoints_with_training_flags(self):
+        tc = _make_training_client()
+        tc._service.http.get.return_value = {
+            "items": [
+                {
+                    "id": "ckpt-1",
+                    "path": "weaver://ckpt-1",
+                    "type": "weight",
+                    "train_unembed": True,
+                    "train_mlp": False,
+                    "train_attn": True,
+                },
+                {
+                    "id": "ckpt-2",
+                    "path": "weaver://ckpt-2",
+                    "type": "weight",
+                },
+            ]
+        }
+
+        checkpoints = tc.list_checkpoints()
+
+        assert checkpoints[0].train_unembed is True
+        assert checkpoints[0].train_mlp is False
+        assert checkpoints[0].train_attn is True
+        assert checkpoints[1].train_unembed is None
+        assert checkpoints[1].train_mlp is None
+        assert checkpoints[1].train_attn is None
+
 
 # ---------------------------------------------------------------------------
 # Checkpoint type
@@ -268,6 +297,34 @@ class TestCheckpointType:
         assert ckpt.name is None
         assert ckpt.checkpoint_type == "weight"
         assert ckpt.status is None
+        assert ckpt.train_unembed is None
+        assert ckpt.train_mlp is None
+        assert ckpt.train_attn is None
+
+    def test_from_payload_with_training_flags(self):
+        payload = {
+            "id": "ckpt-z",
+            "path": "weaver://ckpt-z",
+            "type": "weight",
+            "train_unembed": True,
+            "train_mlp": False,
+            "train_attn": True,
+        }
+        ckpt = Checkpoint.from_payload(payload)
+        assert ckpt.train_unembed is True
+        assert ckpt.train_mlp is False
+        assert ckpt.train_attn is True
+
+    def test_from_payload_with_partial_training_flags(self):
+        payload = {
+            "id": "ckpt-w",
+            "path": "weaver://ckpt-w",
+            "train_attn": True,
+        }
+        ckpt = Checkpoint.from_payload(payload)
+        assert ckpt.train_unembed is None
+        assert ckpt.train_mlp is None
+        assert ckpt.train_attn is True
 
     def test_checkpoint_is_frozen(self):
         ckpt = Checkpoint(id="1", path="p")

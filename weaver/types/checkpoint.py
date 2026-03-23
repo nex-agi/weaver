@@ -32,6 +32,10 @@ class Checkpoint:
         name: Human-readable label provided at save time.
         checkpoint_type: ``"weight"`` or ``"weight_and_optimizer"``.
         status: Current status of the checkpoint (e.g. ``"completed"``).
+        train_unembed: Whether the unembedding layer was trained (``None`` if
+            the server did not report this field).
+        train_mlp: Whether MLP layers were trained.
+        train_attn: Whether attention layers were trained.
     """
 
     id: str
@@ -39,6 +43,9 @@ class Checkpoint:
     name: str | None = None
     checkpoint_type: str = "weight"
     status: str | None = None
+    train_unembed: bool | None = None
+    train_mlp: bool | None = None
+    train_attn: bool | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> Checkpoint:
@@ -62,8 +69,15 @@ class Checkpoint:
                 or "weight"
             ),
             status=_str_or_none(lookup_case_insensitive(payload, "status")),
+            train_unembed=_bool_or_none(lookup_case_insensitive(payload, "train_unembed")),
+            train_mlp=_bool_or_none(lookup_case_insensitive(payload, "train_mlp")),
+            train_attn=_bool_or_none(lookup_case_insensitive(payload, "train_attn")),
         )
 
 
 def _str_or_none(value: Any) -> str | None:
     return str(value) if value is not None else None
+
+
+def _bool_or_none(value: Any) -> bool | None:
+    return bool(value) if value is not None else None
