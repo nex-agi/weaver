@@ -35,10 +35,15 @@ USER_AGENT: str = f"weaver-sdk/{__version__}"  # type: ignore[has-type]
 # default timeout is 1 minute
 DEFAULT_TIMEOUT = httpx.Timeout(timeout=60, connect=5.0)
 DEFAULT_MAX_RETRIES = 10
+DEFAULT_CONNECTION_RETRIES = 3
 DEFAULT_CONNECTION_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=20)
 
 INITIAL_RETRY_DELAY = 0.5
 MAX_RETRY_DELAY = 10.0
+
+# Transport-layer errors that indicate the request never reached the server.
+# Safe to retry regardless of idempotency because no server-side state was created.
+CONNECTION_ERRORS = (OSError, httpx.ConnectError, httpx.RemoteProtocolError)
 
 logger = logging.getLogger(__name__)
 
@@ -175,6 +180,11 @@ class APIClient:
     ) -> Any:
         """Execute HTTP request with retry logic and trace context injection.
 
+        Connection-level errors (stale sockets, refused connections) are retried
+        up to ``DEFAULT_CONNECTION_RETRIES`` times regardless of *max_retries*
+        because the request never reached the server and is therefore safe to
+        retry even for non-idempotent methods.
+
         Args:
             span: OpenTelemetry span for tracing.
             method: HTTP method (GET, POST, etc.).
@@ -185,9 +195,11 @@ class APIClient:
                 When provided, overrides the client-level ``self._max_retries``.
         """
         effective_max_retries = max_retries if max_retries is not None else self._max_retries
-        last_exception = None
+        last_exception: Exception | None = None
+        request_attempt = 0
+        connection_error_count = 0
 
-        for attempt in range(effective_max_retries):
+        while request_attempt < effective_max_retries:
             try:
                 # Inject trace context into HTTP headers
                 headers = dict(self._client.headers or {})
@@ -218,9 +230,50 @@ class APIClient:
                 span.set_status(Status(StatusCode.ERROR, "API error"))
                 raise
 
-            except Exception as e:
+            except CONNECTION_ERRORS as e:
+                # Connection-level error — the request never reached the server,
+                # so it is safe to retry regardless of max_retries.
+                connection_error_count += 1
                 last_exception = e
-                is_last_attempt = attempt == effective_max_retries - 1
+                span.record_exception(e)
+
+                logger.debug(
+                    "Connection error (attempt %d/%d): %s %s - %s: %s",
+                    connection_error_count,
+                    DEFAULT_CONNECTION_RETRIES,
+                    method,
+                    path,
+                    type(e).__name__,
+                    str(e),
+                )
+
+                if connection_error_count >= DEFAULT_CONNECTION_RETRIES:
+                    span.set_status(
+                        Status(
+                            StatusCode.ERROR,
+                            f"Connection failed after {connection_error_count} attempts",
+                        )
+                    )
+                    logger.error(
+                        "Connection error after %d attempts: %s %s - %s",
+                        connection_error_count,
+                        method,
+                        path,
+                        str(e),
+                    )
+                    raise
+
+                delay = min(
+                    INITIAL_RETRY_DELAY * (2 ** (connection_error_count - 1)),
+                    MAX_RETRY_DELAY,
+                )
+                logger.debug("Retrying in %.1fs...", delay)
+                time.sleep(delay)
+
+            except Exception as e:
+                request_attempt += 1
+                last_exception = e
+                is_last_attempt = request_attempt >= effective_max_retries
 
                 # Record error in span
                 span.record_exception(e)
@@ -232,7 +285,7 @@ class APIClient:
                 # Log the error
                 logger.debug(
                     "HTTP request failed (attempt %d/%d): %s %s - %s: %s",
-                    attempt + 1,
+                    request_attempt,
                     effective_max_retries,
                     method,
                     path,
@@ -251,7 +304,7 @@ class APIClient:
                     raise
 
                 # Wait before retrying with exponential backoff
-                delay = min(INITIAL_RETRY_DELAY * (2**attempt), MAX_RETRY_DELAY)
+                delay = min(INITIAL_RETRY_DELAY * (2 ** (request_attempt - 1)), MAX_RETRY_DELAY)
                 logger.debug("Retrying in %.1fs...", delay)
                 time.sleep(delay)
 
