@@ -171,12 +171,19 @@ def display_training_run_detail(data: Dict[str, Any]) -> None:
         checkpoint_table.add_column("ID", style="cyan", no_wrap=True)
         checkpoint_table.add_column("Created At", style="magenta")
         checkpoint_table.add_column("Full Path", style="green")
+        checkpoint_table.add_column("TTL", style="yellow")
+        checkpoint_table.add_column("Expires At", style="red")
 
         for cp in checkpoints:
+            ttl = cp.get("ttl_seconds")
+            ttl_display = f"{ttl}s" if ttl is not None else "permanent"
+            expires = format_date(cp.get("expires_at")) if cp.get("expires_at") else "never"
             checkpoint_table.add_row(
                 str(cp.get("id", ""))[:8],
                 format_date(cp.get("created_at")),
                 cp.get("path", "N/A"),
+                ttl_display,
+                expires,
             )
         console.print(checkpoint_table)
         console.print("\n[dim]Tip: Copy the full path to use with sampling clients[/dim]")
@@ -231,6 +238,11 @@ def list():  # pylint: disable=redefined-builtin
 @cli.group()
 def show():
     """Show detailed information about a specific resource."""
+
+
+@cli.group()
+def checkpoint():
+    """Manage checkpoints."""
 
 
 @list.command("training-runs")
@@ -355,6 +367,48 @@ def show_model_cmd(
                 format_json_output(result)
             else:
                 display_model_detail(result)
+    except Exception as e:
+        handle_error(e)
+
+
+@checkpoint.command("set-ttl")
+@click.argument("model_id")
+@click.argument("path")
+@click.argument("seconds", type=int, required=False, default=None)
+@click.option("--remove", is_flag=True, help="Cancel expiration (make permanent)")
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def checkpoint_set_ttl_cmd(  # pylint: disable=too-many-positional-arguments
+    model_id: str,
+    path: str,
+    seconds: Optional[int],
+    remove: bool,
+    base_url: Optional[str],
+    api_key: Optional[str],
+):
+    """Set or remove TTL for a checkpoint.
+
+    MODEL_ID is the model that owns the checkpoint.
+    PATH is the checkpoint storage path (weaver://...).
+    SECONDS is the TTL in seconds (omit when using --remove).
+    """
+    try:
+        if remove and seconds is not None:
+            raise click.UsageError("Cannot specify both SECONDS and --remove")
+        if not remove and seconds is None:
+            raise click.UsageError("Provide SECONDS or use --remove")
+
+        ttl_value: Optional[int] = None if remove else seconds
+
+        with ServiceClient(base_url=base_url, api_key=api_key) as client:
+            client.http.patch(
+                f"/api/v1/models/{model_id}/checkpoints/ttl",
+                json={"path": path, "ttl_seconds": ttl_value},
+            )
+            if remove:
+                console.print(f"[green]Expiration removed for checkpoint:[/green] {path}")
+            else:
+                console.print(f"[green]TTL set to {seconds}s for checkpoint:[/green] {path}")
     except Exception as e:
         handle_error(e)
 

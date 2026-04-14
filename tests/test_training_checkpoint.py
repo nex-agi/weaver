@@ -330,3 +330,154 @@ class TestCheckpointType:
         ckpt = Checkpoint(id="1", path="p")
         with pytest.raises(AttributeError):
             ckpt.id = "2"  # type: ignore[misc]
+
+    def test_from_payload_with_ttl_fields(self):
+        payload = {
+            "id": "ckpt-t",
+            "path": "weaver://ckpt-t",
+            "ttl_seconds": 86400,
+            "created_at": "2026-04-14T00:00:00Z",
+            "expires_at": "2026-04-15T00:00:00Z",
+        }
+        ckpt = Checkpoint.from_payload(payload)
+        assert ckpt.ttl_seconds == 86400
+        assert ckpt.created_at == "2026-04-14T00:00:00Z"
+        assert ckpt.expires_at == "2026-04-15T00:00:00Z"
+
+    def test_from_payload_without_ttl_fields(self):
+        payload = {"id": "ckpt-n", "path": "weaver://ckpt-n"}
+        ckpt = Checkpoint.from_payload(payload)
+        assert ckpt.ttl_seconds is None
+        assert ckpt.created_at is None
+        assert ckpt.expires_at is None
+
+
+# ---------------------------------------------------------------------------
+# save_state TTL
+# ---------------------------------------------------------------------------
+
+
+class TestSaveStateTTL:
+    def test_default_no_ttl_in_body(self):
+        tc = _make_training_client()
+        handle = _make_handle({"id": "ckpt-1", "path": "weaver://ckpt-1"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_state(name="test")
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert "ttl_seconds" not in body
+
+    def test_explicit_none_sends_null(self):
+        tc = _make_training_client()
+        handle = _make_handle({"id": "ckpt-1", "path": "weaver://ckpt-1"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_state(name="test", ttl_seconds=None)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert "ttl_seconds" in body
+        assert body["ttl_seconds"] is None
+
+    def test_with_ttl_seconds(self):
+        tc = _make_training_client()
+        handle = _make_handle({"id": "ckpt-1", "path": "weaver://ckpt-1"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_state(name="test", ttl_seconds=3600)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["ttl_seconds"] == 3600
+
+
+# ---------------------------------------------------------------------------
+# save_weights_for_sampler TTL
+# ---------------------------------------------------------------------------
+
+
+class TestSaveWeightsForSamplerTTL:
+    def test_default_no_ttl_in_body(self):
+        tc = _make_training_client()
+        handle = _make_handle({"model_path": "weaver://path"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_weights_for_sampler(name="test")
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert "ttl_seconds" not in body
+
+    def test_explicit_none_sends_null(self):
+        tc = _make_training_client()
+        handle = _make_handle({"model_path": "weaver://path"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_weights_for_sampler(name="test", ttl_seconds=None)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert "ttl_seconds" in body
+        assert body["ttl_seconds"] is None
+
+    def test_with_ttl_seconds(self):
+        tc = _make_training_client()
+        handle = _make_handle({"model_path": "weaver://path"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_weights_for_sampler(name="test", ttl_seconds=7200)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["ttl_seconds"] == 7200
+
+
+# ---------------------------------------------------------------------------
+# save_weights_and_get_sampling_client TTL
+# ---------------------------------------------------------------------------
+
+
+class TestSaveWeightsAndGetSamplingClientTTL:
+    def test_default_sends_86400(self):
+        tc = _make_training_client()
+        handle = _make_handle({"model_path": "weaver://path", "sampling_session_id": "ss-1"})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.get_sampling_client.return_value = MagicMock()
+        tc.save_weights_and_get_sampling_client()
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["ttl_seconds"] == 86400
+
+    def test_explicit_none_no_ttl_in_body(self):
+        tc = _make_training_client()
+        handle = _make_handle({"model_path": "weaver://path", "sampling_session_id": "ss-1"})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.get_sampling_client.return_value = MagicMock()
+        tc.save_weights_and_get_sampling_client(ttl_seconds=None)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert "ttl_seconds" not in body
+
+    def test_custom_ttl(self):
+        tc = _make_training_client()
+        handle = _make_handle({"model_path": "weaver://path", "sampling_session_id": "ss-1"})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.get_sampling_client.return_value = MagicMock()
+        tc.save_weights_and_get_sampling_client(ttl_seconds=7200)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["ttl_seconds"] == 7200
+
+
+# ---------------------------------------------------------------------------
+# set_checkpoint_ttl
+# ---------------------------------------------------------------------------
+
+
+class TestSetCheckpointTTL:
+    def test_set_ttl_with_int(self):
+        tc = _make_training_client()
+        tc._service.http.patch.return_value = {"status": "ok"}
+        result = tc.set_checkpoint_ttl("weaver://ckpt-1", ttl_seconds=604800)
+        tc._service.http.patch.assert_called_once_with(
+            "/api/v1/models/mdl-123/checkpoints/ttl",
+            json={"path": "weaver://ckpt-1", "ttl_seconds": 604800},
+        )
+        assert result == {"status": "ok"}
+
+    def test_set_ttl_none_cancels_expiration(self):
+        tc = _make_training_client()
+        tc._service.http.patch.return_value = {"status": "ok"}
+        tc.set_checkpoint_ttl("weaver://ckpt-1", ttl_seconds=None)
+        body = tc._service.http.patch.call_args[1]["json"]
+        assert body["ttl_seconds"] is None
+
+    def test_set_ttl_with_checkpoint_object(self):
+        tc = _make_training_client()
+        tc._service.http.patch.return_value = {"status": "ok"}
+        ckpt = Checkpoint(id="ckpt-1", path="weaver://ckpt-1")
+        tc.set_checkpoint_ttl(ckpt, ttl_seconds=3600)
+        body = tc._service.http.patch.call_args[1]["json"]
+        assert body["path"] == "weaver://ckpt-1"
+        assert body["ttl_seconds"] == 3600

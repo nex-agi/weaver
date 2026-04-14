@@ -36,6 +36,10 @@ class Checkpoint:
             the server did not report this field).
         train_mlp: Whether MLP layers were trained.
         train_attn: Whether attention layers were trained.
+        ttl_seconds: Time-to-live in seconds, or ``None`` for permanent.
+        created_at: ISO 8601 creation timestamp (server-generated).
+        expires_at: ISO 8601 expiration timestamp (server-generated),
+            or ``None`` if permanent.
     """
 
     id: str
@@ -46,6 +50,9 @@ class Checkpoint:
     train_unembed: bool | None = None
     train_mlp: bool | None = None
     train_attn: bool | None = None
+    ttl_seconds: int | None = None
+    created_at: str | None = None
+    expires_at: str | None = None
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> Checkpoint:
@@ -72,6 +79,9 @@ class Checkpoint:
             train_unembed=_bool_or_none(lookup_case_insensitive(payload, "train_unembed")),
             train_mlp=_bool_or_none(lookup_case_insensitive(payload, "train_mlp")),
             train_attn=_bool_or_none(lookup_case_insensitive(payload, "train_attn")),
+            ttl_seconds=_int_or_none(lookup_case_insensitive(payload, "ttl_seconds")),
+            created_at=_str_or_none(lookup_case_insensitive(payload, "created_at")),
+            expires_at=_str_or_none(lookup_case_insensitive(payload, "expires_at")),
         )
 
 
@@ -81,3 +91,7 @@ def _str_or_none(value: Any) -> str | None:
 
 def _bool_or_none(value: Any) -> bool | None:
     return bool(value) if value is not None else None
+
+
+def _int_or_none(value: Any) -> int | None:
+    return int(value) if value is not None else None
