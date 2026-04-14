@@ -20,7 +20,7 @@ import logging
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
-from ._utils import lookup_case_insensitive
+from ._utils import UNSET, _UnsetType, lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
@@ -218,6 +218,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
+        ttl_seconds: int | None = ...,
         wait: Literal[True] = True,
     ) -> str: ...
 
@@ -226,6 +227,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
+        ttl_seconds: int | None = ...,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -233,12 +235,17 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
+        ttl_seconds: int | None | _UnsetType = UNSET,
         wait: bool = True,
     ) -> str | OperationHandle:
         """Export model weights for sampling.
 
         Args:
             name: Optional custom path name for the exported weights
+            ttl_seconds: Time-to-live in seconds for the exported checkpoint.
+                Defaults to ``None`` (permanent, backward-compatible).
+                Pass an integer to set auto-expiration, or explicit ``None``
+                to ensure permanent retention.
             wait: If True (default), waits for export to complete and returns path.
                   If False, returns an OperationHandle immediately.
 
@@ -251,6 +258,8 @@ class TrainingClient:
         body: Dict[str, Any] = {"seq_id": self._next_seq()}
         if name:
             body["path"] = name
+        if not isinstance(ttl_seconds, _UnsetType):
+            body["ttl_seconds"] = ttl_seconds
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/export-sampler",
             body,
@@ -270,6 +279,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
+        ttl_seconds: int | None = 86400,
         wait: Literal[True] = True,
     ) -> "SamplingClient": ...
 
@@ -278,6 +288,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
+        ttl_seconds: int | None = 86400,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -285,6 +296,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
+        ttl_seconds: int | None = 86400,
         wait: bool = True,
     ) -> "SamplingClient" | OperationHandle:
         """Export model weights and create a sampling client.
@@ -292,8 +304,14 @@ class TrainingClient:
         This is a convenience method that combines save_weights_for_sampler
         and get_sampling_client. For more control, use those methods separately.
 
+        Because this method is designed for frequent RL weight-sync calls,
+        the default TTL is **1 day (86400 s)**.  Pass ``ttl_seconds=None``
+        to keep the checkpoint permanently.
+
         Args:
             name: Optional custom path name for the exported weights
+            ttl_seconds: Time-to-live in seconds for the exported checkpoint.
+                Defaults to ``86400`` (1 day).  Pass ``None`` for permanent.
             wait: If True (default), waits for export and returns SamplingClient.
                   If False, returns an OperationHandle immediately.
 
@@ -306,6 +324,8 @@ class TrainingClient:
         body: Dict[str, Any] = {"seq_id": self._next_seq()}
         if name:
             body["path"] = name
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = ttl_seconds
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/export-sampler",
             body,
@@ -355,6 +375,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        ttl_seconds: int | None = ...,
         wait: Literal[True] = True,
     ) -> Checkpoint: ...
 
@@ -364,6 +385,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        ttl_seconds: int | None = ...,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -372,6 +394,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        ttl_seconds: int | None | _UnsetType = UNSET,
         wait: bool = True,
     ) -> Checkpoint | OperationHandle:
         """Save the current model weights as a checkpoint.
@@ -385,6 +408,10 @@ class TrainingClient:
                 the model ID automatically.
             checkpoint_type: ``"weight"`` (default) or
                 ``"weight_and_optimizer"``.
+            ttl_seconds: Time-to-live in seconds for the checkpoint.
+                Defaults to ``None`` (permanent, backward-compatible).
+                Pass an integer to set auto-expiration, or explicit ``None``
+                to ensure permanent retention.
             wait: If True (default), blocks until the save completes and
                 returns a :class:`~weaver.types.Checkpoint`.
 
@@ -395,6 +422,8 @@ class TrainingClient:
         body: Dict[str, Any] = {"type": checkpoint_type}
         if name is not None:
             body["name"] = name
+        if not isinstance(ttl_seconds, _UnsetType):
+            body["ttl_seconds"] = ttl_seconds
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/checkpoints",
             body,
@@ -507,6 +536,33 @@ class TrainingClient:
         )
         items = (response or {}).get("items", []) if isinstance(response, dict) else []
         return [Checkpoint.from_payload(item) for item in items if isinstance(item, dict)]
+
+    def set_checkpoint_ttl(
+        self,
+        path: str | Checkpoint,
+        ttl_seconds: int | None,
+    ) -> Dict[str, Any]:
+        """Set or cancel the TTL (time-to-live) for a checkpoint.
+
+        Args:
+            path: Checkpoint storage path (``weaver://...`` URI), or a
+                :class:`~weaver.types.Checkpoint` object whose ``.path``
+                will be used.
+            ttl_seconds: TTL in seconds.  Pass ``None`` to cancel
+                expiration (make the checkpoint permanent).
+
+        Returns:
+            Server response dict confirming the TTL update.
+        """
+        checkpoint_path = path.path if isinstance(path, Checkpoint) else path
+        body: Dict[str, Any] = {
+            "path": checkpoint_path,
+            "ttl_seconds": ttl_seconds,
+        }
+        return self._service.http.patch(
+            f"/api/v1/models/{self.model_id}/checkpoints/ttl",
+            json=body,
+        )
 
     def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:
         """Terminate trainer and/or inference instances for this model.

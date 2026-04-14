@@ -19,6 +19,26 @@ from __future__ import annotations
 from typing import Any, Dict
 
 
+class _UnsetType:
+    """Sentinel to distinguish 'parameter not passed' from explicit ``None``."""
+
+    _instance: _UnsetType | None = None
+
+    def __new__(cls) -> _UnsetType:
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "<UNSET>"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+UNSET = _UnsetType()
+
+
 def lookup_case_insensitive(payload: Dict[str, Any], name: str) -> Any:
     variants = {
         name,
