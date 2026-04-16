@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
@@ -82,6 +82,18 @@ class OperationHandle:
     def result(self) -> Any:
         payload = self.wait()
         return lookup_case_insensitive(payload, "response")
+
+    @classmethod
+    def wait_all(cls, handles: List["OperationHandle"]) -> List[Any]:
+        """Wait for all handles to complete and return their results.
+
+        Args:
+            handles: List of OperationHandle instances to wait on.
+
+        Returns:
+            List of results in the same order as the input handles.
+        """
+        return [h.result() for h in handles]
 
 
 def build_operation_handle(client: APIClient, payload: Dict[str, Any]) -> OperationHandle:
