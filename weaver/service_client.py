@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import atexit
 import logging
 import threading
 import time
@@ -99,6 +100,7 @@ class ServiceClient:
         else:
             self.ensure_session()
         self._start_heartbeat()
+        atexit.register(self.close)
 
     def terminate_model(
         self,

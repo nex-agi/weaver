@@ -14,6 +14,10 @@
 
 """Tests for the ServiceClient."""
 
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -144,6 +148,61 @@ def test_create_model_passes_debug_info():
     assert training.debug_info == debug_info
     assert training.debug_info["kubectl_exec"].startswith("kubectl exec")
     assert training.model_id == "abc-123"
+
+
+def _build_atexit_script(marker_path: str, exit_code: str = "") -> str:
+    """Build a subprocess script that verifies atexit calls close().
+
+    Patches APIClient so connect() proceeds and registers atexit.
+    Uses _http.close() as the marker hook since atexit holds the original
+    bound method.
+    """
+    return f"""
+from unittest.mock import MagicMock, patch
+from weaver.service_client import ServiceClient
+
+mock_http = MagicMock()
+mock_http.close.side_effect = lambda: open("{marker_path}", "w").write("closed")
+
+with patch("weaver.service_client.APIClient", return_value=mock_http):
+    client = ServiceClient(api_key="sk-test")
+    client.ensure_session = lambda **kw: None
+    client._start_heartbeat = lambda: None
+    client.connect()
+{exit_code}
+"""
+
+
+def test_atexit_calls_close_on_normal_exit():
+    """Test that atexit handler calls close() when process exits normally."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = Path(tmpdir) / "closed.marker"
+        result = subprocess.run(
+            [sys.executable, "-c", _build_atexit_script(str(marker))],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, f"subprocess failed: {result.stderr}"
+        assert marker.exists(), "close() was not called on normal exit"
+
+
+def test_atexit_calls_close_on_exception_exit():
+    """Test that atexit handler calls close() when process exits via unhandled exception."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = Path(tmpdir) / "closed.marker"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _build_atexit_script(str(marker), 'raise RuntimeError("simulated crash")'),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode != 0
+        assert marker.exists(), "close() was not called on exception exit"
 
 
 def test_create_model_debug_info_none_when_absent():
