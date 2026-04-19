@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from typing import Any, Mapping, MutableMapping
@@ -48,6 +49,30 @@ CONNECTION_ERRORS = (OSError, httpx.ConnectError, httpx.RemoteProtocolError)
 logger = logging.getLogger(__name__)
 
 
+def _is_connection_error(exc: BaseException) -> bool:
+    """Return True if *exc* represents a transport-level failure.
+
+    Either the exception itself is in :data:`CONNECTION_ERRORS`, or its
+    ``__cause__``/``__context__`` chain contains an :class:`OSError`. httpx
+    wraps low-level OS errors into :class:`httpx.ReadError` / ``WriteError``
+    via ``raise mapped_exc(...) from original_oserror``, so walking the chain
+    recovers that signal. Treating those as connection errors is safe: an
+    OSError on the client socket (e.g. ``EBADF`` after fork, ``EPIPE`` on a
+    dead keep-alive) means the request bytes never left the process, so
+    retrying cannot duplicate non-idempotent server-side effects.
+    """
+    if isinstance(exc, CONNECTION_ERRORS):
+        return True
+    seen: set[int] = set()
+    cur: BaseException | None = exc.__cause__ or exc.__context__
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, OSError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 class WeaverAPIError(RuntimeError):
     def __init__(self, status_code: int, code: str, message: str, retryable: bool):
         super().__init__(f"[{status_code}] {code}: {message}")
@@ -67,21 +92,48 @@ class APIClient:
         timeout: httpx.Timeout | float | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
     ):
-        base_url = config.base_url.rstrip("/")
+        self._base_url = config.base_url.rstrip("/")
         headers: MutableMapping[str, str] = {"User-Agent": USER_AGENT}
         if config.api_key:
             headers["X-WEAVER-API-KEY"] = config.api_key
+        self._headers = headers
+        self._timeout = timeout or DEFAULT_TIMEOUT
 
-        self._client = httpx.Client(
-            base_url=base_url,
-            timeout=timeout or DEFAULT_TIMEOUT,
-            headers=headers,
-            limits=DEFAULT_CONNECTION_LIMITS,
-        )
+        self._client = self._build_client()
+        self._pid = os.getpid()
         self._max_retries = max_retries
 
         # Initialize tracer for distributed tracing
         self._tracer = get_tracer()
+
+    def _build_client(self) -> httpx.Client:
+        return httpx.Client(
+            base_url=self._base_url,
+            timeout=self._timeout,
+            headers=self._headers,
+            limits=DEFAULT_CONNECTION_LIMITS,
+        )
+
+    def _ensure_fresh_client(self) -> None:
+        """Rebuild ``self._client`` if the current process differs from the one
+        that created it.
+
+        httpx.Client holds OS-level socket file descriptors inside its
+        connection pool. After ``os.fork`` (the default on Linux for
+        ``multiprocessing``), those FDs are inherited by the child but point
+        at sockets the child never opened; any read/write against them fails
+        with ``OSError: [Errno 9] Bad file descriptor``. Detecting the pid
+        change and constructing a fresh client (without touching the
+        inherited one — closing it would attempt to write ``Connection:
+        close`` over the same dead FDs) gives every child its own pool.
+        """
+        current_pid = os.getpid()
+        if current_pid == self._pid:
+            return
+        # Drop the reference to the inherited client without calling close():
+        # its FDs belong to the parent's sockets and are unsafe to touch here.
+        self._client = self._build_client()
+        self._pid = current_pid
 
     def __enter__(self) -> "APIClient":
         return self
@@ -90,7 +142,11 @@ class APIClient:
         self.close()
 
     def close(self) -> None:
-        self._client.close()
+        # Only close the client in the process that created it; closing a
+        # fork-inherited client would write shutdown bytes over FDs that
+        # belong to the parent.
+        if os.getpid() == self._pid:
+            self._client.close()
 
     def get(self, path: str, *, params: Mapping[str, Any] | None = None) -> Any:
         return self._request("GET", path, params=params)
@@ -201,6 +257,10 @@ class APIClient:
 
         while request_attempt < effective_max_retries:
             try:
+                # Rebuild the httpx.Client if we are in a forked child — the
+                # inherited socket pool would otherwise surface as EBADF.
+                self._ensure_fresh_client()
+
                 # Inject trace context into HTTP headers
                 headers = dict(self._client.headers or {})
                 inject(headers)  # Adds 'traceparent' header with trace context
@@ -230,53 +290,52 @@ class APIClient:
                 span.set_status(Status(StatusCode.ERROR, "API error"))
                 raise
 
-            except CONNECTION_ERRORS as e:
-                # Connection-level error — the request never reached the server,
-                # so it is safe to retry regardless of max_retries.
-                connection_error_count += 1
+            except Exception as e:  # pylint: disable=broad-except
                 last_exception = e
                 span.record_exception(e)
 
-                logger.debug(
-                    "Connection error (attempt %d/%d): %s %s - %s: %s",
-                    connection_error_count,
-                    DEFAULT_CONNECTION_RETRIES,
-                    method,
-                    path,
-                    type(e).__name__,
-                    str(e),
-                )
+                if _is_connection_error(e):
+                    # Connection-level error — the request never reached the
+                    # server, so it is safe to retry regardless of max_retries.
+                    connection_error_count += 1
 
-                if connection_error_count >= DEFAULT_CONNECTION_RETRIES:
-                    span.set_status(
-                        Status(
-                            StatusCode.ERROR,
-                            f"Connection failed after {connection_error_count} attempts",
-                        )
-                    )
-                    logger.error(
-                        "Connection error after %d attempts: %s %s - %s",
+                    logger.debug(
+                        "Connection error (attempt %d/%d): %s %s - %s: %s",
                         connection_error_count,
+                        DEFAULT_CONNECTION_RETRIES,
                         method,
                         path,
+                        type(e).__name__,
                         str(e),
                     )
-                    raise
 
-                delay = min(
-                    INITIAL_RETRY_DELAY * (2 ** (connection_error_count - 1)),
-                    MAX_RETRY_DELAY,
-                )
-                logger.debug("Retrying in %.1fs...", delay)
-                time.sleep(delay)
+                    if connection_error_count >= DEFAULT_CONNECTION_RETRIES:
+                        span.set_status(
+                            Status(
+                                StatusCode.ERROR,
+                                f"Connection failed after {connection_error_count} attempts",
+                            )
+                        )
+                        logger.error(
+                            "Connection error after %d attempts: %s %s - %s",
+                            connection_error_count,
+                            method,
+                            path,
+                            str(e),
+                        )
+                        raise
 
-            except Exception as e:
+                    delay = min(
+                        INITIAL_RETRY_DELAY * (2 ** (connection_error_count - 1)),
+                        MAX_RETRY_DELAY,
+                    )
+                    logger.debug("Retrying in %.1fs...", delay)
+                    time.sleep(delay)
+                    continue
+
                 request_attempt += 1
-                last_exception = e
                 is_last_attempt = request_attempt >= effective_max_retries
 
-                # Record error in span
-                span.record_exception(e)
                 if is_last_attempt:
                     span.set_status(
                         Status(StatusCode.ERROR, f"Failed after {effective_max_retries} retries")
