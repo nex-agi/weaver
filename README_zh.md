@@ -42,13 +42,14 @@ if __name__ == "__main__":
 - 采样推理
 - Checkpoint 保存与恢复
 
-## 配合 NexRL 进行 RL 训练
+## 生态
 
-对于强化学习场景，推荐将 Weaver 与 [NexRL](https://github.com/nex-agi/NexRL) 的 **training-service** 模式配合使用。NexRL 负责编排完整的 RL 流程（rollout、轨迹收集、策略更新），Weaver 提供底层的训练和推理服务，实现端到端的 RL 训练而无需直接管理 GPU 资源。
+[NexRL](https://github.com/nex-agi/NexRL) 是配套的 RL 训练框架。在其 **training-service** 模式下，NexRL 负责编排完整的 RL 流程（rollout、轨迹收集、策略更新），Weaver 提供底层的训练和推理服务。
 
-## 配合 MetaClaw 进行 OpenClaw 自主学习
+## 应用案例
 
-[MetaClaw](https://github.com/aiming-lab/MetaClaw) 已接入 Weaver 作为 RL 训练后端，用于 OpenClaw 自主学习场景。MetaClaw 将每次真实对话转化为学习信号——通过设置 `rl.backend=weaver`，即可使用 Weaver 进行云端 LoRA 训练，让你的个人智能体在使用中持续进化，无需本地 GPU。
+**OpenClaw 自主学习** —
+[MetaClaw](https://github.com/aiming-lab/MetaClaw) 已接入 Weaver 作为 RL 训练后端。通过设置 `rl.backend=weaver`，MetaClaw 将每次真实对话转化为学习信号，使用 Weaver 进行云端 LoRA 训练，让个人智能体在使用中持续进化，无需本地 GPU。
 
 ## 深入了解
 

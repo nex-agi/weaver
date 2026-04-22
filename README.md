@@ -45,20 +45,20 @@ tutorial that walks through the full Weaver SDK workflow using a Pig Latin trans
 - Sampling / inference
 - Checkpoint save and restore
 
-## RL Training with NexRL
+## Ecosystem
 
-For reinforcement learning workflows, we recommend using Weaver together with
-[NexRL](https://github.com/nex-agi/NexRL) in its **training-service** mode.
-NexRL orchestrates the full RL loop (rollouts, trajectory collection, policy updates)
-while Weaver handles the underlying training and inference services, so you get
-end-to-end RL training without managing GPU resources directly.
+[NexRL](https://github.com/nex-agi/NexRL) is the companion RL training framework.
+In its **training-service** mode, NexRL orchestrates the full RL loop
+(rollouts, trajectory collection, policy updates) while Weaver handles the underlying
+training and inference services.
 
-## Autonomous Learning with MetaClaw
+## Use Cases
 
-[MetaClaw](https://github.com/aiming-lab/MetaClaw) integrates Weaver as an RL backend
-for OpenClaw autonomous learning. MetaClaw turns every live conversation into a learning
-signal — with `rl.backend=weaver`, it uses Weaver for cloud-based LoRA training so your
-personal agent continuously evolves without a local GPU.
+**OpenClaw Autonomous Learning** —
+[MetaClaw](https://github.com/aiming-lab/MetaClaw) has integrated Weaver as an RL
+backend. By setting `rl.backend=weaver`, MetaClaw turns every live conversation into a
+learning signal and uses Weaver for cloud-based LoRA training, enabling personal agents
+to continuously evolve without a local GPU.
 
 ## Deep Dive
 
