@@ -45,6 +45,14 @@ tutorial that walks through the full Weaver SDK workflow using a Pig Latin trans
 - Sampling / inference
 - Checkpoint save and restore
 
+## RL Training with NexRL
+
+For reinforcement learning workflows, we recommend using Weaver together with
+[NexRL](https://github.com/nex-agi/NexRL) in its **training-service** mode.
+NexRL orchestrates the full RL loop (rollouts, trajectory collection, policy updates)
+while Weaver handles the underlying training and inference services, so you get
+end-to-end RL training without managing GPU resources directly.
+
 ## Deep Dive
 
 For more technical details, see [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver).

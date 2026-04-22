@@ -42,6 +42,10 @@ if __name__ == "__main__":
 - 采样推理
 - Checkpoint 保存与恢复
 
+## 配合 NexRL 进行 RL 训练
+
+对于强化学习场景，推荐将 Weaver 与 [NexRL](https://github.com/nex-agi/NexRL) 的 **training-service** 模式配合使用。NexRL 负责编排完整的 RL 流程（rollout、轨迹收集、策略更新），Weaver 提供底层的训练和推理服务，实现端到端的 RL 训练而无需直接管理 GPU 资源。
+
 ## 深入了解
 
 更多技术细节请参考 [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver)。
