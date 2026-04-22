@@ -33,14 +33,11 @@ if __name__ == "__main__":
     main()
 ```
 
-## 交互式教程
+## 使用方法
 
-参见 [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb)，通过 Pig Latin 翻译任务演示完整的 Weaver SDK 工作流，包括：
+参见 [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb)，通过 Pig Latin 翻译任务交互式演示完整的 SDK 工作流——涵盖数据准备、LoRA / 全量微调、采样推理和 checkpoint 管理。
 
-- 数据准备与 token 级别的 Datum 构造
-- LoRA 训练与全量微调
-- 采样推理
-- Checkpoint 保存与恢复
+完整可运行脚本参见 [`examples/pig_latin.py`](examples/pig_latin.py)。
 
 ## 生态
 
@@ -54,7 +51,3 @@ if __name__ == "__main__":
 ## 深入了解
 
 更多技术细节请参考 [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver)。
-
-## 完整示例
-
-参见 `weaver/examples/pig_latin.py`。

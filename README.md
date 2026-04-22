@@ -35,15 +35,13 @@ if __name__ == "__main__":
     main()
 ```
 
-## Interactive Walkthrough
+## Usage
 
-See [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb) for a hands-on
-tutorial that walks through the full Weaver SDK workflow using a Pig Latin translation task:
+See [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb) for an interactive
+walkthrough of the full SDK workflow using a Pig Latin translation task — covering data
+preparation, LoRA / full fine-tuning, sampling, and checkpoint management.
 
-- Data preparation and token-level Datum construction
-- LoRA training and full fine-tuning
-- Sampling / inference
-- Checkpoint save and restore
+For a complete runnable script, see [`examples/pig_latin.py`](examples/pig_latin.py).
 
 ## Ecosystem
 
@@ -63,7 +61,3 @@ to continuously evolve without a local GPU.
 ## Deep Dive
 
 For more technical details, see [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver).
-
-## Full Example
-
-For a complete script example, see `weaver/examples/pig_latin.py`.
