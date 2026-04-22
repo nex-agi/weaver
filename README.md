@@ -1,5 +1,9 @@
 # Weaver Python SDK
 
+[![PyPI version](https://img.shields.io/pypi/v/nex-weaver)](https://pypi.org/project/nex-weaver/)
+[![Python](https://img.shields.io/pypi/pyversions/nex-weaver)](https://pypi.org/project/nex-weaver/)
+[![CI](https://github.com/nex-agi/weaver/actions/workflows/ci.yml/badge.svg)](https://github.com/nex-agi/weaver/actions/workflows/ci.yml)
+
 English | [中文](README_zh.md)
 
 Python client for the NexWeave Weaver server. The SDK mirrors the REST API exposed by
