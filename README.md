@@ -53,6 +53,13 @@ NexRL orchestrates the full RL loop (rollouts, trajectory collection, policy upd
 while Weaver handles the underlying training and inference services, so you get
 end-to-end RL training without managing GPU resources directly.
 
+## Autonomous Learning with MetaClaw
+
+[MetaClaw](https://github.com/aiming-lab/MetaClaw) integrates Weaver as an RL backend
+for OpenClaw autonomous learning. MetaClaw turns every live conversation into a learning
+signal — with `rl.backend=weaver`, it uses Weaver for cloud-based LoRA training so your
+personal agent continuously evolves without a local GPU.
+
 ## Deep Dive
 
 For more technical details, see [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver).
