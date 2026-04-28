@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 
 @dataclass(slots=True)
@@ -26,6 +26,7 @@ class LogprobsParams:
 
     return_rollout_token_expert: bool = False
     loss_fn_config: Mapping[str, Any] | None = None
+    sampling_mask: Sequence[Sequence[int]] | None = None
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {}
@@ -33,4 +34,8 @@ class LogprobsParams:
             payload["loss_fn_config"] = dict(self.loss_fn_config)
         if self.return_rollout_token_expert:
             payload["return_rollout_token_expert"] = True
+        if self.sampling_mask is not None:
+            payload["sampling_mask"] = [
+                [int(token_id) for token_id in token_mask] for token_mask in self.sampling_mask
+            ]
         return payload
