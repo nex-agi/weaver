@@ -195,11 +195,7 @@ class TrainingClient:
         self.forward_backward(surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True)
 
         # Step G: return loss and metrics
-        return {
-            "loss": loss.detach(),
-            "metrics": metrics,
-            "debug_forward_outputs": outputs,
-        }
+        return {"loss": loss.detach(), "metrics": metrics}
 
     @overload
     def optim_step(self, params: AdamParams, *, wait: Literal[True] = True) -> Dict[str, Any]: ...
