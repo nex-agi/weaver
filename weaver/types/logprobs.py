@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Mapping
 
 
 @dataclass(slots=True)
@@ -24,9 +25,12 @@ class LogprobsParams:
     """Parameters for compute_logprobs requests."""
 
     return_rollout_token_expert: bool = False
+    loss_fn_config: Mapping[str, Any] | None = None
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {}
+        if self.loss_fn_config:
+            payload["loss_fn_config"] = dict(self.loss_fn_config)
         if self.return_rollout_token_expert:
             payload["return_rollout_token_expert"] = True
         return payload

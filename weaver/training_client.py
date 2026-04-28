@@ -66,7 +66,7 @@ class TrainingClient:
         data: Sequence[Datum],
         loss_fn: str,
         *,
-        loss_fn_config: Mapping[str, float] | None = None,
+        loss_fn_config: Mapping[str, Any] | None = None,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
 
@@ -76,7 +76,7 @@ class TrainingClient:
         data: Sequence[Datum],
         loss_fn: str,
         *,
-        loss_fn_config: Mapping[str, float] | None = None,
+        loss_fn_config: Mapping[str, Any] | None = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -85,7 +85,7 @@ class TrainingClient:
         data: Sequence[Datum],
         loss_fn: str,
         *,
-        loss_fn_config: Mapping[str, float] | None = None,
+        loss_fn_config: Mapping[str, Any] | None = None,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -110,6 +110,8 @@ class TrainingClient:
         loss_fn: Callable[
             [Sequence[Datum], List["torch.Tensor"]], Tuple["torch.Tensor", Dict[str, Any]]
         ],
+        *,
+        loss_fn_config: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Run a custom loss function with surrogate-based gradient propagation.
 
@@ -130,7 +132,9 @@ class TrainingClient:
         import torch
 
         # Step A: forward pass to get logprobs
-        fwd_result = self.forward_backward(data, "forward_logprob", wait=True)
+        fwd_result = self.forward_backward(
+            data, "forward_logprob", loss_fn_config=loss_fn_config, wait=True
+        )
 
         # Step B: parse logprobs from response
         outputs = fwd_result.get("result", {}).get("loss_fn_outputs", [])
@@ -188,7 +192,7 @@ class TrainingClient:
             surrogate_data.append(surrogate_datum)
 
         # Step F: surrogate backward pass
-        self.forward_backward(surrogate_data, "surrogate", wait=True)
+        self.forward_backward(surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True)
 
         # Step G: return loss and metrics
         return {"loss": loss.detach(), "metrics": metrics}
