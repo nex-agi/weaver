@@ -110,6 +110,8 @@ class TrainingClient:
         loss_fn: Callable[
             [Sequence[Datum], List["torch.Tensor"]], Tuple["torch.Tensor", Dict[str, Any]]
         ],
+        *,
+        loss_fn_config: Mapping[str, float] | None = None,
     ) -> Dict[str, Any]:
         """Run a custom loss function with surrogate-based gradient propagation.
 
@@ -130,7 +132,9 @@ class TrainingClient:
         import torch
 
         # Step A: forward pass to get logprobs
-        fwd_result = self.forward_backward(data, "forward_logprob", wait=True)
+        fwd_result = self.forward_backward(
+            data, "forward_logprob", loss_fn_config=loss_fn_config, wait=True
+        )
 
         # Step B: parse logprobs from response
         outputs = fwd_result.get("result", {}).get("loss_fn_outputs", [])
@@ -187,11 +191,22 @@ class TrainingClient:
             )
             surrogate_data.append(surrogate_datum)
 
+        debug_surrogate_weights: List["torch.Tensor"] = []
+        for t in logprob_tensors:
+            grad = t.grad
+            if grad is not None:
+                debug_surrogate_weights.append(grad.detach().cpu())
+
         # Step F: surrogate backward pass
-        self.forward_backward(surrogate_data, "surrogate", wait=True)
+        self.forward_backward(surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True)
 
         # Step G: return loss and metrics
-        return {"loss": loss.detach(), "metrics": metrics}
+        return {
+            "loss": loss.detach(),
+            "metrics": metrics,
+            "debug_forward_outputs": outputs,
+            "debug_surrogate_weights": debug_surrogate_weights,
+        }
 
     @overload
     def optim_step(self, params: AdamParams, *, wait: Literal[True] = True) -> Dict[str, Any]: ...
