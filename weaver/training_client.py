@@ -66,7 +66,7 @@ class TrainingClient:
         data: Sequence[Datum],
         loss_fn: str,
         *,
-        loss_fn_config: Mapping[str, float] | None = None,
+        loss_fn_config: Mapping[str, Any] | None = None,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
 
@@ -76,7 +76,7 @@ class TrainingClient:
         data: Sequence[Datum],
         loss_fn: str,
         *,
-        loss_fn_config: Mapping[str, float] | None = None,
+        loss_fn_config: Mapping[str, Any] | None = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -85,7 +85,7 @@ class TrainingClient:
         data: Sequence[Datum],
         loss_fn: str,
         *,
-        loss_fn_config: Mapping[str, float] | None = None,
+        loss_fn_config: Mapping[str, Any] | None = None,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -111,7 +111,7 @@ class TrainingClient:
             [Sequence[Datum], List["torch.Tensor"]], Tuple["torch.Tensor", Dict[str, Any]]
         ],
         *,
-        loss_fn_config: Mapping[str, float] | None = None,
+        loss_fn_config: Mapping[str, Any] | None = None,
     ) -> Dict[str, Any]:
         """Run a custom loss function with surrogate-based gradient propagation.
 
@@ -191,12 +191,6 @@ class TrainingClient:
             )
             surrogate_data.append(surrogate_datum)
 
-        debug_surrogate_weights: List["torch.Tensor"] = []
-        for t in logprob_tensors:
-            grad = t.grad
-            if grad is not None:
-                debug_surrogate_weights.append(grad.detach().cpu())
-
         # Step F: surrogate backward pass
         self.forward_backward(surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True)
 
@@ -205,7 +199,6 @@ class TrainingClient:
             "loss": loss.detach(),
             "metrics": metrics,
             "debug_forward_outputs": outputs,
-            "debug_surrogate_weights": debug_surrogate_weights,
         }
 
     @overload
