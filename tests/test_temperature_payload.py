@@ -49,7 +49,34 @@ def test_forward_backward_sends_temperature_in_loss_fn_config() -> None:
     assert body["payload"]["forward_backward_input"]["loss_fn_config"]["temperature"] == 0.7
 
 
-def test_forward_backward_custom_reuses_loss_fn_config() -> None:
+def test_forward_sends_temperature_in_loss_fn_config() -> None:
+    client = _make_training_client()
+    handle = MagicMock()
+    client._service.enqueue_operation.return_value = handle
+
+    result = client.forward([], "cross_entropy", loss_fn_config={"temperature": 0.7}, wait=False)
+
+    assert result is handle
+    path, body = client._service.enqueue_operation.call_args[0]
+    assert path == "/api/v1/models/model-123/forward-passes"
+    assert body["payload"]["forward_input"]["loss_fn_config"]["temperature"] == 0.7
+    assert body["payload"]["forward_input"]["loss_fn"] == "cross_entropy"
+    assert "forward_backward_input" not in body["payload"]
+
+
+def test_forward_waits_for_result_by_default() -> None:
+    client = _make_training_client()
+    handle = MagicMock()
+    handle.result.return_value = {"result": {"loss": 1.23}}
+    client._service.enqueue_operation.return_value = handle
+
+    result = client.forward([], "cross_entropy")
+
+    assert result == {"result": {"loss": 1.23}}
+    handle.result.assert_called_once_with()
+
+
+def test_forward_backward_custom_uses_forward_and_reuses_loss_fn_config() -> None:
     client = _make_training_client()
     datum = Datum.from_raw(
         model_input=ModelInput.from_ints([1, 2]),
@@ -57,7 +84,7 @@ def test_forward_backward_custom_reuses_loss_fn_config() -> None:
     )
     calls: list[dict[str, Any]] = []
 
-    def fake_forward_backward(
+    def fake_forward(
         self: TrainingClient,
         data: list[Datum],
         loss_fn: str,
@@ -70,6 +97,18 @@ def test_forward_backward_custom_reuses_loss_fn_config() -> None:
             return {"result": {"loss_fn_outputs": [{"logprobs": [1.0]}]}}
         return {"result": {}}
 
+    def fake_forward_backward(
+        self: TrainingClient,
+        data: list[Datum],
+        loss_fn: str,
+        *,
+        loss_fn_config: dict[str, float] | None = None,
+        wait: bool = True,
+    ) -> dict[str, Any]:
+        calls.append({"loss_fn": loss_fn, "loss_fn_config": loss_fn_config})
+        return {"result": {}}
+
+    client.forward = MethodType(fake_forward, client)
     client.forward_backward = MethodType(fake_forward_backward, client)
 
     def loss_fn(_data: list[Datum], logprob_tensors: list[torch.Tensor]):
