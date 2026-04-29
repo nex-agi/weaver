@@ -61,6 +61,51 @@ class TrainingClient:
         return [datum.to_payload() for datum in data]
 
     @overload
+    def forward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        *,
+        wait: Literal[True] = True,
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    def forward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        *,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
+
+    def forward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        *,
+        wait: bool = True,
+    ) -> OperationHandle | Dict[str, Any]:
+        """Compute a forward pass without accumulating gradients."""
+        payload: Dict[str, Any] = {
+            "model_id": self.model_id,
+            "seq_id": self._next_seq(),
+            "forward_input": {
+                "loss_fn": loss_fn,
+                "data": self._serialize_data(data),
+            },
+        }
+        if loss_fn_config:
+            payload["forward_input"]["loss_fn_config"] = dict(loss_fn_config)
+        handle = self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/forward-passes",
+            {"payload": payload},
+        )
+        return handle.result() if wait else handle
+
+    @overload
     def forward_backward(
         self,
         data: Sequence[Datum],

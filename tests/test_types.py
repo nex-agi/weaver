@@ -74,24 +74,6 @@ def test_model_input_creation():
     assert model_input.chunks[0].tokens == [1, 2, 3]
 
 
-def test_logprobs_params_accepts_sampling_mask():
-    params = LogprobsParams(sampling_mask=[[1, 2], [3]])
-
-    assert params.to_payload() == {"sampling_mask": [[1, 2], [3]]}
-
-
-def test_logprobs_params_combines_loss_config_and_sampling_mask():
-    params = LogprobsParams(
-        loss_fn_config={"temperature": 0.7},
-        sampling_mask=[[1, 2], [3]],
-    )
-
-    assert params.to_payload() == {
-        "loss_fn_config": {"temperature": 0.7},
-        "sampling_mask": [[1, 2], [3]],
-    }
-
-
 def test_model_input_to_ints():
     """Test ModelInput conversion to ints."""
     model_input = ModelInput.from_ints([1, 2, 3, 4, 5])

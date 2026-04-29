@@ -49,6 +49,29 @@ def test_forward_backward_sends_temperature_in_loss_fn_config() -> None:
     assert body["payload"]["forward_backward_input"]["loss_fn_config"]["temperature"] == 0.7
 
 
+def test_forward_sends_loss_fn_inputs_to_trainer_backend() -> None:
+    client = _make_training_client()
+    handle = MagicMock()
+    client._service.enqueue_operation.return_value = handle
+    datum = Datum.from_raw(
+        model_input=ModelInput.from_ints([10, 11, 12]),
+        loss_fn_inputs={
+            "target_tokens": [11, 12],
+            "sampling_mask": [[11, 99], [12]],
+        },
+    )
+
+    result = client.forward([datum], "forward_logprob", wait=False)
+
+    assert result is handle
+    path, body = client._service.enqueue_operation.call_args[0]
+    assert path == "/api/v1/models/model-123/forward-passes"
+    forward_input = body["payload"]["forward_input"]
+    assert forward_input["loss_fn"] == "forward_logprob"
+    assert forward_input["data"][0]["loss_fn_inputs"]["target_tokens"]["data"] == [11, 12]
+    assert forward_input["data"][0]["loss_fn_inputs"]["sampling_mask"] == [[11, 99], [12]]
+
+
 def test_forward_backward_custom_reuses_loss_fn_config() -> None:
     client = _make_training_client()
     datum = Datum.from_raw(
