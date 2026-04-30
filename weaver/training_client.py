@@ -88,7 +88,19 @@ class TrainingClient:
         *,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
-        """Compute a forward pass without accumulating gradients."""
+        """Compute a forward pass without accumulating gradients.
+
+        For ``loss_fn="forward_logprob"``, the trainer-forward contract is
+        target-aligned: each datum must provide ``model_input`` and
+        ``loss_fn_inputs["target_tokens"]`` with the same length, and the result
+        contains one logprob per target token. For a full token sequence
+        ``tokens``, send ``model_input=tokens[:-1]`` and
+        ``target_tokens=tokens[1:]`` to score next-token targets.
+
+        This is intentionally different from ``SamplingClient.compute_logprobs``,
+        whose public result is prompt-token-aligned and includes a leading
+        ``None`` placeholder at index 0.
+        """
         payload: Dict[str, Any] = {
             "model_id": self.model_id,
             "seq_id": self._next_seq(),
