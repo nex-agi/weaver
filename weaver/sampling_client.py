@@ -86,6 +86,13 @@ class SamplingClient:
     ) -> List[float | None] | Dict[str, Any]:
         """Compute log-probabilities for the given prompt.
 
+        The sampling-client contract is prompt-token-aligned: the returned list
+        has length ``len(prompt_tokens)``, and index 0 is ``None`` because the
+        first token has no previous token context to score. This differs from
+        trainer-side ``forward_logprob`` tasks, which score explicit
+        ``target_tokens`` and return one logprob per target token, with no
+        leading placeholder.
+
         Args:
             prompt: The model input (tokens) to compute logprobs for.
             logprobs_params: Optional parameters (e.g. return_rollout_token_expert for MoE router replay).
