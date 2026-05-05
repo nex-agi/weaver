@@ -265,7 +265,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = ...,
+        ttl_seconds: int | None = 86400,
         wait: Literal[True] = True,
     ) -> str: ...
 
@@ -274,7 +274,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = ...,
+        ttl_seconds: int | None = 86400,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -282,17 +282,20 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None | _UnsetType = UNSET,
+        ttl_seconds: int | None = 86400,
         wait: bool = True,
     ) -> str | OperationHandle:
         """Export model weights for sampling.
 
+        Sampler weights are intended for short-lived RL weight-sync use, so
+        the default TTL is **1 day (86400 s)**.  Pass ``ttl_seconds=None`` to
+        keep the exported checkpoint permanently (use ``save_state`` if you
+        need a durable checkpoint instead).
+
         Args:
             name: Optional custom path name for the exported weights
             ttl_seconds: Time-to-live in seconds for the exported checkpoint.
-                Defaults to ``None`` (permanent, backward-compatible).
-                Pass an integer to set auto-expiration, or explicit ``None``
-                to ensure permanent retention.
+                Defaults to ``86400`` (1 day).  Pass ``None`` for permanent.
             wait: If True (default), waits for export to complete and returns path.
                   If False, returns an OperationHandle immediately.
 
@@ -305,7 +308,7 @@ class TrainingClient:
         body: Dict[str, Any] = {"seq_id": self._next_seq()}
         if name:
             body["path"] = name
-        if not isinstance(ttl_seconds, _UnsetType):
+        if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/export-sampler",
