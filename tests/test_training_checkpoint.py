@@ -390,22 +390,21 @@ class TestSaveStateTTL:
 
 
 class TestSaveWeightsForSamplerTTL:
-    def test_default_no_ttl_in_body(self):
+    def test_default_is_one_day(self):
         tc = _make_training_client()
         handle = _make_handle({"model_path": "weaver://path"})
         tc._service.enqueue_operation.return_value = handle
         tc.save_weights_for_sampler(name="test")
         body = tc._service.enqueue_operation.call_args[0][1]
-        assert "ttl_seconds" not in body
+        assert body["ttl_seconds"] == 86400
 
-    def test_explicit_none_sends_null(self):
+    def test_explicit_none_no_ttl_in_body(self):
         tc = _make_training_client()
         handle = _make_handle({"model_path": "weaver://path"})
         tc._service.enqueue_operation.return_value = handle
         tc.save_weights_for_sampler(name="test", ttl_seconds=None)
         body = tc._service.enqueue_operation.call_args[0][1]
-        assert "ttl_seconds" in body
-        assert body["ttl_seconds"] is None
+        assert "ttl_seconds" not in body
 
     def test_with_ttl_seconds(self):
         tc = _make_training_client()
