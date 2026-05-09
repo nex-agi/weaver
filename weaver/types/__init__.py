@@ -20,6 +20,17 @@ from .logprobs import LogprobsParams
 from .lora_config import LoraConfig
 from .model_input import ModelInput, ModelInputChunk
 from .optim import AdamParams
+from .router_replay import (
+    ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK,
+    ROUTER_REPLAY_MODE_R2,
+    ROUTER_REPLAY_MODE_R3,
+    ROUTER_REPLAY_SOURCE_RECOMPUTE,
+    ROUTER_REPLAY_SOURCE_ROLLOUT,
+    ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED,
+    RouterReplayIndices,
+    RouterReplayMetadata,
+    RouterReplayModelConfig,
+)
 from .sampling import SamplingParams
 from .tensor import TensorData
 
@@ -31,6 +42,15 @@ __all__ = [
     "LogprobsParams",
     "ModelInput",
     "ModelInputChunk",
+    "ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK",
+    "ROUTER_REPLAY_MODE_R2",
+    "ROUTER_REPLAY_MODE_R3",
+    "ROUTER_REPLAY_SOURCE_RECOMPUTE",
+    "ROUTER_REPLAY_SOURCE_ROLLOUT",
+    "ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED",
+    "RouterReplayIndices",
+    "RouterReplayMetadata",
+    "RouterReplayModelConfig",
     "SamplingParams",
     "TensorData",
 ]

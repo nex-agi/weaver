@@ -67,6 +67,7 @@ class TrainingClient:
         loss_fn: str,
         loss_fn_config: Mapping[str, Any] | None = None,
         *,
+        metadata: Mapping[str, Any] | None = None,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
 
@@ -77,6 +78,7 @@ class TrainingClient:
         loss_fn: str,
         loss_fn_config: Mapping[str, Any] | None = None,
         *,
+        metadata: Mapping[str, Any] | None = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -86,9 +88,20 @@ class TrainingClient:
         loss_fn: str,
         loss_fn_config: Mapping[str, Any] | None = None,
         *,
+        metadata: Mapping[str, Any] | None = None,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
-        """Compute a forward pass without accumulating gradients."""
+        """Compute a forward pass without accumulating gradients.
+
+        Args:
+            data: Sequence of training data.
+            loss_fn: Name of the loss function to use.
+            loss_fn_config: Optional loss function configuration.
+            metadata: Optional top-level request metadata (e.g. router_replay
+                context). RFC-0001: passed through to TrainerTask.metadata,
+                does not enter datum or loss_fn_inputs.
+            wait: If True, blocks until the operation completes.
+        """
         payload: Dict[str, Any] = {
             "model_id": self.model_id,
             "seq_id": self._next_seq(),
@@ -99,6 +112,8 @@ class TrainingClient:
         }
         if loss_fn_config:
             payload["forward_input"]["loss_fn_config"] = dict(loss_fn_config)
+        if metadata:
+            payload["metadata"] = dict(metadata)
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-passes",
             {"payload": payload},
@@ -112,6 +127,7 @@ class TrainingClient:
         loss_fn: str,
         *,
         loss_fn_config: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
 
@@ -122,6 +138,7 @@ class TrainingClient:
         loss_fn: str,
         *,
         loss_fn_config: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -131,8 +148,20 @@ class TrainingClient:
         loss_fn: str,
         *,
         loss_fn_config: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
+        """Compute a forward and backward pass, accumulating gradients.
+
+        Args:
+            data: Sequence of training data.
+            loss_fn: Name of the loss function to use.
+            loss_fn_config: Optional loss function configuration.
+            metadata: Optional top-level request metadata (e.g. router_replay
+                context). RFC-0001: passed through to TrainerTask.metadata,
+                does not enter datum or loss_fn_inputs.
+            wait: If True, blocks until the operation completes.
+        """
         payload: Dict[str, Any] = {
             "model_id": self.model_id,
             "seq_id": self._next_seq(),
@@ -143,6 +172,8 @@ class TrainingClient:
         }
         if loss_fn_config:
             payload["forward_backward_input"]["loss_fn_config"] = dict(loss_fn_config)
+        if metadata:
+            payload["metadata"] = dict(metadata)
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-backward-passes",
             {"payload": payload},
