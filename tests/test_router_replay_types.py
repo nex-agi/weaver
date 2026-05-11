@@ -17,7 +17,9 @@
 from weaver.types.router_replay import (
     ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK,
     ROUTER_REPLAY_MODE_R2,
+    ROUTER_REPLAY_MODE_R3,
     ROUTER_REPLAY_SOURCE_RECOMPUTE,
+    ROUTER_REPLAY_SOURCE_ROLLOUT,
     ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED,
     RouterReplayIndices,
     RouterReplayMetadata,
@@ -62,6 +64,17 @@ def test_router_replay_metadata_to_payload():
     }
 
 
+def test_router_replay_metadata_to_payload_preserves_fail_fast_false():
+    metadata = RouterReplayMetadata(
+        mode=ROUTER_REPLAY_MODE_R3,
+        source=ROUTER_REPLAY_SOURCE_ROLLOUT,
+        indices=RouterReplayIndices(value=[[[7, 8]]], num_layers=1, topk=2),
+        fail_fast=False,
+    )
+
+    assert metadata.to_payload()["fail_fast"] is False
+
+
 def test_router_replay_model_config_to_payload():
     config = RouterReplayModelConfig(
         enabled=True,
@@ -77,3 +90,9 @@ def test_router_replay_model_config_to_payload():
         "topk": 8,
         "fail_fast": True,
     }
+
+
+def test_router_replay_model_config_to_payload_preserves_fail_fast_false():
+    config = RouterReplayModelConfig(enabled=False, fail_fast=False)
+
+    assert config.to_payload() == {"enabled": False, "fail_fast": False}
