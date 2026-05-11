@@ -70,14 +70,12 @@ class RouterReplayMetadata:
     fail_fast: bool = True
 
     def to_payload(self) -> dict[str, object]:
-        payload: dict[str, object] = {
+        return {
             "mode": self.mode,
             "source": self.source,
             "indices": self.indices.to_payload(),
+            "fail_fast": self.fail_fast,
         }
-        if self.fail_fast:
-            payload["fail_fast"] = True
-        return payload
 
 
 @dataclass(slots=True)
@@ -95,15 +93,13 @@ class RouterReplayModelConfig:
     fail_fast: bool = True
 
     def to_payload(self) -> dict[str, object]:
-        payload: dict[str, object] = {"enabled": self.enabled}
+        payload: dict[str, object] = {"enabled": self.enabled, "fail_fast": self.fail_fast}
         if self.mode is not None:
             payload["mode"] = self.mode
         if self.num_layers is not None:
             payload["num_layers"] = self.num_layers
         if self.topk is not None:
             payload["topk"] = self.topk
-        if self.fail_fast:
-            payload["fail_fast"] = True
         return payload
 
 

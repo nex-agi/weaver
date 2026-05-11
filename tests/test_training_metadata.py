@@ -46,9 +46,7 @@ def _make_training_client() -> TrainingClient:
 
 def _make_datum() -> Datum:
     """Create a minimal Datum for testing."""
-    model_input = ModelInput(
-        chunks=[ModelInputChunk(type="encoded_text", tokens=[10, 20, 30])]
-    )
+    model_input = ModelInput(chunks=[ModelInputChunk(type="encoded_text", tokens=[10, 20, 30])])
     return Datum.from_raw(
         model_input=model_input,
         loss_fn_inputs={"target_tokens": [10, 20, 30]},
@@ -239,9 +237,7 @@ class TestForwardBackwardMetadata:
 
         meta = _router_replay_metadata()
         config = {"temperature": 0.7, "clip_ratio": 0.2}
-        client.forward_backward(
-            [_make_datum()], "grpo", loss_fn_config=config, metadata=meta
-        )
+        client.forward_backward([_make_datum()], "grpo", loss_fn_config=config, metadata=meta)
 
         inner_payload = captured_payloads[0]["payload"]
         # Both are present and independent
@@ -256,10 +252,7 @@ class TestRouterReplayMetadataType:
 
     def test_typed_metadata_serialization(self):
         """RouterReplayMetadata.to_payload() produces valid metadata dict."""
-        from weaver.types.router_replay import (
-            RouterReplayIndices,
-            RouterReplayMetadata,
-        )
+        from weaver.types.router_replay import RouterReplayIndices, RouterReplayMetadata
 
         replay = RouterReplayMetadata(
             mode="R3",
