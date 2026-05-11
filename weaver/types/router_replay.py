@@ -36,8 +36,8 @@ ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED: RouterReplayTokenAlignment = "targ
 class RouterReplayIndices:
     """Token-layer-topk router replay indices payload.
 
-    RFC-0001: This is the normalized, backend-neutral contract used by the SDK
-    and downstream trainer metadata.
+    This is the normalized, backend-neutral contract used by the SDK and
+    downstream trainer metadata.
     """
 
     value: Sequence[Sequence[Sequence[int]]]
@@ -60,7 +60,7 @@ class RouterReplayIndices:
 class RouterReplayMetadata:
     """Training-side router replay metadata envelope.
 
-    RFC-0001: Training requests carry this object at top-level metadata, not in
+    Training requests carry this object at top-level metadata, not in
     loss_fn_inputs, so the replay execution context stays separate from loss data.
     """
 
@@ -82,7 +82,7 @@ class RouterReplayMetadata:
 class RouterReplayModelConfig:
     """Model-registration router replay toggle.
 
-    RFC-0001: This mirrors supported-models.config.router_replay and keeps the
+    This mirrors supported-models.config.router_replay and keeps the
     enable/mode/shape contract explicit for clients that introspect model config.
     """
 

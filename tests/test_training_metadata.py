@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""RFC-0001 T3: Tests for training request metadata passthrough.
+"""Tests for training request metadata passthrough.
 
 Validates that TrainingClient.forward() and forward_backward() pass metadata
 as a top-level payload key (not inside datum or loss_fn_inputs), and that it
@@ -54,7 +54,7 @@ def _make_datum() -> Datum:
 
 
 def _router_replay_metadata() -> Dict[str, Any]:
-    """Sample router_replay metadata per RFC-0001 contract."""
+    """Sample router_replay metadata contract."""
     return {
         "router_replay": {
             "mode": "R3",

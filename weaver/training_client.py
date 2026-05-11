@@ -98,8 +98,8 @@ class TrainingClient:
             loss_fn: Name of the loss function to use.
             loss_fn_config: Optional loss function configuration.
             metadata: Optional top-level request metadata (e.g. router_replay
-                context). RFC-0001: passed through to TrainerTask.metadata,
-                does not enter datum or loss_fn_inputs.
+                context). Passed through to TrainerTask.metadata and does not
+                enter datum or loss_fn_inputs.
             wait: If True, blocks until the operation completes.
         """
         payload: Dict[str, Any] = {
@@ -158,8 +158,8 @@ class TrainingClient:
             loss_fn: Name of the loss function to use.
             loss_fn_config: Optional loss function configuration.
             metadata: Optional top-level request metadata (e.g. router_replay
-                context). RFC-0001: passed through to TrainerTask.metadata,
-                does not enter datum or loss_fn_inputs.
+                context). Passed through to TrainerTask.metadata and does not
+                enter datum or loss_fn_inputs.
             wait: If True, blocks until the operation completes.
         """
         payload: Dict[str, Any] = {
