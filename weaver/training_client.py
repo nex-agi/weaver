@@ -225,12 +225,12 @@ class TrainingClient:
 
             grad = logprob_tensor.grad
             assert grad is not None  # validated above
+            loss_fn_inputs: Dict[str, Any] = dict(datum.loss_fn_inputs)
+            loss_fn_inputs["target_tokens"] = resolved_targets
+            loss_fn_inputs["surrogate_weights"] = grad.detach().tolist()
             surrogate_datum = Datum.from_raw(
                 model_input=datum.model_input,
-                loss_fn_inputs={
-                    "target_tokens": resolved_targets,
-                    "surrogate_weights": grad.detach().tolist(),
-                },
+                loss_fn_inputs=loss_fn_inputs,
             )
             surrogate_data.append(surrogate_datum)
 

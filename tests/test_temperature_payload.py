@@ -80,9 +80,15 @@ def test_forward_backward_custom_uses_forward_and_reuses_loss_fn_config() -> Non
     client = _make_training_client()
     datum = Datum.from_raw(
         model_input=ModelInput.from_ints([1, 2]),
-        loss_fn_inputs={"target_tokens": [2]},
+        loss_fn_inputs={
+            "target_tokens": [2],
+            "loss_mask": [1],
+            "sampling_mask": [[2]],
+            "surrogate_weights": [99.0],
+        },
     )
     calls: list[dict[str, Any]] = []
+    surrogate_data: list[Datum] = []
 
     def fake_forward(
         self: TrainingClient,
@@ -106,6 +112,7 @@ def test_forward_backward_custom_uses_forward_and_reuses_loss_fn_config() -> Non
         wait: bool = True,
     ) -> dict[str, Any]:
         calls.append({"loss_fn": loss_fn, "loss_fn_config": loss_fn_config})
+        surrogate_data.extend(data)
         return {"result": {}}
 
     client.forward = MethodType(fake_forward, client)
@@ -120,6 +127,15 @@ def test_forward_backward_custom_uses_forward_and_reuses_loss_fn_config() -> Non
         {"loss_fn": "forward_logprob", "loss_fn_config": {"temperature": 0.7}},
         {"loss_fn": "surrogate", "loss_fn_config": {"temperature": 0.7}},
     ]
+    assert len(surrogate_data) == 1
+    assert torch.equal(surrogate_data[0].loss_fn_inputs["target_tokens"], torch.tensor([2]))
+    assert torch.equal(surrogate_data[0].loss_fn_inputs["loss_mask"], torch.tensor([1]))
+    assert torch.equal(surrogate_data[0].loss_fn_inputs["sampling_mask"], torch.tensor([[2]]))
+    assert torch.equal(
+        surrogate_data[0].loss_fn_inputs["surrogate_weights"],
+        torch.tensor([1.0]),
+    )
+    assert torch.equal(datum.loss_fn_inputs["surrogate_weights"], torch.tensor([99.0]))
 
 
 def test_logprobs_params_sends_loss_fn_config() -> None:
