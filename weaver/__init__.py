@@ -18,7 +18,7 @@
 try:
     from importlib.metadata import version as _get_version
 
-    __version__ = _get_version("weaver")
+    __version__ = _get_version("nex-weaver")
 except Exception:
     # Fallback when package is not installed (e.g., development mode without pip install -e)
     __version__ = "0.3.0"

@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     import torch
 
     from .sampling_client import SamplingClient
+    from .types.router_replay import RouterReplayMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,29 @@ class TrainingClient:
     def _serialize_data(self, data: Sequence[Datum]) -> Sequence[Dict[str, Any]]:
         return [datum.to_payload() for datum in data]
 
+    def _build_metadata(
+        self,
+        metadata: Mapping[str, Any] | None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None",
+    ) -> Dict[str, Any] | None:
+        if not metadata and router_replay is None:
+            return None
+
+        payload = dict(metadata or {})
+        if router_replay is not None:
+            if "router_replay" in payload:
+                raise ValueError(
+                    "Pass router replay either via metadata['router_replay'] or "
+                    "router_replay=, not both."
+                )
+            to_payload = getattr(router_replay, "to_payload", None)
+            if callable(to_payload):
+                payload["router_replay"] = to_payload()
+            else:
+                assert isinstance(router_replay, Mapping)
+                payload["router_replay"] = dict(router_replay)
+        return payload or None
+
     @overload
     def forward(
         self,
@@ -68,6 +92,7 @@ class TrainingClient:
         loss_fn_config: Mapping[str, Any] | None = None,
         *,
         metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
 
@@ -79,6 +104,7 @@ class TrainingClient:
         loss_fn_config: Mapping[str, Any] | None = None,
         *,
         metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -89,6 +115,7 @@ class TrainingClient:
         loss_fn_config: Mapping[str, Any] | None = None,
         *,
         metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         """Compute a forward pass without accumulating gradients.
@@ -100,6 +127,9 @@ class TrainingClient:
             metadata: Optional top-level request metadata (e.g. router_replay
                 context). Passed through to TrainerTask.metadata and does not
                 enter datum or loss_fn_inputs.
+            router_replay: Optional per-call Router Replay envelope. This is
+                serialized into top-level metadata.router_replay for this
+                forward call only.
             wait: If True, blocks until the operation completes.
         """
         payload: Dict[str, Any] = {
@@ -112,8 +142,9 @@ class TrainingClient:
         }
         if loss_fn_config:
             payload["forward_input"]["loss_fn_config"] = dict(loss_fn_config)
-        if metadata:
-            payload["metadata"] = dict(metadata)
+        request_metadata = self._build_metadata(metadata, router_replay)
+        if request_metadata:
+            payload["metadata"] = request_metadata
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-passes",
             {"payload": payload},
@@ -128,6 +159,7 @@ class TrainingClient:
         *,
         loss_fn_config: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
         wait: Literal[True] = True,
     ) -> Dict[str, Any]: ...
 
@@ -139,6 +171,7 @@ class TrainingClient:
         *,
         loss_fn_config: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -149,6 +182,7 @@ class TrainingClient:
         *,
         loss_fn_config: Mapping[str, Any] | None = None,
         metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         """Compute a forward and backward pass, accumulating gradients.
@@ -160,6 +194,9 @@ class TrainingClient:
             metadata: Optional top-level request metadata (e.g. router_replay
                 context). Passed through to TrainerTask.metadata and does not
                 enter datum or loss_fn_inputs.
+            router_replay: Optional per-call Router Replay envelope. This is
+                serialized into top-level metadata.router_replay for this
+                forward_backward call only.
             wait: If True, blocks until the operation completes.
         """
         payload: Dict[str, Any] = {
@@ -172,8 +209,9 @@ class TrainingClient:
         }
         if loss_fn_config:
             payload["forward_backward_input"]["loss_fn_config"] = dict(loss_fn_config)
-        if metadata:
-            payload["metadata"] = dict(metadata)
+        request_metadata = self._build_metadata(metadata, router_replay)
+        if request_metadata:
+            payload["metadata"] = request_metadata
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-backward-passes",
             {"payload": payload},

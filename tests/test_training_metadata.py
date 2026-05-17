@@ -289,3 +289,46 @@ class TestRouterReplayMetadataType:
         assert rr["indices"]["num_layers"] == 2
         assert rr["indices"]["topk"] == 2
         assert rr["fail_fast"] is True
+
+    def test_forward_accepts_router_replay_argument(self):
+        """TrainingClient.forward serializes router_replay as per-call metadata."""
+        from weaver.types.router_replay import RouterReplayMetadata
+
+        client = _make_training_client()
+        captured_payloads = []
+
+        def mock_enqueue(path, payload):
+            captured_payloads.append(payload)
+            handle = MagicMock()
+            handle.result.return_value = {}
+            return handle
+
+        client._service.enqueue_operation = mock_enqueue
+
+        client.forward(
+            [_make_datum()],
+            "forward_logprob",
+            router_replay=RouterReplayMetadata.r2_record(),
+        )
+
+        rr = captured_payloads[0]["payload"]["metadata"]["router_replay"]
+        assert rr == {
+            "mode": "R2",
+            "source": "recompute",
+            "fail_fast": True,
+            "action": "RECORD",
+        }
+
+    def test_forward_backward_rejects_router_replay_conflict(self):
+        """Explicit router_replay cannot conflict with metadata.router_replay."""
+        from weaver.types.router_replay import RouterReplayMetadata
+
+        client = _make_training_client()
+
+        with pytest.raises(ValueError, match="router replay either"):
+            client.forward_backward(
+                [_make_datum()],
+                "grpo",
+                metadata=_router_replay_metadata(),
+                router_replay=RouterReplayMetadata.r2_record(),
+            )
