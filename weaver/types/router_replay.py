@@ -16,7 +16,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .payload_ref import materialize_payload_ref
@@ -32,6 +35,8 @@ ROUTER_REPLAY_SOURCE_RECOMPUTE: RouterReplaySource = "recompute"
 ROUTER_REPLAY_SOURCE_ROLLOUT: RouterReplaySource = "rollout"
 ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK: RouterReplayFormat = "token_layer_topk"
 ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED: RouterReplayTokenAlignment = "target_aligned"
+ROUTER_REPLAY_DATUM_SCHEMA = "weaver.router_replay.datum.v1"
+ROUTER_REPLAY_INDEX_SET_SCHEMA = "weaver.router_replay.index_set.v1"
 
 
 @dataclass(slots=True)
@@ -68,10 +73,10 @@ class RouterReplayIndices:
 
 @dataclass(slots=True)
 class RouterReplayMetadata:
-    """Training-side router replay metadata envelope.
+    """Datum-level router replay metadata envelope.
 
-    Training requests carry this object at top-level metadata, not in
-    loss_fn_inputs, so the replay execution context stays separate from loss data.
+    Training requests carry this object in ``Datum.metadata["router_replay"]``.
+    Batch-level router replay metadata is intentionally no longer canonical.
     """
 
     mode: RouterReplayMode
@@ -79,13 +84,27 @@ class RouterReplayMetadata:
     indices: RouterReplayIndices | Mapping[str, Any] | None = None
     fail_fast: bool = True
     action: str | None = None
+    sample_index: int | None = None
+    index_uri: str | None = None
+    index_set_uri: str | None = None
+    manifest_uri: str | None = None
+    schema: str = ROUTER_REPLAY_DATUM_SCHEMA
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
+            "schema": self.schema,
             "mode": self.mode,
             "source": self.source,
             "fail_fast": self.fail_fast,
         }
+        if self.sample_index is not None:
+            payload["sample_index"] = int(self.sample_index)
+        if self.index_uri is not None:
+            payload["index_uri"] = self.index_uri
+        if self.index_set_uri is not None:
+            payload["index_set_uri"] = self.index_set_uri
+        if self.manifest_uri is not None:
+            payload["manifest_uri"] = self.manifest_uri
         if self.indices is not None:
             payload["indices"] = (
                 self.indices.to_payload()
@@ -97,8 +116,13 @@ class RouterReplayMetadata:
         return payload
 
     @classmethod
-    def r2_record(cls, *, fail_fast: bool = True) -> "RouterReplayMetadata":
-        """Build per-call R2 RECORD metadata for ``forward`` recompute calls."""
+    def r2_record(
+        cls,
+        *,
+        sample_index: int | None = None,
+        fail_fast: bool = True,
+    ) -> "RouterReplayMetadata":
+        """Build datum-level R2 RECORD metadata for ``forward`` recompute calls."""
 
         return cls(
             mode=ROUTER_REPLAY_MODE_R2,
@@ -106,6 +130,7 @@ class RouterReplayMetadata:
             indices=None,
             fail_fast=fail_fast,
             action="RECORD",
+            sample_index=sample_index,
         )
 
     @classmethod
@@ -113,6 +138,10 @@ class RouterReplayMetadata:
         cls,
         indices: RouterReplayIndices | Mapping[str, Any],
         *,
+        sample_index: int | None = None,
+        index_uri: str | None = None,
+        index_set_uri: str | None = None,
+        manifest_uri: str | None = None,
         fail_fast: bool = True,
     ) -> "RouterReplayMetadata":
         return cls(
@@ -120,6 +149,10 @@ class RouterReplayMetadata:
             source=ROUTER_REPLAY_SOURCE_RECOMPUTE,
             indices=indices,
             fail_fast=fail_fast,
+            sample_index=sample_index,
+            index_uri=index_uri,
+            index_set_uri=index_set_uri,
+            manifest_uri=manifest_uri,
         )
 
     @classmethod
@@ -127,6 +160,10 @@ class RouterReplayMetadata:
         cls,
         indices: RouterReplayIndices | Mapping[str, Any],
         *,
+        sample_index: int | None = None,
+        index_uri: str | None = None,
+        index_set_uri: str | None = None,
+        manifest_uri: str | None = None,
         fail_fast: bool = True,
     ) -> "RouterReplayMetadata":
         return cls(
@@ -134,6 +171,10 @@ class RouterReplayMetadata:
             source=ROUTER_REPLAY_SOURCE_ROLLOUT,
             indices=indices,
             fail_fast=fail_fast,
+            sample_index=sample_index,
+            index_uri=index_uri,
+            index_set_uri=index_set_uri,
+            manifest_uri=manifest_uri,
         )
 
 
@@ -207,7 +248,14 @@ def materialize_router_replay_indices(envelope: Mapping[str, Any]) -> list[Any]:
         if isinstance(sample_indices, list) and tokens_per_sample > 0:
             saw_sample_layout = True
             pp_rank = int(shard.get("pp_rank") or 0)
-            for offset, sample_idx in enumerate(sample_indices):
+            sample_rows = _split_shard_rows_by_sample(
+                shard_value=shard_value,
+                sample_indices=[int(item) for item in sample_indices],
+                tokens_per_sample=tokens_per_sample,
+                row_layout=str(shard.get("row_layout") or ""),
+                microbatch_sizes=shard.get("microbatch_sizes"),
+            )
+            for sample_idx, rows in sample_rows.items():
                 sample_idx = int(sample_idx)
                 sample_pp_key = (sample_idx, pp_rank)
                 if sample_pp_key in seen_sample_pp:
@@ -215,9 +263,7 @@ def materialize_router_replay_indices(envelope: Mapping[str, Any]) -> list[Any]:
                     # inspection purposes; one TP copy per PP stage is enough.
                     continue
                 seen_sample_pp.add(sample_pp_key)
-                start = offset * tokens_per_sample
-                end = start + tokens_per_sample
-                per_sample_parts.setdefault(sample_idx, {})[pp_rank] = shard_value[start:end]
+                per_sample_parts.setdefault(sample_idx, {})[pp_rank] = rows
         else:
             concatenated.extend(shard_value)
 
@@ -238,3 +284,195 @@ def materialize_router_replay_indices(envelope: Mapping[str, Any]) -> list[Any]:
             materialized.append(sample_tokens)
         return materialized
     return concatenated
+
+
+def _split_shard_rows_by_sample(
+    *,
+    shard_value: list[Any],
+    sample_indices: list[int],
+    tokens_per_sample: int,
+    row_layout: str,
+    microbatch_sizes: Any,
+) -> dict[int, list[Any]]:
+    if row_layout != "seq_major_microbatch":
+        return {
+            int(sample_idx): shard_value[
+                offset * tokens_per_sample : (offset + 1) * tokens_per_sample
+            ]
+            for offset, sample_idx in enumerate(sample_indices)
+            if (offset + 1) * tokens_per_sample <= len(shard_value)
+        }
+
+    if isinstance(microbatch_sizes, list) and microbatch_sizes:
+        mb_sizes = [int(item) for item in microbatch_sizes]
+    else:
+        mb_sizes = [len(sample_indices)]
+    if sum(mb_sizes) != len(sample_indices):
+        return {}
+
+    per_sample: dict[int, list[Any]] = {}
+    sample_offset = 0
+    row_base = 0
+    for mb_size in mb_sizes:
+        mb_samples = sample_indices[sample_offset : sample_offset + mb_size]
+        for pos, sample_idx in enumerate(mb_samples):
+            rows: list[Any] = []
+            for token_idx in range(tokens_per_sample):
+                row_idx = row_base + token_idx * mb_size + pos
+                if row_idx < len(shard_value):
+                    rows.append(shard_value[row_idx])
+            if rows:
+                per_sample[int(sample_idx)] = rows
+        sample_offset += mb_size
+        row_base += mb_size * tokens_per_sample
+    return per_sample
+
+
+def router_replay_set_uri(model_id: str, replay_set_id: str) -> str:
+    return f"weaver://{model_id}/router-replay/{replay_set_id}"
+
+
+def router_replay_manifest_uri(model_id: str, replay_set_id: str) -> str:
+    return f"{router_replay_set_uri(model_id, replay_set_id)}/manifest.json"
+
+
+def router_replay_sample_uri(model_id: str, replay_set_id: str, sample_index: int) -> str:
+    return f"{router_replay_set_uri(model_id, replay_set_id)}/samples/{int(sample_index)}"
+
+
+def router_replay_shard_uri(
+    model_id: str,
+    replay_set_id: str,
+    *,
+    dp_rank: int,
+    tp_rank: int,
+    pp_rank: int,
+) -> str:
+    return (
+        f"{router_replay_set_uri(model_id, replay_set_id)}/shards/"
+        f"dp{int(dp_rank)}-tp{int(tp_rank)}-pp{int(pp_rank)}.pt"
+    )
+
+
+def materialize_router_replay_index(uri_or_datum: Any) -> Any:
+    """Materialize router replay index content for explicit user inspection.
+
+    Normal training flows should pass router replay refs opaquely. This helper is
+    for debugging: it can resolve a datum payload, a sample URI, a manifest URI,
+    a shard URI, or an inline indices envelope from a local/GPFS environment.
+    """
+
+    if isinstance(uri_or_datum, Mapping):
+        return _materialize_router_replay_mapping(uri_or_datum)
+    if not isinstance(uri_or_datum, str):
+        raise TypeError("Expected a weaver:// URI, datum mapping, or indices envelope.")
+    return _materialize_router_replay_uri(uri_or_datum)
+
+
+def _materialize_router_replay_mapping(uri_or_datum: Mapping[str, Any]) -> Any:
+    replay = uri_or_datum.get("router_replay")
+    if replay is None and isinstance(uri_or_datum.get("metadata"), Mapping):
+        replay = uri_or_datum["metadata"].get("router_replay")
+    if isinstance(replay, Mapping):
+        result = _materialize_router_replay_payload(replay)
+        if result is not None:
+            return result
+    if uri_or_datum.get("value") is not None or uri_or_datum.get("shards") is not None:
+        return materialize_router_replay_indices(uri_or_datum)
+    raise ValueError("Mapping does not contain router replay metadata or indices.")
+
+
+def _materialize_router_replay_payload(replay: Mapping[str, Any]) -> Any | None:
+    indices = replay.get("indices")
+    if isinstance(indices, Mapping) and indices.get("value") is not None:
+        return materialize_router_replay_indices(indices)
+    sample_index = replay.get("sample_index")
+    manifest_uri = replay.get("manifest_uri")
+    if isinstance(manifest_uri, str) and sample_index is not None:
+        manifest = _load_manifest_from_uri(manifest_uri)
+        return _materialize_sample_from_manifest(manifest, int(sample_index))
+    index_uri = replay.get("index_uri")
+    if isinstance(index_uri, str):
+        return _materialize_router_replay_uri(index_uri)
+    return None
+
+
+def _materialize_router_replay_uri(uri: str) -> Any:
+    if not uri.startswith("weaver://"):
+        raise ValueError(f"Unsupported router replay URI: {uri!r}")
+    if uri.endswith("/manifest.json"):
+        return _load_manifest_from_uri(uri)
+    if "/samples/" in uri:
+        prefix, sample = uri.rsplit("/samples/", 1)
+        manifest = _load_manifest_from_uri(f"{prefix}/manifest.json")
+        return _materialize_sample_from_manifest(manifest, int(sample.strip("/")))
+    if "/shards/" in uri:
+        path = _resolve_weaver_uri_path(uri)
+        if path.suffix == ".pt":
+            return materialize_payload_ref({"storage": "gpfs", "format": "torch.save", "uri": uri})
+        return json.loads(path.read_text(encoding="utf-8"))
+    raise ValueError(f"Unsupported router replay URI kind: {uri!r}")
+
+
+def _load_manifest_from_uri(uri: str) -> Mapping[str, Any]:
+    path = _resolve_weaver_uri_path(uri)
+    if not path.exists():
+        raise FileNotFoundError(f"Router replay manifest does not exist: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_weaver_uri_path(uri: str) -> Path:
+    relative = uri.removeprefix("weaver://").lstrip("/")
+    if not relative:
+        raise ValueError("weaver:// URI must include a relative component.")
+    for env_key in ("WEAVER_PAYLOAD_REF_ROOT", "WEAVER_ROUTER_REPLAY_REF_ROOT"):
+        root = os.environ.get(env_key)
+        if root:
+            return Path(root) / relative
+    return Path(relative)
+
+
+def _materialize_sample_from_manifest(
+    manifest: Mapping[str, Any],
+    sample_index: int,
+) -> list[Any]:
+    raw_shards = manifest.get("shards", [])
+    shards = raw_shards if isinstance(raw_shards, list) else []
+    envelope = {
+        "format": manifest.get("format", ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK),
+        "token_alignment": manifest.get(
+            "token_alignment", ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED
+        ),
+        "num_layers": manifest.get("num_layers"),
+        "topk": manifest.get("topk"),
+        "transport": manifest.get("transport"),
+        "shards": shards,
+    }
+    sample_order = sorted(
+        {
+            int(sample_idx)
+            for shard in shards
+            if isinstance(shard, Mapping)
+            for sample_idx in _sample_indices_from_shard(shard)
+        }
+    )
+    if sample_index in sample_order:
+        values = materialize_router_replay_indices(envelope)
+        if values:
+            return values[sample_order.index(sample_index)]
+    for shard in shards:
+        if not isinstance(shard, Mapping):
+            continue
+        sample_indices = shard.get("sample_indices")
+        if not isinstance(sample_indices, list) or sample_index not in sample_indices:
+            continue
+        values = materialize_router_replay_indices({"shards": [shard]})
+        sample_order = sorted({int(item) for item in sample_indices})
+        if values and sample_index in sample_order:
+            return values[sample_order.index(sample_index)]
+    return []
+
+
+def _sample_indices_from_shard(shard: Mapping[str, Any]) -> list[Any]:
+    sample_indices = shard.get("sample_indices")
+    return sample_indices if isinstance(sample_indices, list) else []

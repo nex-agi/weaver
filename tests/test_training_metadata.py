@@ -53,21 +53,24 @@ def _make_datum() -> Datum:
     )
 
 
-def _router_replay_metadata() -> Dict[str, Any]:
-    """Sample router_replay metadata contract."""
+def _generic_metadata() -> Dict[str, Any]:
+    return {"trace_id": "abc", "priority": 3}
+
+
+def _router_replay_payload() -> Dict[str, Any]:
+    """Sample datum-level router_replay metadata contract."""
     return {
-        "router_replay": {
-            "mode": "R3",
-            "source": "rollout",
-            "indices": {
-                "format": "token_layer_topk",
-                "value": [[[1, 7], [3, 5]], [[2, 4], [0, 6]]],
-                "token_alignment": "target_aligned",
-                "num_layers": 2,
-                "topk": 2,
-            },
-            "fail_fast": True,
-        }
+        "mode": "R3",
+        "source": "rollout",
+        "sample_index": 7,
+        "indices": {
+            "format": "token_layer_topk",
+            "value": [[[1, 7], [3, 5]], [[2, 4], [0, 6]]],
+            "token_alignment": "target_aligned",
+            "num_layers": 2,
+            "topk": 2,
+        },
+        "fail_fast": True,
     }
 
 
@@ -88,7 +91,7 @@ class TestForwardMetadata:
 
         client._service.enqueue_operation = mock_enqueue
 
-        meta = _router_replay_metadata()
+        meta = _generic_metadata()
         client.forward([_make_datum()], "grpo", metadata=meta)
 
         assert len(captured_payloads) == 1
@@ -111,7 +114,7 @@ class TestForwardMetadata:
 
         client._service.enqueue_operation = mock_enqueue
 
-        meta = _router_replay_metadata()
+        meta = _generic_metadata()
         client.forward([_make_datum()], "grpo", metadata=meta)
 
         inner_payload = captured_payloads[0]["payload"]
@@ -173,7 +176,7 @@ class TestForwardBackwardMetadata:
 
         client._service.enqueue_operation = mock_enqueue
 
-        meta = _router_replay_metadata()
+        meta = _generic_metadata()
         client.forward_backward([_make_datum()], "grpo", metadata=meta)
 
         assert len(captured_payloads) == 1
@@ -195,7 +198,7 @@ class TestForwardBackwardMetadata:
 
         client._service.enqueue_operation = mock_enqueue
 
-        meta = _router_replay_metadata()
+        meta = _generic_metadata()
         client.forward_backward([_make_datum()], "grpo", metadata=meta)
 
         inner_payload = captured_payloads[0]["payload"]
@@ -235,7 +238,7 @@ class TestForwardBackwardMetadata:
 
         client._service.enqueue_operation = mock_enqueue
 
-        meta = _router_replay_metadata()
+        meta = _generic_metadata()
         config = {"temperature": 0.7, "clip_ratio": 0.2}
         client.forward_backward([_make_datum()], "grpo", loss_fn_config=config, metadata=meta)
 
@@ -248,10 +251,10 @@ class TestForwardBackwardMetadata:
 
 
 class TestRouterReplayMetadataType:
-    """Test using RouterReplayMetadata.to_payload() as metadata value."""
+    """Test datum-level router replay serialization and request-level rejection."""
 
-    def test_typed_metadata_serialization(self):
-        """RouterReplayMetadata.to_payload() produces valid metadata dict."""
+    def test_typed_datum_metadata_serialization(self):
+        """RouterReplayMetadata.to_payload() can be attached to a Datum."""
         from weaver.types.router_replay import RouterReplayIndices, RouterReplayMetadata
 
         replay = RouterReplayMetadata(
@@ -275,14 +278,14 @@ class TestRouterReplayMetadataType:
 
         client._service.enqueue_operation = mock_enqueue
 
-        client.forward_backward(
-            [_make_datum()],
-            "grpo",
-            metadata={"router_replay": replay.to_payload()},
-        )
+        datum = _make_datum()
+        datum.metadata["router_replay"] = replay.to_payload()
+
+        client.forward_backward([datum], "grpo")
 
         inner_payload = captured_payloads[0]["payload"]
-        rr = inner_payload["metadata"]["router_replay"]
+        assert "metadata" not in inner_payload
+        rr = inner_payload["forward_backward_input"]["data"][0]["metadata"]["router_replay"]
         assert rr["mode"] == "R3"
         assert rr["source"] == "rollout"
         assert rr["indices"]["format"] == "token_layer_topk"
@@ -290,45 +293,26 @@ class TestRouterReplayMetadataType:
         assert rr["indices"]["topk"] == 2
         assert rr["fail_fast"] is True
 
-    def test_forward_accepts_router_replay_argument(self):
-        """TrainingClient.forward serializes router_replay as per-call metadata."""
-        from weaver.types.router_replay import RouterReplayMetadata
-
-        client = _make_training_client()
-        captured_payloads = []
-
-        def mock_enqueue(path, payload):
-            captured_payloads.append(payload)
-            handle = MagicMock()
-            handle.result.return_value = {}
-            return handle
-
-        client._service.enqueue_operation = mock_enqueue
-
-        client.forward(
-            [_make_datum()],
-            "forward_logprob",
-            router_replay=RouterReplayMetadata.r2_record(),
-        )
-
-        rr = captured_payloads[0]["payload"]["metadata"]["router_replay"]
-        assert rr == {
-            "mode": "R2",
-            "source": "recompute",
-            "fail_fast": True,
-            "action": "RECORD",
-        }
-
-    def test_forward_backward_rejects_router_replay_conflict(self):
-        """Explicit router_replay cannot conflict with metadata.router_replay."""
+    def test_forward_rejects_router_replay_argument(self):
+        """Request-level router_replay is no longer accepted."""
         from weaver.types.router_replay import RouterReplayMetadata
 
         client = _make_training_client()
 
-        with pytest.raises(ValueError, match="router replay either"):
+        with pytest.raises(ValueError, match="datum.metadata"):
+            client.forward(
+                [_make_datum()],
+                "forward_logprob",
+                router_replay=RouterReplayMetadata.r2_record(),
+            )
+
+    def test_forward_backward_rejects_request_metadata_router_replay(self):
+        """Top-level metadata.router_replay is no longer accepted."""
+        client = _make_training_client()
+
+        with pytest.raises(ValueError, match="datum.metadata"):
             client.forward_backward(
                 [_make_datum()],
                 "grpo",
-                metadata=_router_replay_metadata(),
-                router_replay=RouterReplayMetadata.r2_record(),
+                metadata={"router_replay": _router_replay_payload()},
             )

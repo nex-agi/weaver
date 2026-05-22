@@ -29,6 +29,7 @@ from .tensor import TensorData, tensor_payload
 class Datum:
     model_input: ModelInput
     loss_fn_inputs: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         normalized: Dict[str, Any] = {}
@@ -61,6 +62,7 @@ class Datum:
                 )
                 for name, values in self.loss_fn_inputs.items()
             },
+            **({"metadata": dict(self.metadata)} if self.metadata else {}),
         }
 
     @classmethod
@@ -69,10 +71,12 @@ class Datum:
         *,
         model_input: ModelInput,
         loss_fn_inputs: Mapping[str, Any],
+        metadata: Mapping[str, Any] | None = None,
     ) -> "Datum":
         return cls(
             model_input=model_input,
             loss_fn_inputs=dict(loss_fn_inputs),  # type: ignore[arg-type]
+            metadata=dict(metadata or {}),
         )
 
     def tensors(self) -> Dict[str, TensorData]:

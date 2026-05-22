@@ -38,6 +38,7 @@ class PayloadRef:
     format: str
     schema: str | None = None
     size_bytes: int | None = None
+    uri: str | None = None
     relative_path: str | None = None
     path: str | None = None
     dtype: str | None = None
@@ -50,6 +51,7 @@ class PayloadRef:
             "format",
             "schema",
             "size_bytes",
+            "uri",
             "relative_path",
             "path",
             "dtype",
@@ -60,6 +62,7 @@ class PayloadRef:
             format=str(payload.get("format", "")),
             schema=_optional_str(payload.get("schema")),
             size_bytes=_optional_int(payload.get("size_bytes")),
+            uri=_optional_str(payload.get("uri")),
             relative_path=_optional_str(payload.get("relative_path")),
             path=_optional_str(payload.get("path")),
             dtype=_optional_str(payload.get("dtype")),
@@ -75,6 +78,8 @@ class PayloadRef:
             payload["schema"] = self.schema
         if self.size_bytes is not None:
             payload["size_bytes"] = self.size_bytes
+        if self.uri is not None:
+            payload["uri"] = self.uri
         if self.relative_path is not None:
             payload["relative_path"] = self.relative_path
         if include_private and self.path is not None:
@@ -143,22 +148,47 @@ def materialize_payload_ref(
 def _resolve_local_ref_path(payload_ref: PayloadRef) -> Path | None:
     """Resolve local/GPFS refs without requiring callers to handle storage paths."""
 
-    if payload_ref.path:
-        legacy_path = Path(payload_ref.path)
-        if legacy_path.exists():
-            return legacy_path
+    legacy_path = _existing_path(payload_ref.path)
+    if legacy_path is not None:
+        return legacy_path
+    if payload_ref.uri and payload_ref.uri.startswith("weaver://"):
+        resolved = _resolve_weaver_uri(payload_ref.uri)
+        if resolved is not None:
+            return resolved
     if payload_ref.relative_path:
-        relative = Path(payload_ref.relative_path)
-        if relative.is_absolute():
-            return relative
-        for env_key in ("WEAVER_PAYLOAD_REF_ROOT", "WEAVER_ROUTER_REPLAY_REF_ROOT"):
-            root = os.environ.get(env_key)
-            if root:
-                return Path(root) / relative
-        return relative
+        return _resolve_relative_ref_path(payload_ref.relative_path)
     if payload_ref.path:
         return Path(payload_ref.path)
     return None
+
+
+def _existing_path(path: str | None) -> Path | None:
+    if not path:
+        return None
+    resolved = Path(path)
+    return resolved if resolved.exists() else None
+
+
+def _resolve_relative_ref_path(relative_path: str) -> Path:
+    relative = Path(relative_path)
+    if relative.is_absolute():
+        return relative
+    for env_key in ("WEAVER_PAYLOAD_REF_ROOT", "WEAVER_ROUTER_REPLAY_REF_ROOT"):
+        root = os.environ.get(env_key)
+        if root:
+            return Path(root) / relative
+    return relative
+
+
+def _resolve_weaver_uri(uri: str) -> Path | None:
+    relative = uri.removeprefix("weaver://").lstrip("/")
+    if not relative:
+        return None
+    for env_key in ("WEAVER_PAYLOAD_REF_ROOT", "WEAVER_ROUTER_REPLAY_REF_ROOT"):
+        root = os.environ.get(env_key)
+        if root:
+            return Path(root) / relative
+    return Path(relative)
 
 
 def _optional_str(value: Any) -> str | None:

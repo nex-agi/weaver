@@ -14,8 +14,11 @@
 
 """Tests for Router Replay contract helpers."""
 
+import json
+
 from weaver.types.payload_ref import materialize_payload_ref
 from weaver.types.router_replay import (
+    ROUTER_REPLAY_DATUM_SCHEMA,
     ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK,
     ROUTER_REPLAY_MODE_R2,
     ROUTER_REPLAY_MODE_R3,
@@ -25,7 +28,11 @@ from weaver.types.router_replay import (
     RouterReplayIndices,
     RouterReplayMetadata,
     RouterReplayModelConfig,
+    materialize_router_replay_index,
     materialize_router_replay_indices,
+    router_replay_manifest_uri,
+    router_replay_sample_uri,
+    router_replay_set_uri,
 )
 
 
@@ -53,6 +60,7 @@ def test_router_replay_metadata_to_payload():
     )
 
     assert metadata.to_payload() == {
+        "schema": ROUTER_REPLAY_DATUM_SCHEMA,
         "mode": "R2",
         "source": "recompute",
         "indices": {
@@ -81,11 +89,28 @@ def test_router_replay_r2_record_has_no_indices():
     metadata = RouterReplayMetadata.r2_record()
 
     assert metadata.to_payload() == {
+        "schema": ROUTER_REPLAY_DATUM_SCHEMA,
         "mode": "R2",
         "source": "recompute",
         "fail_fast": True,
         "action": "RECORD",
     }
+
+
+def test_router_replay_metadata_supports_datum_ref_uris():
+    metadata = RouterReplayMetadata.r3_replay(
+        RouterReplayIndices(value=[[[1, 2]]], num_layers=1, topk=2),
+        sample_index=3,
+        index_uri=router_replay_sample_uri("model-a", "set-1", 3),
+        index_set_uri=router_replay_set_uri("model-a", "set-1"),
+        manifest_uri=router_replay_manifest_uri("model-a", "set-1"),
+    )
+
+    payload = metadata.to_payload()
+    assert payload["sample_index"] == 3
+    assert payload["index_uri"] == "weaver://model-a/router-replay/set-1/samples/3"
+    assert payload["index_set_uri"] == "weaver://model-a/router-replay/set-1"
+    assert payload["manifest_uri"] == "weaver://model-a/router-replay/set-1/manifest.json"
 
 
 def test_router_replay_indices_support_ref_shards():
@@ -164,6 +189,71 @@ def test_materialize_router_replay_indices_combines_pipeline_shards():
             [[1, 2], [3, 4], [9, 10], [11, 12]],
             [[5, 6], [7, 8], [13, 14], [15, 16]],
         ]
+    ]
+
+
+def test_materialize_router_replay_indices_handles_seq_major_microbatch():
+    envelope = {
+        "format": "token_layer_topk",
+        "shards": [
+            {
+                "dp_rank": 0,
+                "tp_rank": 0,
+                "pp_rank": 0,
+                "sample_indices": [0, 2, 4],
+                "local_tokens_per_sample": 3,
+                "microbatch_sizes": [3],
+                "row_layout": "seq_major_microbatch",
+                "value": [
+                    ["s0-t0"],
+                    ["s2-t0"],
+                    ["s4-t0"],
+                    ["s0-t1"],
+                    ["s2-t1"],
+                    ["s4-t1"],
+                    ["s0-t2"],
+                    ["s2-t2"],
+                    ["s4-t2"],
+                ],
+            }
+        ],
+    }
+
+    assert materialize_router_replay_indices(envelope) == [
+        [["s0-t0"], ["s0-t1"], ["s0-t2"]],
+        [["s2-t0"], ["s2-t1"], ["s2-t2"]],
+        [["s4-t0"], ["s4-t1"], ["s4-t2"]],
+    ]
+
+
+def test_materialize_router_replay_index_selects_sample_from_manifest(tmp_path, monkeypatch):
+    manifest = {
+        "format": "token_layer_topk",
+        "token_alignment": "target_aligned",
+        "num_layers": 2,
+        "topk": 1,
+        "shards": [
+            {
+                "pp_rank": 0,
+                "sample_indices": [3, 1],
+                "local_tokens_per_sample": 1,
+                "value": [[["s3-pp0"]], [["s1-pp0"]]],
+            },
+            {
+                "pp_rank": 1,
+                "sample_indices": [3, 1],
+                "local_tokens_per_sample": 1,
+                "value": [[["s3-pp1"]], [["s1-pp1"]]],
+            },
+        ],
+    }
+    manifest_path = tmp_path / "model-a" / "router-replay" / "set-1" / "manifest.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setenv("WEAVER_PAYLOAD_REF_ROOT", str(tmp_path))
+
+    assert materialize_router_replay_index("weaver://model-a/router-replay/set-1/samples/3") == [
+        [["s3-pp0"], ["s3-pp1"]]
     ]
 
 

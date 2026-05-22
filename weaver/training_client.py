@@ -66,22 +66,22 @@ class TrainingClient:
         metadata: Mapping[str, Any] | None,
         router_replay: "RouterReplayMetadata | Mapping[str, Any] | None",
     ) -> Dict[str, Any] | None:
+        if router_replay is not None:
+            raise ValueError(
+                "router_replay= is no longer accepted at request level. "
+                "Attach router replay metadata to each Datum via "
+                "datum.metadata['router_replay']."
+            )
         if not metadata and router_replay is None:
             return None
 
         payload = dict(metadata or {})
-        if router_replay is not None:
-            if "router_replay" in payload:
-                raise ValueError(
-                    "Pass router replay either via metadata['router_replay'] or "
-                    "router_replay=, not both."
-                )
-            to_payload = getattr(router_replay, "to_payload", None)
-            if callable(to_payload):
-                payload["router_replay"] = to_payload()
-            else:
-                assert isinstance(router_replay, Mapping)
-                payload["router_replay"] = dict(router_replay)
+        if "router_replay" in payload:
+            raise ValueError(
+                "metadata['router_replay'] is no longer accepted at request level. "
+                "Attach router replay metadata to each Datum via "
+                "datum.metadata['router_replay']."
+            )
         return payload or None
 
     @overload
@@ -125,11 +125,10 @@ class TrainingClient:
             loss_fn: Name of the loss function to use.
             loss_fn_config: Optional loss function configuration.
             metadata: Optional top-level request metadata (e.g. router_replay
-                context). Passed through to TrainerTask.metadata and does not
-                enter datum or loss_fn_inputs.
-            router_replay: Optional per-call Router Replay envelope. This is
-                serialized into top-level metadata.router_replay for this
-                forward call only.
+                context). Router replay metadata must be attached to each Datum
+                as ``datum.metadata["router_replay"]``.
+            router_replay: Deprecated request-level Router Replay envelope.
+                Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
         payload: Dict[str, Any] = {
@@ -192,11 +191,10 @@ class TrainingClient:
             loss_fn: Name of the loss function to use.
             loss_fn_config: Optional loss function configuration.
             metadata: Optional top-level request metadata (e.g. router_replay
-                context). Passed through to TrainerTask.metadata and does not
-                enter datum or loss_fn_inputs.
-            router_replay: Optional per-call Router Replay envelope. This is
-                serialized into top-level metadata.router_replay for this
-                forward_backward call only.
+                context). Router replay metadata must be attached to each Datum
+                as ``datum.metadata["router_replay"]``.
+            router_replay: Deprecated request-level Router Replay envelope.
+                Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
         payload: Dict[str, Any] = {
