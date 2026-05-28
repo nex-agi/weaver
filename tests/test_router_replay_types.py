@@ -16,6 +16,8 @@
 
 import json
 
+import pytest
+
 from weaver.types.payload_ref import materialize_payload_ref
 from weaver.types.router_replay import (
     ROUTER_REPLAY_DATUM_SCHEMA,
@@ -56,29 +58,40 @@ def test_router_replay_metadata_to_payload():
     metadata = RouterReplayMetadata(
         mode=ROUTER_REPLAY_MODE_R2,
         source=ROUTER_REPLAY_SOURCE_RECOMPUTE,
-        indices=RouterReplayIndices(value=[[[7, 8]]], num_layers=1, topk=2),
+        action="REPLAY",
+        sample_ref=router_replay_sample_uri("model-a", "set-1", 7),
+        index_set_uri=router_replay_set_uri("model-a", "set-1"),
+        manifest_uri=router_replay_manifest_uri("model-a", "set-1"),
     )
 
     assert metadata.to_payload() == {
         "schema": ROUTER_REPLAY_DATUM_SCHEMA,
         "mode": "R2",
         "source": "recompute",
-        "indices": {
-            "format": ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK,
-            "value": [[[7, 8]]],
-            "token_alignment": ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED,
-            "num_layers": 1,
-            "topk": 2,
-        },
         "fail_fast": True,
+        "sample_ref": "weaver://model-a/router-replay/set-1/samples/7",
+        "index_set_uri": "weaver://model-a/router-replay/set-1",
+        "manifest_uri": "weaver://model-a/router-replay/set-1/manifest.json",
+        "action": "REPLAY",
     }
 
 
-def test_router_replay_metadata_to_payload_preserves_fail_fast_false():
+def test_router_replay_metadata_rejects_sdk_visible_indices():
     metadata = RouterReplayMetadata(
-        mode=ROUTER_REPLAY_MODE_R3,
-        source=ROUTER_REPLAY_SOURCE_ROLLOUT,
+        mode=ROUTER_REPLAY_MODE_R2,
+        source=ROUTER_REPLAY_SOURCE_RECOMPUTE,
         indices=RouterReplayIndices(value=[[[7, 8]]], num_layers=1, topk=2),
+    )
+
+    with pytest.raises(ValueError, match="indices is no longer SDK-visible"):
+        metadata.to_payload()
+
+
+def test_router_replay_metadata_to_payload_preserves_fail_fast_false():
+    metadata = RouterReplayMetadata.r3_replay(
+        sample_ref=router_replay_sample_uri("model-a", "set-1", 3),
+        index_set_uri=router_replay_set_uri("model-a", "set-1"),
+        manifest_uri=router_replay_manifest_uri("model-a", "set-1"),
         fail_fast=False,
     )
 
@@ -99,16 +112,13 @@ def test_router_replay_r2_record_has_no_indices():
 
 def test_router_replay_metadata_supports_datum_ref_uris():
     metadata = RouterReplayMetadata.r3_replay(
-        RouterReplayIndices(value=[[[1, 2]]], num_layers=1, topk=2),
-        sample_index=3,
-        index_uri=router_replay_sample_uri("model-a", "set-1", 3),
+        sample_ref=router_replay_sample_uri("model-a", "set-1", 3),
         index_set_uri=router_replay_set_uri("model-a", "set-1"),
         manifest_uri=router_replay_manifest_uri("model-a", "set-1"),
     )
 
     payload = metadata.to_payload()
-    assert payload["sample_index"] == 3
-    assert payload["index_uri"] == "weaver://model-a/router-replay/set-1/samples/3"
+    assert payload["sample_ref"] == "weaver://model-a/router-replay/set-1/samples/3"
     assert payload["index_set_uri"] == "weaver://model-a/router-replay/set-1"
     assert payload["manifest_uri"] == "weaver://model-a/router-replay/set-1/manifest.json"
 
@@ -140,7 +150,10 @@ def test_router_replay_indices_support_ref_shards():
 def test_materialize_router_replay_indices_returns_inline_value():
     value = [[[1, 2]]]
 
-    assert materialize_router_replay_indices({"value": value}) == value
+    summary = materialize_router_replay_indices({"value": value})
+    assert summary["kind"] == "router_replay_ref"
+    assert summary["materialized"] is False
+    assert materialize_router_replay_indices({"value": value}, trusted=True) == value
 
 
 def test_materialize_router_replay_indices_combines_pipeline_shards():
@@ -184,7 +197,7 @@ def test_materialize_router_replay_indices_combines_pipeline_shards():
         ],
     }
 
-    assert materialize_router_replay_indices(envelope) == [
+    assert materialize_router_replay_indices(envelope, trusted=True) == [
         [
             [[1, 2], [3, 4], [9, 10], [11, 12]],
             [[5, 6], [7, 8], [13, 14], [15, 16]],
@@ -219,7 +232,7 @@ def test_materialize_router_replay_indices_handles_seq_major_microbatch():
         ],
     }
 
-    assert materialize_router_replay_indices(envelope) == [
+    assert materialize_router_replay_indices(envelope, trusted=True) == [
         [["s0-t0"], ["s0-t1"], ["s0-t2"]],
         [["s2-t0"], ["s2-t1"], ["s2-t2"]],
         [["s4-t0"], ["s4-t1"], ["s4-t2"]],
@@ -252,9 +265,14 @@ def test_materialize_router_replay_index_selects_sample_from_manifest(tmp_path, 
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     monkeypatch.setenv("WEAVER_PAYLOAD_REF_ROOT", str(tmp_path))
 
-    assert materialize_router_replay_index("weaver://model-a/router-replay/set-1/samples/3") == [
-        [["s3-pp0"], ["s3-pp1"]]
-    ]
+    summary = materialize_router_replay_index("weaver://model-a/router-replay/set-1/samples/3")
+    assert summary["materialized"] is False
+    assert summary["kind"] == "router_replay_sample_ref"
+
+    assert materialize_router_replay_index(
+        "weaver://model-a/router-replay/set-1/samples/3",
+        trusted=True,
+    ) == [[["s3-pp0"], ["s3-pp1"]]]
 
 
 def test_materialize_payload_ref_resolves_relative_path_with_root(tmp_path, monkeypatch):

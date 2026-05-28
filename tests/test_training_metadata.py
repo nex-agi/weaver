@@ -60,16 +60,13 @@ def _generic_metadata() -> Dict[str, Any]:
 def _router_replay_payload() -> Dict[str, Any]:
     """Sample datum-level router_replay metadata contract."""
     return {
+        "schema": "weaver.router_replay.datum.v1",
         "mode": "R3",
         "source": "rollout",
-        "sample_index": 7,
-        "indices": {
-            "format": "token_layer_topk",
-            "value": [[[1, 7], [3, 5]], [[2, 4], [0, 6]]],
-            "token_alignment": "target_aligned",
-            "num_layers": 2,
-            "topk": 2,
-        },
+        "action": "REPLAY",
+        "sample_ref": "weaver://model-a/router-replay/set-1/samples/7",
+        "index_set_uri": "weaver://model-a/router-replay/set-1",
+        "manifest_uri": "weaver://model-a/router-replay/set-1/manifest.json",
         "fail_fast": True,
     }
 
@@ -255,16 +252,17 @@ class TestRouterReplayMetadataType:
 
     def test_typed_datum_metadata_serialization(self):
         """RouterReplayMetadata.to_payload() can be attached to a Datum."""
-        from weaver.types.router_replay import RouterReplayIndices, RouterReplayMetadata
+        from weaver.types.router_replay import (
+            RouterReplayMetadata,
+            router_replay_manifest_uri,
+            router_replay_sample_uri,
+            router_replay_set_uri,
+        )
 
-        replay = RouterReplayMetadata(
-            mode="R3",
-            source="rollout",
-            indices=RouterReplayIndices(
-                value=[[[1, 7], [3, 5]], [[2, 4], [0, 6]]],
-                num_layers=2,
-                topk=2,
-            ),
+        replay = RouterReplayMetadata.r3_replay(
+            sample_ref=router_replay_sample_uri("model-a", "set-1", 7),
+            index_set_uri=router_replay_set_uri("model-a", "set-1"),
+            manifest_uri=router_replay_manifest_uri("model-a", "set-1"),
         )
 
         client = _make_training_client()
@@ -288,9 +286,8 @@ class TestRouterReplayMetadataType:
         rr = inner_payload["forward_backward_input"]["data"][0]["metadata"]["router_replay"]
         assert rr["mode"] == "R3"
         assert rr["source"] == "rollout"
-        assert rr["indices"]["format"] == "token_layer_topk"
-        assert rr["indices"]["num_layers"] == 2
-        assert rr["indices"]["topk"] == 2
+        assert rr["sample_ref"] == "weaver://model-a/router-replay/set-1/samples/7"
+        assert "indices" not in rr
         assert rr["fail_fast"] is True
 
     def test_forward_rejects_router_replay_argument(self):
