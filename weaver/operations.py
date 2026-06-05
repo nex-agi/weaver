@@ -16,12 +16,81 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
+
+logger = logging.getLogger(__name__)
+
+_TRANSIENT_OPERATION_POLL_ERROR_FRAGMENTS = (
+    "unexpected eof",
+    "connection reset",
+    "broken pipe",
+    "bad connection",
+    "server closed the connection",
+)
+
+
+def _positive_float_env(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return None
+    value = float(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be positive, got {raw!r}")
+    return value
+
+
+def _nonnegative_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"{name} must be non-negative, got {raw!r}")
+    return value
+
+
+def _operation_poll_transient_retries() -> int:
+    """Number of transient operation-refresh failures to tolerate per wait."""
+
+    return _nonnegative_int_env("WEAVER_OPERATION_POLL_TRANSIENT_RETRIES", 20)
+
+
+def _is_transient_operation_poll_error(exc: WeaverAPIError) -> bool:
+    if exc.retryable:
+        return True
+    if exc.status_code >= 500:
+        return True
+
+    # Legacy weaver-server mis-maps repo/read errors to 404 not_found; tolerate
+    # those transient I/O messages while old servers are live (a real missing
+    # operation, without a transient fragment, still stays fatal).
+    message = f"{exc.code} {exc.message}".lower()
+    return (
+        exc.status_code == 404
+        and exc.code == "not_found"
+        and any(fragment in message for fragment in _TRANSIENT_OPERATION_POLL_ERROR_FRAGMENTS)
+    )
+
+
+def _operation_poll_delays() -> Iterator[float]:
+    """Yield operation polling delays.
+
+    ``WEAVER_OPERATION_POLL_INTERVAL`` sets a fixed interval for latency-
+    sensitive loops (e.g. RL training waiting step-by-step on one operation);
+    otherwise fall back to the default exponential backoff.
+    """
+    fixed_interval = _positive_float_env("WEAVER_OPERATION_POLL_INTERVAL")
+    if fixed_interval is not None:
+        while True:
+            yield fixed_interval
+    yield from backoff_delays()
 
 
 class WeaverOperationError(RuntimeError):
@@ -66,11 +135,29 @@ class OperationHandle:
         return self._cached
 
     def wait(self) -> Dict[str, Any]:
+        transient_error_count = 0
+        max_transient_errors = _operation_poll_transient_retries()
         if self.done():
             return self._cached
-        for delay in backoff_delays():
+        for delay in _operation_poll_delays():
             time.sleep(delay)
-            self.refresh()
+            try:
+                self.refresh()
+            except WeaverAPIError as exc:
+                if (
+                    transient_error_count < max_transient_errors
+                    and _is_transient_operation_poll_error(exc)
+                ):
+                    transient_error_count += 1
+                    logger.warning(
+                        "Transient error while polling operation %s; retrying (%d/%d): %s",
+                        self.operation_id,
+                        transient_error_count,
+                        max_transient_errors,
+                        exc,
+                    )
+                    continue
+                raise
             if self.done():
                 break
         if not self.done():

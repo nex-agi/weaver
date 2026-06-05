@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 @dataclass(slots=True)
@@ -26,8 +26,9 @@ class SamplingParams:
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1
-    stop: List[str] = field(default_factory=list)
+    stop: List[Union[str, int]] = field(default_factory=list)
     seed: Optional[int] = None
+    sampling_seed: Optional[int] = None
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -38,7 +39,19 @@ class SamplingParams:
         if self.max_tokens is not None:
             payload["max_tokens"] = self.max_tokens
         if self.stop:
-            payload["stop"] = self.stop
+            stop_strings: list[str] = []
+            stop_token_ids: list[int] = []
+            for item in self.stop:
+                if isinstance(item, int) and not isinstance(item, bool):
+                    stop_token_ids.append(item)
+                else:
+                    stop_strings.append(str(item))
+            if stop_strings:
+                payload["stop"] = stop_strings
+            if stop_token_ids:
+                payload["stop_token_ids"] = stop_token_ids
         if self.seed is not None:
             payload["seed"] = self.seed
+        if self.sampling_seed is not None:
+            payload["sampling_seed"] = self.sampling_seed
         return payload
