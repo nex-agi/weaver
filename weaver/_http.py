@@ -285,10 +285,32 @@ class APIClient:
                 span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
                 self._raise_error(response)
 
-            except WeaverAPIError:
-                # Don't retry WeaverAPIError (4xx errors are not retryable)
-                span.set_status(Status(StatusCode.ERROR, "API error"))
-                raise
+            except WeaverAPIError as e:
+                # Retry server-declared retryable errors for idempotent methods
+                # only (e.g. GET operation polling surviving a transient read);
+                # POST stays fatal to avoid duplicating non-idempotent work.
+                last_exception = e
+                span.record_exception(e)
+                request_attempt += 1
+                is_last_attempt = request_attempt >= effective_max_retries
+                idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
+
+                if (not e.retryable) or (not idempotent_method) or is_last_attempt:
+                    span.set_status(Status(StatusCode.ERROR, "API error"))
+                    raise
+
+                logger.debug(
+                    "Retryable API error (attempt %d/%d): %s %s - [%d] %s: %s",
+                    request_attempt,
+                    effective_max_retries,
+                    method,
+                    path,
+                    e.status_code,
+                    e.code,
+                    e.message,
+                )
+                delay = min(INITIAL_RETRY_DELAY * (2 ** (request_attempt - 1)), MAX_RETRY_DELAY)
+                time.sleep(delay)
 
             except Exception as e:  # pylint: disable=broad-except
                 last_exception = e
