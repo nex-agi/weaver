@@ -55,6 +55,7 @@ class SamplingClient:
         topk_prompt_logprobs: int = 0,
         return_sampling_mask: bool = False,
         return_old_logprob: bool = False,
+        return_moe_topk_indices: bool = False,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         params = sampling_params or SamplingParams()
@@ -69,6 +70,8 @@ class SamplingClient:
             body["return_sampling_mask"] = True
         if return_old_logprob:
             body["return_old_logprob"] = True
+        if return_moe_topk_indices:
+            body["return_moe_topk_indices"] = True
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
             body,
@@ -191,6 +194,8 @@ class SamplingClient:
                     sequence["old_logprobs"] = raw["old_logprobs"]
                 if "sampling_masks" in raw and raw["sampling_masks"] is not None:
                     sequence["sampling_masks"] = raw["sampling_masks"]
+                if "moe_topk_indices" in raw and raw["moe_topk_indices"] is not None:
+                    sequence["moe_topk_indices"] = raw["moe_topk_indices"]
                 sequences.append(sequence)
             return [seq for seq in sequences if seq["tokens"]]
 

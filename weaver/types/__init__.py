@@ -20,6 +20,26 @@ from .logprobs import LogprobsParams
 from .lora_config import LoraConfig
 from .model_input import ModelInput, ModelInputChunk
 from .optim import AdamParams
+from .payload_ref import PayloadRef, PayloadRefMaterializationError, materialize_payload_ref
+from .router_replay import (
+    ROUTER_REPLAY_DATUM_SCHEMA,
+    ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK,
+    ROUTER_REPLAY_INDEX_SET_SCHEMA,
+    ROUTER_REPLAY_MODE_R2,
+    ROUTER_REPLAY_MODE_R3,
+    ROUTER_REPLAY_SOURCE_RECOMPUTE,
+    ROUTER_REPLAY_SOURCE_ROLLOUT,
+    ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED,
+    RouterReplayIndices,
+    RouterReplayMetadata,
+    RouterReplayModelConfig,
+    materialize_router_replay_index,
+    materialize_router_replay_indices,
+    router_replay_manifest_uri,
+    router_replay_sample_uri,
+    router_replay_set_uri,
+    router_replay_shard_uri,
+)
 from .sampling import SamplingParams
 from .tensor import TensorData
 
@@ -31,6 +51,26 @@ __all__ = [
     "LogprobsParams",
     "ModelInput",
     "ModelInputChunk",
+    "PayloadRef",
+    "PayloadRefMaterializationError",
+    "ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK",
+    "ROUTER_REPLAY_MODE_R2",
+    "ROUTER_REPLAY_MODE_R3",
+    "ROUTER_REPLAY_SOURCE_RECOMPUTE",
+    "ROUTER_REPLAY_SOURCE_ROLLOUT",
+    "ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED",
+    "ROUTER_REPLAY_DATUM_SCHEMA",
+    "ROUTER_REPLAY_INDEX_SET_SCHEMA",
+    "RouterReplayIndices",
+    "RouterReplayMetadata",
+    "RouterReplayModelConfig",
     "SamplingParams",
     "TensorData",
+    "materialize_payload_ref",
+    "materialize_router_replay_index",
+    "materialize_router_replay_indices",
+    "router_replay_manifest_uri",
+    "router_replay_sample_uri",
+    "router_replay_set_uri",
+    "router_replay_shard_uri",
 ]
