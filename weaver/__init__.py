@@ -24,7 +24,19 @@ except Exception:
     __version__ = "0.3.0"
 
 from . import types  # noqa: F401
-from .operations import OperationHandle  # noqa: F401
+from .async_sampling_client import AsyncSamplingClient  # noqa: F401
+from .async_service_client import AsyncServiceClient  # noqa: F401
+from .async_training_client import AsyncTrainingClient  # noqa: F401
+from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
 
-__all__ = ["ServiceClient", "OperationHandle", "types", "__version__"]
+__all__ = [
+    "ServiceClient",
+    "OperationHandle",
+    "AsyncServiceClient",
+    "AsyncTrainingClient",
+    "AsyncSamplingClient",
+    "AsyncOperationHandle",
+    "types",
+    "__version__",
+]

@@ -20,6 +20,14 @@ import logging
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
+from ._payloads import (
+    build_request_metadata,
+    build_surrogate_data,
+    forward_backward_payload,
+    forward_payload,
+    parse_logprob_tensors,
+    serialize_data,
+)
 from ._utils import UNSET, _UnsetType, lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
@@ -59,30 +67,14 @@ class TrainingClient:
         return self._service.next_operation_seq(self.model_id)
 
     def _serialize_data(self, data: Sequence[Datum]) -> Sequence[Dict[str, Any]]:
-        return [datum.to_payload() for datum in data]
+        return serialize_data(data)
 
     def _build_metadata(
         self,
         metadata: Mapping[str, Any] | None,
         router_replay: "RouterReplayMetadata | Mapping[str, Any] | None",
     ) -> Dict[str, Any] | None:
-        if router_replay is not None:
-            raise ValueError(
-                "router_replay= is no longer accepted at request level. "
-                "Attach router replay metadata to each Datum via "
-                "datum.metadata['router_replay']."
-            )
-        if not metadata and router_replay is None:
-            return None
-
-        payload = dict(metadata or {})
-        if "router_replay" in payload:
-            raise ValueError(
-                "metadata['router_replay'] is no longer accepted at request level. "
-                "Attach router replay metadata to each Datum via "
-                "datum.metadata['router_replay']."
-            )
-        return payload or None
+        return build_request_metadata(metadata, router_replay)
 
     @overload
     def forward(
@@ -131,19 +123,14 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        payload: Dict[str, Any] = {
-            "model_id": self.model_id,
-            "seq_id": self._next_seq(),
-            "forward_input": {
-                "loss_fn": loss_fn,
-                "data": self._serialize_data(data),
-            },
-        }
-        if loss_fn_config:
-            payload["forward_input"]["loss_fn_config"] = dict(loss_fn_config)
-        request_metadata = self._build_metadata(metadata, router_replay)
-        if request_metadata:
-            payload["metadata"] = request_metadata
+        payload = forward_payload(
+            model_id=self.model_id,
+            seq_id=self._next_seq(),
+            data=data,
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            request_metadata=build_request_metadata(metadata, router_replay),
+        )
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-passes",
             {"payload": payload},
@@ -197,19 +184,14 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        payload: Dict[str, Any] = {
-            "model_id": self.model_id,
-            "seq_id": self._next_seq(),
-            "forward_backward_input": {
-                "loss_fn": loss_fn,
-                "data": self._serialize_data(data),
-            },
-        }
-        if loss_fn_config:
-            payload["forward_backward_input"]["loss_fn_config"] = dict(loss_fn_config)
-        request_metadata = self._build_metadata(metadata, router_replay)
-        if request_metadata:
-            payload["metadata"] = request_metadata
+        payload = forward_backward_payload(
+            model_id=self.model_id,
+            seq_id=self._next_seq(),
+            data=data,
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            request_metadata=build_request_metadata(metadata, router_replay),
+        )
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-backward-passes",
             {"payload": payload},
@@ -241,27 +223,11 @@ class TrainingClient:
             data: Sequence of training data.
             loss_fn: ``(data, logprob_tensors) -> (loss, metrics)``
         """
-        import torch
-
         # Step A: forward pass to get logprobs
         fwd_result = self.forward(data, "forward_logprob", loss_fn_config=loss_fn_config, wait=True)
 
         # Step B: parse logprobs from response
-        outputs = fwd_result.get("result", {}).get("loss_fn_outputs", [])
-        if not outputs:
-            raise ValueError("Forward pass returned no loss_fn_outputs")
-        if len(outputs) != len(data):
-            raise ValueError(f"Expected {len(data)} loss_fn_outputs, got {len(outputs)}")
-
-        logprob_tensors: List[torch.Tensor] = []
-        for output in outputs:
-            lp = output.get("logprobs") or output.get("Logprobs")
-            if isinstance(lp, dict):
-                lp = lp["data"]
-            if lp is None:
-                raise ValueError("Missing logprobs in forward/backward output")
-            t = torch.tensor(lp, dtype=torch.float32).requires_grad_(True)
-            logprob_tensors.append(t)
+        logprob_tensors = parse_logprob_tensors(fwd_result, data)
 
         # Step C: run user's loss function
         try:
@@ -275,31 +241,8 @@ class TrainingClient:
         # Step D: backprop through user graph into logprob tensors
         loss.backward()
 
-        for i, t in enumerate(logprob_tensors):
-            if t.grad is None:
-                raise ValueError(f"logprob_tensors[{i}] has no gradient after backward")
-
-        # Step E: build surrogate Datum objects
-        surrogate_data: List[Datum] = []
-        for datum, logprob_tensor in zip(data, logprob_tensors):
-            raw_targets = datum.loss_fn_inputs.get("target_tokens")
-            if raw_targets is None:
-                resolved_targets: List[Any] = datum.model_input.to_ints()
-            elif hasattr(raw_targets, "tolist"):
-                resolved_targets = raw_targets.tolist()
-            else:
-                resolved_targets = list(raw_targets)
-
-            grad = logprob_tensor.grad
-            assert grad is not None  # validated above
-            loss_fn_inputs: Dict[str, Any] = dict(datum.loss_fn_inputs)
-            loss_fn_inputs["target_tokens"] = resolved_targets
-            loss_fn_inputs["surrogate_weights"] = grad.detach().tolist()
-            surrogate_datum = Datum.from_raw(
-                model_input=datum.model_input,
-                loss_fn_inputs=loss_fn_inputs,
-            )
-            surrogate_data.append(surrogate_datum)
+        # Step E: build surrogate Datum objects from the propagated gradients
+        surrogate_data = build_surrogate_data(data, logprob_tensors)
 
         # Step F: surrogate backward pass
         self.forward_backward(surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True)

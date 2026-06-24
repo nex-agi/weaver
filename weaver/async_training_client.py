@@ -1,0 +1,520 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Asyncio-native training client built on top of AsyncServiceClient.
+
+Every operation is awaited. Pass ``wait=False`` to get an
+:class:`~weaver.operations.AsyncOperationHandle` back immediately and await it
+later, which lets several server-side operations overlap::
+
+    fb = await tc.forward_backward(data, "cross_entropy", wait=False)
+    opt = await tc.optim_step(params, wait=False)
+    await fb            # both already submitted; the waits overlap
+    await opt
+"""
+
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
+
+from ._payloads import (
+    build_request_metadata,
+    build_surrogate_data,
+    forward_backward_payload,
+    forward_payload,
+    parse_logprob_tensors,
+)
+from ._utils import UNSET, _UnsetType, lookup_case_insensitive
+from .async_service_client import AsyncServiceClient
+from .operations import AsyncOperationHandle
+from .types import AdamParams, Datum
+from .types.checkpoint import Checkpoint
+
+if TYPE_CHECKING:
+    from typing import Literal
+
+    import torch
+
+    from .async_sampling_client import AsyncSamplingClient
+    from .types.router_replay import RouterReplayMetadata
+
+logger = logging.getLogger(__name__)
+
+
+class AsyncTrainingClient:
+    def __init__(
+        self,
+        *,
+        service: AsyncServiceClient,
+        model_id: str,
+        base_model: str,
+        session_id: str,
+        tokenizer_path: str | None = None,
+        debug_info: Dict[str, Any] | None = None,
+    ) -> None:
+        self._service = service
+        self.model_id = model_id
+        self.base_model = base_model
+        self.session_id = session_id
+        self.tokenizer_path = tokenizer_path
+        self.debug_info = debug_info
+        self._tokenizer: Any = None
+
+    def _next_seq(self) -> int:
+        return self._service.next_operation_seq(self.model_id)
+
+    @overload
+    async def forward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
+        wait: "Literal[True]" = True,
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    async def forward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
+        wait: "Literal[False]",
+    ) -> AsyncOperationHandle: ...
+
+    async def forward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
+        wait: bool = True,
+    ) -> AsyncOperationHandle | Dict[str, Any]:
+        """Compute a forward pass without accumulating gradients.
+
+        Args:
+            data: Sequence of training data.
+            loss_fn: Name of the loss function to use.
+            loss_fn_config: Optional loss function configuration.
+            metadata: Optional top-level request metadata. Router replay metadata
+                must be attached to each Datum as ``datum.metadata["router_replay"]``.
+            router_replay: Deprecated request-level Router Replay envelope; passing
+                it raises ``ValueError``.
+            wait: If True (default), awaits completion and returns the result dict;
+                if False, returns an ``AsyncOperationHandle`` immediately.
+        """
+        payload = forward_payload(
+            model_id=self.model_id,
+            seq_id=self._next_seq(),
+            data=data,
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            request_metadata=build_request_metadata(metadata, router_replay),
+        )
+        handle = await self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/forward-passes",
+            {"payload": payload},
+        )
+        return await handle.result() if wait else handle
+
+    @overload
+    async def forward_backward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        *,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
+        wait: "Literal[True]" = True,
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    async def forward_backward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        *,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
+        wait: "Literal[False]",
+    ) -> AsyncOperationHandle: ...
+
+    async def forward_backward(
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        *,
+        loss_fn_config: Mapping[str, Any] | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        router_replay: "RouterReplayMetadata | Mapping[str, Any] | None" = None,
+        wait: bool = True,
+    ) -> AsyncOperationHandle | Dict[str, Any]:
+        """Compute a forward and backward pass, accumulating gradients.
+
+        Args:
+            data: Sequence of training data.
+            loss_fn: Name of the loss function to use.
+            loss_fn_config: Optional loss function configuration.
+            metadata: Optional top-level request metadata. Router replay metadata
+                must be attached to each Datum as ``datum.metadata["router_replay"]``.
+            router_replay: Deprecated request-level Router Replay envelope; passing
+                it raises ``ValueError``.
+            wait: If True (default), awaits completion and returns the result dict;
+                if False, returns an ``AsyncOperationHandle`` immediately.
+        """
+        payload = forward_backward_payload(
+            model_id=self.model_id,
+            seq_id=self._next_seq(),
+            data=data,
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            request_metadata=build_request_metadata(metadata, router_replay),
+        )
+        handle = await self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/forward-backward-passes",
+            {"payload": payload},
+        )
+        return await handle.result() if wait else handle
+
+    async def forward_backward_custom(
+        self,
+        data: Sequence[Datum],
+        loss_fn: Callable[
+            [Sequence[Datum], List["torch.Tensor"]], Tuple["torch.Tensor", Dict[str, Any]]
+        ],
+        *,
+        loss_fn_config: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Run a custom loss function with surrogate-based gradient propagation.
+
+        Orchestrates two sequential server calls: a forward pass to obtain
+        per-token logprobs, then a surrogate backward pass that applies the
+        user-computed gradients. See
+        :meth:`weaver.training_client.TrainingClient.forward_backward_custom`.
+        """
+        # Step A: forward pass to get logprobs
+        fwd_result = await self.forward(
+            data, "forward_logprob", loss_fn_config=loss_fn_config, wait=True
+        )
+
+        # Step B: parse logprobs from response
+        logprob_tensors = parse_logprob_tensors(fwd_result, data)
+
+        # Step C: run user's loss function
+        try:
+            loss, metrics = loss_fn(data, logprob_tensors)
+        except Exception as exc:
+            raise RuntimeError(f"User loss_fn failed: {exc}") from exc
+
+        if loss.dim() != 0:
+            raise ValueError(f"loss_fn must return a scalar loss, got shape {loss.shape}")
+
+        # Step D: backprop through user graph into logprob tensors
+        loss.backward()
+
+        # Step E: build surrogate Datum objects from the propagated gradients
+        surrogate_data = build_surrogate_data(data, logprob_tensors)
+
+        # Step F: surrogate backward pass
+        await self.forward_backward(
+            surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True
+        )
+
+        # Step G: return loss and metrics
+        return {"loss": loss.detach(), "metrics": metrics}
+
+    @overload
+    async def optim_step(
+        self, params: AdamParams, *, wait: "Literal[True]" = True
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    async def optim_step(
+        self, params: AdamParams, *, wait: "Literal[False]"
+    ) -> AsyncOperationHandle: ...
+
+    async def optim_step(
+        self, params: AdamParams, *, wait: bool = True
+    ) -> AsyncOperationHandle | Dict[str, Any]:
+        payload = {
+            "model_id": self.model_id,
+            "seq_id": self._next_seq(),
+            "adam_params": params.to_payload(),
+        }
+        handle = await self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/optimizer-steps",
+            {"payload": payload},
+        )
+        return await handle.result() if wait else handle
+
+    @overload
+    async def save_weights_for_sampler(
+        self,
+        *,
+        name: str | None = None,
+        ttl_seconds: int | None = 86400,
+        wait: "Literal[True]" = True,
+    ) -> str: ...
+
+    @overload
+    async def save_weights_for_sampler(
+        self, *, name: str | None = None, ttl_seconds: int | None = 86400, wait: "Literal[False]"
+    ) -> AsyncOperationHandle: ...
+
+    async def save_weights_for_sampler(
+        self,
+        *,
+        name: str | None = None,
+        ttl_seconds: int | None = 86400,
+        wait: bool = True,
+    ) -> str | AsyncOperationHandle:
+        """Export model weights for sampling.
+
+        See :meth:`weaver.training_client.TrainingClient.save_weights_for_sampler`.
+        Returns the model path (str) when *wait* is True, else an
+        ``AsyncOperationHandle``.
+        """
+        body: Dict[str, Any] = {"seq_id": self._next_seq()}
+        if name:
+            body["path"] = name
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = ttl_seconds
+        handle = await self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/export-sampler",
+            body,
+        )
+        if not wait:
+            return handle
+        result = await handle.result()
+        model_path = lookup_case_insensitive(result or {}, "model_path") or lookup_case_insensitive(
+            result or {}, "path"
+        )
+        if not model_path:
+            raise RuntimeError("Export response missing model path")
+        return str(model_path)
+
+    @overload
+    async def save_weights_and_get_sampling_client(
+        self,
+        *,
+        name: str | None = None,
+        ttl_seconds: int | None = 86400,
+        wait: "Literal[True]" = True,
+    ) -> "AsyncSamplingClient": ...
+
+    @overload
+    async def save_weights_and_get_sampling_client(
+        self, *, name: str | None = None, ttl_seconds: int | None = 86400, wait: "Literal[False]"
+    ) -> AsyncOperationHandle: ...
+
+    async def save_weights_and_get_sampling_client(
+        self,
+        *,
+        name: str | None = None,
+        ttl_seconds: int | None = 86400,
+        wait: bool = True,
+    ) -> "AsyncSamplingClient | AsyncOperationHandle":
+        """Export model weights and create an async sampling client.
+
+        See :meth:`weaver.training_client.TrainingClient.save_weights_and_get_sampling_client`.
+        """
+        body: Dict[str, Any] = {"seq_id": self._next_seq()}
+        if name:
+            body["path"] = name
+        if ttl_seconds is not None:
+            body["ttl_seconds"] = ttl_seconds
+        handle = await self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/export-sampler",
+            body,
+        )
+        if not wait:
+            return handle
+        result = await handle.result()
+        sampling_session_id = lookup_case_insensitive(result or {}, "sampling_session_id")
+        model_path = lookup_case_insensitive(result or {}, "model_path") or lookup_case_insensitive(
+            result or {}, "path"
+        )
+        if sampling_session_id:
+            return await self._service.get_sampling_client(
+                model_path=model_path or "",
+                base_model=self.base_model,
+                model_id=self.model_id,
+                sampling_session_id=sampling_session_id,
+                tokenizer_path=self.tokenizer_path,
+            )
+        if model_path:
+            return await self._service.get_sampling_client(
+                model_path=str(model_path),
+                base_model=self.base_model,
+                model_id=self.model_id,
+                tokenizer_path=self.tokenizer_path,
+            )
+        raise RuntimeError("Export response missing sampling session id or model path")
+
+    @property
+    def tokenizer(self):  # type: ignore[misc]
+        if self._tokenizer is None:
+            from transformers import AutoTokenizer
+
+            model_name_or_path = self.tokenizer_path if self.tokenizer_path else self.base_model
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                model_name_or_path, trust_remote_code=True
+            )
+        return self._tokenizer
+
+    def get_tokenizer(self):  # Backwards compatible accessor
+        return self.tokenizer
+
+    # ------------------------------------------------------------------
+    # Checkpoint management
+    # ------------------------------------------------------------------
+
+    @overload
+    async def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "weight",
+        ttl_seconds: int | None | _UnsetType = ...,
+        wait: "Literal[True]" = True,
+    ) -> Checkpoint: ...
+
+    @overload
+    async def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "weight",
+        ttl_seconds: int | None | _UnsetType = ...,
+        wait: "Literal[False]",
+    ) -> AsyncOperationHandle: ...
+
+    async def save_state(
+        self,
+        *,
+        name: str | None = None,
+        checkpoint_type: str = "weight",
+        ttl_seconds: int | None | _UnsetType = UNSET,
+        wait: bool = True,
+    ) -> Checkpoint | AsyncOperationHandle:
+        """Save the current model weights as a checkpoint.
+
+        See :meth:`weaver.training_client.TrainingClient.save_state`. Returns a
+        :class:`~weaver.types.Checkpoint` when *wait* is True, else an
+        ``AsyncOperationHandle``.
+        """
+        body: Dict[str, Any] = {"type": checkpoint_type}
+        if name is not None:
+            body["name"] = name
+        if not isinstance(ttl_seconds, _UnsetType):
+            body["ttl_seconds"] = ttl_seconds
+        handle = await self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/checkpoints",
+            body,
+        )
+        if not wait:
+            return handle
+        result = await handle.result()
+        return Checkpoint.from_payload(result if isinstance(result, dict) else {})
+
+    @overload
+    async def load_state(
+        self, path: str | Checkpoint, *, wait: "Literal[True]" = True
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    async def load_state(
+        self, path: str | Checkpoint, *, wait: "Literal[False]"
+    ) -> AsyncOperationHandle: ...
+
+    async def load_state(
+        self,
+        path: str | Checkpoint,
+        *,
+        wait: bool = True,
+    ) -> AsyncOperationHandle | Dict[str, Any]:
+        """Restore model weights from a checkpoint (optimizer state is **not** restored)."""
+        return await self._load_checkpoint(path, include_optimizer=False, wait=wait)
+
+    @overload
+    async def load_state_with_optimizer(
+        self, path: str | Checkpoint, *, wait: "Literal[True]" = True
+    ) -> Dict[str, Any]: ...
+
+    @overload
+    async def load_state_with_optimizer(
+        self, path: str | Checkpoint, *, wait: "Literal[False]"
+    ) -> AsyncOperationHandle: ...
+
+    async def load_state_with_optimizer(
+        self,
+        path: str | Checkpoint,
+        *,
+        wait: bool = True,
+    ) -> AsyncOperationHandle | Dict[str, Any]:
+        """Restore model weights **and** optimizer state from a checkpoint."""
+        return await self._load_checkpoint(path, include_optimizer=True, wait=wait)
+
+    async def _load_checkpoint(
+        self,
+        path: str | Checkpoint,
+        *,
+        include_optimizer: bool,
+        wait: bool,
+    ) -> AsyncOperationHandle | Dict[str, Any]:
+        checkpoint_path = path.path if isinstance(path, Checkpoint) else path
+        body: Dict[str, Any] = {
+            "path": checkpoint_path,
+            "include_optimizer": include_optimizer,
+        }
+        handle = await self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/load",
+            body,
+        )
+        return await handle.result() if wait else handle
+
+    async def list_checkpoints(self) -> list[Checkpoint]:
+        """List all checkpoints for this model."""
+        response = await self._service.http.get(
+            f"/api/v1/models/{self.model_id}/checkpoints",
+        )
+        items = (response or {}).get("items", []) if isinstance(response, dict) else []
+        return [Checkpoint.from_payload(item) for item in items if isinstance(item, dict)]
+
+    async def set_checkpoint_ttl(
+        self,
+        path: str | Checkpoint,
+        ttl_seconds: int | None,
+    ) -> Dict[str, Any]:
+        """Set or cancel the TTL (time-to-live) for a checkpoint."""
+        checkpoint_path = path.path if isinstance(path, Checkpoint) else path
+        body: Dict[str, Any] = {"path": checkpoint_path, "ttl_seconds": ttl_seconds}
+        return await self._service.http.patch(
+            f"/api/v1/models/{self.model_id}/checkpoints/ttl",
+            json=body,
+        )
+
+    async def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:
+        """Terminate trainer and/or inference instances for this model."""
+        return await self._service.terminate_model(self.model_id, instance_types)
