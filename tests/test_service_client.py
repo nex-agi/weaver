@@ -221,3 +221,45 @@ def test_create_model_debug_info_none_when_absent():
     training = client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
 
     assert training.debug_info is None
+
+
+def _make_create_model_client():
+    """Build a ServiceClient with a mocked http layer for create_model payload tests."""
+    client = ServiceClient(api_key="sk-test-key")
+    client._session_id = "session-1"
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "abc-123", "base_model": "Qwen/Qwen3-8B"}
+    client._http.get.return_value = {"items": []}
+    return client
+
+
+def test_create_model_passes_workload_hints():
+    """Workload hints are forwarded in the create-model request body when provided."""
+    client = _make_create_model_client()
+
+    client.create_model(
+        base_model="Qwen/Qwen3-8B",
+        training_mode="full_ft",
+        max_seq_len=8192,
+        training_batch_size=32,
+        rollout_batch_size=64,
+    )
+
+    _, kwargs = client._http.post.call_args
+    payload = kwargs["json"]
+    assert payload["max_seq_len"] == 8192
+    assert payload["training_batch_size"] == 32
+    assert payload["rollout_batch_size"] == 64
+
+
+def test_create_model_omits_workload_hints_when_absent():
+    """Hints are not present in the payload when omitted, preserving prior behavior."""
+    client = _make_create_model_client()
+
+    client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
+
+    _, kwargs = client._http.post.call_args
+    payload = kwargs["json"]
+    assert "max_seq_len" not in payload
+    assert "training_batch_size" not in payload
+    assert "rollout_batch_size" not in payload

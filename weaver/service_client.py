@@ -198,6 +198,9 @@ class ServiceClient:
         training_mode: Optional[str] = None,
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
+        max_seq_len: Optional[int] = None,
+        training_batch_size: Optional[int] = None,
+        rollout_batch_size: Optional[int] = None,
     ) -> "TrainingClient":
         """Create a training model with LoRA or FullFT configuration.
 
@@ -208,6 +211,21 @@ class ServiceClient:
             lora_config: LoRA configuration (default: LoraConfig(rank=32) with all layers enabled)
             full_ft_config: Full fine-tuning config dict (optional, for full_ft mode only)
             user_metadata: Optional user metadata
+            max_seq_len: Optional workload hint - expected maximum sequence length. Used by the
+                server to plan parallelism and resources. Should be filled with the worst case.
+            training_batch_size: Optional workload hint - training mini-batch size (per-step batch,
+                NOT the global batch with gradient accumulation). Drives training DP planning.
+                Primarily for full_ft; ignored for LoRA, which uses a single configuration.
+            rollout_batch_size: Optional workload hint - rollout sampling batch size. Drives
+                inference replica planning.
+
+        Note:
+            The workload hints are descriptive facts about the workload, not parallelism knobs.
+            All are optional: when omitted, the server plans from the first observed batch or
+            model defaults, and behavior is unchanged for existing users. When provided, the
+            server sizes resources precisely against them. Out-of-range values are validated and
+            rejected by the server (each hint has an upper bound); such errors surface via
+            WeaverAPIError.
 
         Returns:
             TrainingClient for the created model
@@ -246,6 +264,15 @@ class ServiceClient:
 
         if user_metadata is not None:
             payload["user_metadata"] = user_metadata
+
+        # Optional workload hints — passed through verbatim so the server can plan resources.
+        # Omitted hints are not sent, preserving today's behavior for existing users.
+        if max_seq_len is not None:
+            payload["max_seq_len"] = max_seq_len
+        if training_batch_size is not None:
+            payload["training_batch_size"] = training_batch_size
+        if rollout_batch_size is not None:
+            payload["rollout_batch_size"] = rollout_batch_size
 
         response = self.http.post(
             f"/api/v1/sessions/{self.session_id}/models",
