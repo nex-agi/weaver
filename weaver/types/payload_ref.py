@@ -108,6 +108,17 @@ def materialize_payload_ref(
     """
 
     payload_ref = ref if isinstance(ref, PayloadRef) else PayloadRef.from_payload(ref)
+    if payload_ref.format.lower() == "raw-tensor":
+        # Raw tensor buffers are owned by the blob store (the hot-path offload);
+        # delegate so generic inspection resolves the same bytes the trainer/SDK
+        # consume (against WEAVER_BLOB_ROOT / TRAINER_BLOB_ROOT).
+        from ..blob_store import BLOB_KEY, get_blob_store
+
+        if field is not None:
+            raise PayloadRefMaterializationError(
+                "field= is not supported for raw-tensor payload refs."
+            )
+        return get_blob_store().get_array({BLOB_KEY: payload_ref.to_payload()})
     storage = payload_ref.storage.lower()
     if storage not in {"gpfs", "filesystem", "local"}:
         raise PayloadRefMaterializationError(

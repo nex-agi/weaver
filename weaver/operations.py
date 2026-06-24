@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
+from .blob_store import get_blob_store
 
 if TYPE_CHECKING:
     from ._async_http import AsyncAPIClient
@@ -182,7 +183,7 @@ class OperationHandle(_OperationHandleMixin):
 
     def result(self) -> Any:
         payload = self.wait()
-        return lookup_case_insensitive(payload, "response")
+        return _resolve_result_blobs(lookup_case_insensitive(payload, "response"))
 
     @classmethod
     def wait_all(cls, handles: List["OperationHandle"]) -> List[Any]:
@@ -256,7 +257,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
 
     async def result(self) -> Any:
         payload = await self.wait()
-        return lookup_case_insensitive(payload, "response")
+        return _resolve_result_blobs(lookup_case_insensitive(payload, "response"))
 
     def __await__(self):
         return self.result().__await__()
@@ -275,3 +276,57 @@ def build_async_operation_handle(
     client: "AsyncAPIClient", payload: Dict[str, Any]
 ) -> AsyncOperationHandle:
     return AsyncOperationHandle.from_payload(client, payload)
+
+
+def _resolve_loss_fn_outputs_packed(container: Dict[str, Any]) -> None:
+    """Rebuild ``loss_fn_outputs`` from a leg-2 packed-blob descriptor in place.
+
+    The trainer offloads the per-datum logprobs into one ``$blob`` and sends a
+    ``loss_fn_outputs_packed`` descriptor instead of inline floats; here we read
+    the blob back and restore the exact inline shape (order preserved) so
+    callers never see the offload.
+    """
+    packed = container.get("loss_fn_outputs_packed")
+    if not isinstance(packed, dict) or "ref" not in packed:
+        return
+    arrays = get_blob_store().get_packed(packed["ref"])
+    field_name = packed.get("field", "logprobs")
+    siblings = packed.get("siblings") or []
+    outputs: List[Dict[str, Any]] = []
+    for idx, arr in enumerate(arrays):
+        out = dict(siblings[idx]) if idx < len(siblings) else {}
+        data = arr.tolist()
+        existing = out.get(field_name)
+        if isinstance(existing, dict):
+            # Tensor envelope ({dtype, shape}) was kept by the trainer; restore
+            # the exact ``{data, dtype, shape}`` shape the inline path emits.
+            envelope = dict(existing)
+            envelope["data"] = data
+            out[field_name] = envelope
+        else:
+            out[field_name] = data
+        outputs.append(out)
+    container["loss_fn_outputs"] = outputs
+    container.pop("loss_fn_outputs_packed", None)
+
+
+def _resolve_result_blobs(response: Any) -> Any:
+    """Resolve any blob-offloaded fields (leg-2) in an operation response.
+
+    Mirrors the consumer's result-shape handling: the packed descriptor may sit
+    at the top level, under ``result``, or nested per task under
+    ``forward_task_results`` (the aggregated forward shape).
+    """
+    if not isinstance(response, dict):
+        return response
+    containers: List[Dict[str, Any]] = [response]
+    inner = response.get("result")
+    if isinstance(inner, dict):
+        containers.append(inner)
+    for container in list(containers):
+        task_results = container.get("forward_task_results")
+        if isinstance(task_results, dict):
+            containers.extend(v for v in task_results.values() if isinstance(v, dict))
+    for container in containers:
+        _resolve_loss_fn_outputs_packed(container)
+    return response

@@ -47,21 +47,58 @@ class Datum:
                 normalized[key] = torch.as_tensor(value)
         self.loss_fn_inputs = normalized
 
-    def to_payload(self) -> dict[str, object]:
-        return {
-            "model_input": self.model_input.to_payload(),
-            "loss_fn_inputs": {
-                name: (
-                    values.to_dict()
-                    if isinstance(values, TensorData)
-                    else (
-                        tensor_payload(values).to_dict()
-                        if isinstance(values, torch.Tensor)
-                        else values
+    def to_payload(
+        self,
+        *,
+        blob_ctx: dict[str, Any] | None = None,
+        index: int = 0,
+    ) -> dict[str, object]:
+        """Serialize to a wire payload.
+
+        Args:
+            blob_ctx: When blob offload is enabled, ``{"model_id", "seq_id"}``
+                used to name offloaded blobs. ``None`` (default) keeps the
+                inline form, byte-identical to before.
+            index: Position of this datum within its batch, for unique keys.
+        """
+        store = None
+        if blob_ctx is not None:
+            from ..blob_store import get_blob_store
+
+            store = get_blob_store()
+        offload = store is not None and store.enabled
+
+        model_input_payload = (
+            self.model_input.to_payload(blob_ctx=blob_ctx, field_prefix=f"d{index}")
+            if offload
+            else self.model_input.to_payload()
+        )
+
+        pack = blob_ctx.get("pack") if blob_ctx is not None else None
+        loss_fn_inputs_payload: dict[str, object] = {}
+        for name, values in self.loss_fn_inputs.items():
+            if offload and isinstance(values, (torch.Tensor, TensorData)):
+                tensor = values if isinstance(values, torch.Tensor) else values.to_tensor()
+                assert store is not None and blob_ctx is not None
+                if pack is not None:
+                    loss_fn_inputs_payload[name] = pack.put_tensor(tensor, field=f"d{index}_{name}")
+                else:
+                    loss_fn_inputs_payload[name] = store.put_tensor(
+                        tensor,
+                        model_id=blob_ctx["model_id"],
+                        seq_id=blob_ctx["seq_id"],
+                        field=f"d{index}_{name}",
                     )
-                )
-                for name, values in self.loss_fn_inputs.items()
-            },
+            elif isinstance(values, TensorData):
+                loss_fn_inputs_payload[name] = values.to_dict()
+            elif isinstance(values, torch.Tensor):
+                loss_fn_inputs_payload[name] = tensor_payload(values).to_dict()
+            else:
+                loss_fn_inputs_payload[name] = values
+
+        return {
+            "model_input": model_input_payload,
+            "loss_fn_inputs": loss_fn_inputs_payload,
             **({"metadata": dict(self.metadata)} if self.metadata else {}),
         }
 
@@ -90,6 +127,14 @@ class Datum:
 def _is_jagged_sequence(value: Any) -> bool:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return False
+    # Fast path: loss inputs are homogeneous, so a sequence whose first element
+    # is a scalar is a flat (non-jagged) array. Decide in O(1) instead of
+    # scanning every element — the full scan dominated client-side datum
+    # building for dense per-token arrays (advantages, logprobs, loss_mask).
+    if value:
+        first = value[0]
+        if not (isinstance(first, Sequence) and not isinstance(first, (str, bytes, bytearray))):
+            return False
     nested_lengths: list[int] = []
     saw_nested = False
     for item in value:

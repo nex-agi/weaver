@@ -66,7 +66,26 @@ class TrainingClient:
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
 
-    def _serialize_data(self, data: Sequence[Datum]) -> Sequence[Dict[str, Any]]:
+    def _serialize_data(
+        self,
+        data: Sequence[Datum],
+        *,
+        blob_ctx: Dict[str, Any] | None = None,
+    ) -> Sequence[Dict[str, Any]]:
+        if blob_ctx is not None:
+            from .blob_store import get_blob_store
+
+            store = get_blob_store()
+            if store.enabled:
+                # Pack the whole batch's offloaded tensors into one file: each
+                # datum field becomes a slice rather than its own tiny file.
+                pack = store.open_pack(model_id=blob_ctx["model_id"], seq_id=blob_ctx["seq_id"])
+                ctx = {**blob_ctx, "pack": pack}
+                payload = [datum.to_payload(blob_ctx=ctx, index=i) for i, datum in enumerate(data)]
+                pack.commit()
+                return payload
+        # Offload disabled (or no ctx): defer to the shared serializer so the
+        # sync and async stacks emit identical inline bytes.
         return serialize_data(data)
 
     def _build_metadata(
@@ -123,14 +142,21 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        payload = forward_payload(
-            model_id=self.model_id,
-            seq_id=self._next_seq(),
-            data=data,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
-            request_metadata=build_request_metadata(metadata, router_replay),
-        )
+        seq_id = self._next_seq()
+        blob_ctx = {"model_id": self.model_id, "seq_id": seq_id}
+        payload: Dict[str, Any] = {
+            "model_id": self.model_id,
+            "seq_id": seq_id,
+            "forward_input": {
+                "loss_fn": loss_fn,
+                "data": self._serialize_data(data, blob_ctx=blob_ctx),
+            },
+        }
+        if loss_fn_config:
+            payload["forward_input"]["loss_fn_config"] = dict(loss_fn_config)
+        request_metadata = self._build_metadata(metadata, router_replay)
+        if request_metadata:
+            payload["metadata"] = request_metadata
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-passes",
             {"payload": payload},
@@ -184,14 +210,21 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        payload = forward_backward_payload(
-            model_id=self.model_id,
-            seq_id=self._next_seq(),
-            data=data,
-            loss_fn=loss_fn,
-            loss_fn_config=loss_fn_config,
-            request_metadata=build_request_metadata(metadata, router_replay),
-        )
+        seq_id = self._next_seq()
+        blob_ctx = {"model_id": self.model_id, "seq_id": seq_id}
+        payload: Dict[str, Any] = {
+            "model_id": self.model_id,
+            "seq_id": seq_id,
+            "forward_backward_input": {
+                "loss_fn": loss_fn,
+                "data": self._serialize_data(data, blob_ctx=blob_ctx),
+            },
+        }
+        if loss_fn_config:
+            payload["forward_backward_input"]["loss_fn_config"] = dict(loss_fn_config)
+        request_metadata = self._build_metadata(metadata, router_replay)
+        if request_metadata:
+            payload["metadata"] = request_metadata
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/forward-backward-passes",
             {"payload": payload},

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable, List, Sequence
+from typing import Any, Iterable, List, Sequence
 
 
 @dataclass(slots=True)
@@ -50,5 +50,39 @@ class ModelInput:
             return
         self.chunks[chunk_index].tokens.extend(tokens)
 
-    def to_payload(self) -> dict[str, object]:
+    def to_payload(
+        self,
+        *,
+        blob_ctx: dict[str, Any] | None = None,
+        field_prefix: str = "",
+    ) -> dict[str, object]:
+        """Serialize to a wire payload.
+
+        With ``blob_ctx`` and offload enabled, each chunk's ``tokens`` list is
+        written to a blob and replaced with a ``$blob`` reference; otherwise the
+        inline form is preserved (byte-identical to before).
+        """
+        if blob_ctx is not None:
+            import torch  # local: keep the type module torch-light when inline
+
+            from ..blob_store import get_blob_store
+
+            store = get_blob_store()
+            if store.enabled:
+                pack = blob_ctx.get("pack")
+                chunks: list[dict[str, object]] = []
+                for chunk_index, chunk in enumerate(self.chunks):
+                    tensor = torch.as_tensor(chunk.tokens, dtype=torch.int64)
+                    field_name = f"{field_prefix}_tokens_{chunk_index}"
+                    if pack is not None:
+                        ref = pack.put_tensor(tensor, field=field_name)
+                    else:
+                        ref = store.put_tensor(
+                            tensor,
+                            model_id=blob_ctx["model_id"],
+                            seq_id=blob_ctx["seq_id"],
+                            field=field_name,
+                        )
+                    chunks.append({"type": chunk.type, "tokens": ref})
+                return {"chunks": chunks}
         return {"chunks": [chunk.to_dict() for chunk in self.chunks]}
