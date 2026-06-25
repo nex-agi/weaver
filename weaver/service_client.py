@@ -20,7 +20,7 @@ import atexit
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import __version__
 from ._http import APIClient
@@ -39,6 +39,61 @@ logger = logging.getLogger(__name__)
 
 # Default LoRA configuration
 DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
+
+# Per-operation fields accepted inside a workload hint. The set of valid operation *names*
+# is intentionally not enforced client-side (forward compatibility); the server owns that.
+WORKLOAD_HINT_FIELDS = ("max_seq_len", "batch_size")
+
+
+def _normalize_workload_hints(
+    workload_hints: Optional[Mapping[str, Mapping[str, int]]],
+) -> Dict[str, Dict[str, int]]:
+    """Validate the structure of ``workload_hints`` and return a plain-dict copy.
+
+    Performs only light structural checks so typos fail locally with a clear message;
+    operation-name validity and value ranges are owned by the server. Empty per-operation
+    specs are dropped so an empty mapping is not sent.
+
+    Args:
+        workload_hints: Optional mapping of operation name -> {field: int}, where field is
+            one of ``max_seq_len`` / ``batch_size``.
+
+    Returns:
+        A normalized ``{op: {field: int}}`` dict (possibly empty).
+
+    Raises:
+        ValueError: If the overall shape, a per-operation spec, a field name, or a value is
+            not of the expected type.
+    """
+    if workload_hints is None:
+        return {}
+    if not isinstance(workload_hints, Mapping):
+        raise ValueError(
+            f"workload_hints must be a mapping of operation -> hints, got {type(workload_hints).__name__}"
+        )
+
+    normalized: Dict[str, Dict[str, int]] = {}
+    for op, spec in workload_hints.items():
+        if not isinstance(spec, Mapping):
+            raise ValueError(
+                f"workload_hints[{op!r}] must be a mapping of field -> int, got {type(spec).__name__}"
+            )
+        op_hints: Dict[str, int] = {}
+        for field, value in spec.items():
+            if field not in WORKLOAD_HINT_FIELDS:
+                raise ValueError(
+                    f"workload_hints[{op!r}] has unknown field {field!r}; "
+                    f"expected one of {WORKLOAD_HINT_FIELDS}"
+                )
+            # bool is an int subclass but never a valid size; reject it explicitly.
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(
+                    f"workload_hints[{op!r}][{field!r}] must be an int, got {type(value).__name__}"
+                )
+            op_hints[field] = value
+        if op_hints:
+            normalized[op] = op_hints
+    return normalized
 
 
 class ServiceClient:
@@ -198,9 +253,7 @@ class ServiceClient:
         training_mode: Optional[str] = None,
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
-        max_seq_len: Optional[int] = None,
-        training_batch_size: Optional[int] = None,
-        rollout_batch_size: Optional[int] = None,
+        workload_hints: Optional[Mapping[str, Mapping[str, int]]] = None,
     ) -> "TrainingClient":
         """Create a training model with LoRA or FullFT configuration.
 
@@ -211,21 +264,29 @@ class ServiceClient:
             lora_config: LoRA configuration (default: LoraConfig(rank=32) with all layers enabled)
             full_ft_config: Full fine-tuning config dict (optional, for full_ft mode only)
             user_metadata: Optional user metadata
-            max_seq_len: Optional workload hint - expected maximum sequence length. Used by the
-                server to plan parallelism and resources. Should be filled with the worst case.
-            training_batch_size: Optional workload hint - training mini-batch size (per-step batch,
-                NOT the global batch with gradient accumulation). Drives training DP planning.
-                Primarily for full_ft; ignored for LoRA, which uses a single configuration.
-            rollout_batch_size: Optional workload hint - rollout sampling batch size. Drives
-                inference replica planning.
+            workload_hints: Optional per-operation workload hints used by the server to plan
+                parallelism and replica counts. A mapping keyed by operation name, where each
+                value is a mapping with optional ``max_seq_len`` and ``batch_size`` integers::
+
+                    {
+                        "forward_backward": {"max_seq_len": 8192, "batch_size": 8},
+                        "forward":          {"max_seq_len": 8192, "batch_size": 64},
+                        "sample":           {"max_seq_len": 4096, "batch_size": 256},
+                    }
+
+                Recognized operations: ``forward_backward``, ``forward``,
+                ``forward_backward_custom`` (trainer-side); ``sample``, ``compute_logprobs``
+                (sampler-side). ``forward_backward`` drives training DP planning; ``sample``
+                drives inference replica planning.
 
         Note:
-            The workload hints are descriptive facts about the workload, not parallelism knobs.
-            All are optional: when omitted, the server plans from the first observed batch or
-            model defaults, and behavior is unchanged for existing users. When provided, the
-            server sizes resources precisely against them. Out-of-range values are validated and
-            rejected by the server (each hint has an upper bound); such errors surface via
-            WeaverAPIError.
+            Workload hints are descriptive facts about the workload, not parallelism knobs
+            (no ``world_size`` / ``tp`` / ``dp`` / ``replicas``). They are optional: when
+            omitted, the server plans from the first observed batch or model defaults and
+            behavior is unchanged for existing users. When provided, hints should reflect the
+            worst case; the server sizes resources against them. Unknown operations and
+            out-of-range values are validated and rejected by the server (HTTP 400); such
+            errors surface via WeaverAPIError.
 
         Returns:
             TrainingClient for the created model
@@ -241,10 +302,14 @@ class ServiceClient:
                 lora_config=LoraConfig(rank=16, seed=42)
             )
 
-            # Full fine-tuning mode
+            # Full fine-tuning mode with per-operation workload hints
             client.create_model(
                 base_model="Qwen/Qwen3-8B",
                 training_mode="full_ft",
+                workload_hints={
+                    "forward_backward": {"max_seq_len": 8192, "batch_size": 8},
+                    "sample": {"max_seq_len": 4096, "batch_size": 256},
+                },
             )
         """
         model_seq_id = model_seq_id or self._next_model_seq()
@@ -265,14 +330,12 @@ class ServiceClient:
         if user_metadata is not None:
             payload["user_metadata"] = user_metadata
 
-        # Optional workload hints — passed through verbatim so the server can plan resources.
-        # Omitted hints are not sent, preserving today's behavior for existing users.
-        if max_seq_len is not None:
-            payload["max_seq_len"] = max_seq_len
-        if training_batch_size is not None:
-            payload["training_batch_size"] = training_batch_size
-        if rollout_batch_size is not None:
-            payload["rollout_batch_size"] = rollout_batch_size
+        # Optional per-operation workload hints. Validated structurally here (so typos fail
+        # locally with a clear message) then passed through; the server owns range/op-name
+        # validation. Omitted -> not sent, preserving today's behavior for existing users.
+        normalized_hints = _normalize_workload_hints(workload_hints)
+        if normalized_hints:
+            payload["workload_hints"] = normalized_hints
 
         response = self.http.post(
             f"/api/v1/sessions/{self.session_id}/models",
