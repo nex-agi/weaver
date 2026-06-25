@@ -16,14 +16,19 @@
 This mirrors ``pig_latin.py`` but uses the asyncio-native client stack so the
 event loop stays free while the server works:
 
-* Training is **fully pipelined** — every ``forward_backward`` / ``optim_step``
-  for all steps is submitted with ``wait=False`` (the submit returns an
-  ``AsyncOperationHandle`` immediately), then the handles are awaited together
-  with ``AsyncOperationHandle.wait_all``. The server runs them in ``seq_id``
-  order, so the result is identical to the sequential loop — but the submits
-  never block.
+* Training is **pipelined** — every ``forward_backward`` / ``optim_step`` for
+  all steps is submitted with ``wait=False`` (the submit returns an
+  ``AsyncOperationHandle`` immediately, each carrying a monotonic ``seq_id``),
+  then the handles are awaited together with ``AsyncOperationHandle.wait_all``.
+  The submits never block.
+  NOTE: pipelined training only matches a blocking (``wait=True``) loop when the
+  trainer applies ops in ``seq_id`` order. That ordering is currently NOT
+  honored server-side (the trainer aggregates a poll batch by task type), so a
+  pipelined loop under-converges today — tracked in weaver-server#364. Until
+  that lands, await each step (``wait=True``) for correct convergence.
 * Sampling is **concurrent** — several prompts are sampled at once via
   ``asyncio.gather``; each ``await`` yields the loop instead of blocking it.
+  Sampling requests are independent, so concurrency here is always correct.
 
 This entry point owns the loop via ``asyncio.run(main())``. The client itself
 creates no loop and runs on the caller's loop — when embedding in an existing
