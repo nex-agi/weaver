@@ -239,63 +239,43 @@ def _posted_payload(client):
     return kwargs["json"]
 
 
-def test_create_model_passes_workload_hints():
-    """Per-operation workload hints are forwarded verbatim in the request body."""
+def test_create_model_passes_sizing_hints():
+    """max_seq_len and performance_tier are forwarded in the request body when provided."""
     client = _make_create_model_client()
 
-    hints = {
-        "forward_backward": {"max_seq_len": 8192, "batch_size": 8},
-        "forward": {"max_seq_len": 8192, "batch_size": 64},
-        "sample": {"max_seq_len": 4096, "batch_size": 256},
-    }
     client.create_model(
         base_model="Qwen/Qwen3-8B",
         training_mode="full_ft",
-        workload_hints=hints,
+        max_seq_len=65536,
+        performance_tier="fast",
     )
 
-    assert _posted_payload(client)["workload_hints"] == hints
+    payload = _posted_payload(client)
+    assert payload["max_seq_len"] == 65536
+    assert payload["performance_tier"] == "fast"
 
 
-def test_create_model_omits_workload_hints_when_absent():
+def test_create_model_omits_sizing_hints_when_absent():
     """Hints are not present in the payload when omitted, preserving prior behavior."""
     client = _make_create_model_client()
 
     client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
 
-    assert "workload_hints" not in _posted_payload(client)
+    payload = _posted_payload(client)
+    assert "max_seq_len" not in payload
+    assert "performance_tier" not in payload
 
 
-def test_create_model_drops_empty_workload_specs():
-    """Operations with empty hint mappings are dropped; an all-empty mapping is not sent."""
+def test_create_model_passes_hints_independently():
+    """Each sizing hint can be supplied on its own."""
     client = _make_create_model_client()
-
-    client.create_model(
-        base_model="Qwen/Qwen3-8B",
-        workload_hints={"forward_backward": {"batch_size": 8}, "forward": {}},
-    )
-
-    assert _posted_payload(client)["workload_hints"] == {"forward_backward": {"batch_size": 8}}
+    client.create_model(base_model="Qwen/Qwen3-8B", max_seq_len=8192)
+    payload = _posted_payload(client)
+    assert payload["max_seq_len"] == 8192
+    assert "performance_tier" not in payload
 
     client2 = _make_create_model_client()
-    client2.create_model(base_model="Qwen/Qwen3-8B", workload_hints={"forward": {}})
-    assert "workload_hints" not in _posted_payload(client2)
-
-
-@pytest.mark.parametrize(
-    "bad_hints",
-    [
-        {"forward": {"unknown_field": 1}},  # unknown sub-field
-        {"forward": {"batch_size": "8"}},  # non-int value
-        {"forward": {"batch_size": True}},  # bool rejected even though int subclass
-        {"forward": [8192, 8]},  # spec not a mapping
-    ],
-)
-def test_create_model_rejects_malformed_workload_hints(bad_hints):
-    """Structural problems fail locally with ValueError before any HTTP call."""
-    client = _make_create_model_client()
-
-    with pytest.raises(ValueError):
-        client.create_model(base_model="Qwen/Qwen3-8B", workload_hints=bad_hints)
-
-    client._http.post.assert_not_called()
+    client2.create_model(base_model="Qwen/Qwen3-8B", performance_tier="flash")
+    payload2 = _posted_payload(client2)
+    assert payload2["performance_tier"] == "flash"
+    assert "max_seq_len" not in payload2
