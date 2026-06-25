@@ -24,6 +24,36 @@ Usage::
         tc = await svc.create_model(base_model="Qwen/Qwen3-8B")
         await tc.forward_backward(data, "cross_entropy")
         await tc.optim_step(AdamParams(learning_rate=1e-4))
+
+Event loop model
+----------------
+The client **owns no event loop**. It never calls ``asyncio.run``,
+``new_event_loop`` or ``run_until_complete`` — it is just coroutines plus an
+``httpx.AsyncClient`` and runs on whatever loop is active when you ``await`` it.
+
+**One client instance is bound to one event loop and one thread.** The binding
+happens on the first call (``connect()``): the ``httpx.AsyncClient`` connection
+pool and the heartbeat ``asyncio.Task`` both attach to the loop running then.
+Do **not** share a single instance across loops or threads.
+
+Integrating without hangs:
+
+* **Inside an existing async app** (FastAPI / Starlette / aiohttp / Jupyter):
+  you already have a running loop, so ``await`` the client directly — do **not**
+  call ``asyncio.run`` (it raises "cannot be called from a running event loop").
+  Create the client once at startup, reuse it for the app's lifetime on that
+  loop, and ``await svc.aclose()`` on shutdown.
+* **From synchronous code**: wrap a whole workflow in a single
+  ``asyncio.run(main())``. If you must call repeatedly from sync code, either
+  keep one long-lived loop on a dedicated thread and submit coroutines with
+  ``asyncio.run_coroutine_threadsafe``, or build *and close* a client inside
+  each ``asyncio.run`` — do not keep one instance and call ``asyncio.run`` with
+  it repeatedly.
+* **Always close** via ``async with`` or ``await svc.aclose()`` so the heartbeat
+  task is cancelled before the loop closes (otherwise asyncio cancels it at
+  shutdown and may log a "Task was destroyed but it is pending" warning).
+* **Multiple threads**: give each thread its own loop and its own client, or
+  marshal calls onto the owning loop with ``asyncio.run_coroutine_threadsafe``.
 """
 
 from __future__ import annotations

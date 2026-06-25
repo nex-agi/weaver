@@ -54,7 +54,24 @@ async module:
 - Mirror any change to `APIClient` retry/trace/fork-safety logic in
   `AsyncAPIClient` (the loop bodies are intentionally parallel).
 
-## 4. Tests
+## 4. Event loop model (document any change to it)
+
+The async stack **owns no event loop** — it is coroutines + `httpx.AsyncClient`
+and runs on the caller's loop. Invariants that MUST be preserved:
+
+- Never call `asyncio.run` / `new_event_loop` / `run_until_complete` inside the
+  library. Callers own the loop.
+- **One client instance ⇄ one event loop ⇄ one thread.** Binding happens at
+  `connect()`: the httpx pool and the heartbeat `asyncio.Task` attach to the
+  loop running then. Anything that adds loop-bound state (tasks, locks, queues,
+  pools) must bind lazily at first use and be torn down in `aclose()`.
+- `aclose()` must cancel every task it started (e.g. heartbeat) before returning,
+  and be idempotent.
+- The full integration contract lives in the `AsyncServiceClient` docstring
+  ("Event loop model"). If you change loop/heartbeat/lifecycle behaviour, update
+  that docstring in the same PR — integrators rely on it to avoid hangs.
+
+## 5. Tests
 
 - Add async coverage alongside sync coverage. Mocked unit tests use
   `unittest.mock.AsyncMock` and drive coroutines with `asyncio.run` (no
@@ -73,3 +90,4 @@ async module:
 - [ ] No `time.sleep` / sync `httpx` / blocking IO in async code paths
 - [ ] `APIClient` ↔ `AsyncAPIClient` retry/trace/fork logic kept in sync
 - [ ] Async tests added; liveness tests have timeout + ticker probe
+- [ ] Loop/heartbeat/lifecycle change? `AsyncServiceClient` "Event loop model" docstring updated

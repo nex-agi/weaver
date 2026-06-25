@@ -25,6 +25,12 @@ event loop stays free while the server works:
 * Sampling is **concurrent** — several prompts are sampled at once via
   ``asyncio.gather``; each ``await`` yields the loop instead of blocking it.
 
+This entry point owns the loop via ``asyncio.run(main())``. The client itself
+creates no loop and runs on the caller's loop — when embedding in an existing
+async app (FastAPI, Jupyter, ...) ``await`` the client directly instead of
+calling ``asyncio.run``. See the "Event loop model" section in
+``AsyncServiceClient`` for the full integration contract.
+
 Run with:  ``python examples/pig_latin_async.py``  (needs ``WEAVER_API_KEY``).
 """
 
