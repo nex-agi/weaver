@@ -239,43 +239,27 @@ def _posted_payload(client):
     return kwargs["json"]
 
 
-def test_create_model_passes_sizing_hints():
-    """max_seq_len and performance_tier are forwarded in the request body when provided."""
+def test_create_model_passes_performance_tier():
+    """performance_tier is forwarded in the request body when provided."""
     client = _make_create_model_client()
 
     client.create_model(
-        base_model="Qwen/Qwen3-8B",
+        base_model="Qwen/Qwen3-8B:262144",
         training_mode="full_ft",
-        max_seq_len=65536,
         performance_tier="fast",
     )
 
     payload = _posted_payload(client)
-    assert payload["max_seq_len"] == 65536
     assert payload["performance_tier"] == "fast"
+    # Sequence length lives in base_model, not a separate field.
+    assert payload["base_model"] == "Qwen/Qwen3-8B:262144"
+    assert "max_seq_len" not in payload
 
 
-def test_create_model_omits_sizing_hints_when_absent():
-    """Hints are not present in the payload when omitted, preserving prior behavior."""
+def test_create_model_omits_performance_tier_when_absent():
+    """performance_tier is not present in the payload when omitted, preserving prior behavior."""
     client = _make_create_model_client()
 
     client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
 
-    payload = _posted_payload(client)
-    assert "max_seq_len" not in payload
-    assert "performance_tier" not in payload
-
-
-def test_create_model_passes_hints_independently():
-    """Each sizing hint can be supplied on its own."""
-    client = _make_create_model_client()
-    client.create_model(base_model="Qwen/Qwen3-8B", max_seq_len=8192)
-    payload = _posted_payload(client)
-    assert payload["max_seq_len"] == 8192
-    assert "performance_tier" not in payload
-
-    client2 = _make_create_model_client()
-    client2.create_model(base_model="Qwen/Qwen3-8B", performance_tier="flash")
-    payload2 = _posted_payload(client2)
-    assert payload2["performance_tier"] == "flash"
-    assert "max_seq_len" not in payload2
+    assert "performance_tier" not in _posted_payload(client)

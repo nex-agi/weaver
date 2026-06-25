@@ -198,24 +198,20 @@ class ServiceClient:
         training_mode: Optional[str] = None,
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
-        max_seq_len: Optional[int] = None,
         performance_tier: Optional[str] = None,
     ) -> "TrainingClient":
         """Create a training model with LoRA or FullFT configuration.
 
         Args:
-            base_model: Base model name (e.g., "Qwen/Qwen3-8B")
+            base_model: Base model name (e.g., "Qwen/Qwen3-8B"). The maximum sequence length
+                is encoded in the name: a long-context variant uses a ``:<max_seq_len>`` suffix
+                (e.g. "Qwen/Qwen3-8B:262144"). Pick the variant whose context fits your
+                workload rather than passing a separate length parameter.
             model_seq_id: Optional model sequence ID
             training_mode: Training mode - "lora" or "full_ft" (default: None -> server defaults to "lora")
             lora_config: LoRA configuration (default: LoraConfig(rank=32) with all layers enabled)
             full_ft_config: Full fine-tuning config dict (optional, for full_ft mode only)
             user_metadata: Optional user metadata
-            max_seq_len: Optional maximum sequence length the model must support. The server
-                picks a parallel strategy that guarantees this length can be trained. It is a
-                per-model ceiling; if your workloads span very different lengths, create
-                separate models (e.g. a 64k and a 512k variant of the same base model) rather
-                than sizing one model for the largest case. Defaults to the model's default
-                when omitted.
             performance_tier: Optional throughput tier selecting how much parallelism / data
                 parallelism the server provisions. Higher tiers deliver proportionally more
                 throughput at proportionally higher price (e.g. "fast" ~= 2x the throughput
@@ -223,10 +219,10 @@ class ServiceClient:
                 Defaults to the server default tier when omitted.
 
         Note:
-            ``max_seq_len`` and ``performance_tier`` are optional: when omitted, behavior is
-            unchanged for existing users and the server applies its defaults. Values are
-            validated by the server, which rejects unsupported tiers or out-of-range lengths
-            with HTTP 400; such errors surface via WeaverAPIError.
+            ``performance_tier`` is optional: when omitted, behavior is unchanged for existing
+            users and the server applies its default tier. The value is validated by the
+            server, which rejects unsupported tiers with HTTP 400; such errors surface via
+            WeaverAPIError.
 
         Returns:
             TrainingClient for the created model
@@ -242,11 +238,10 @@ class ServiceClient:
                 lora_config=LoraConfig(rank=16, seed=42)
             )
 
-            # Full fine-tuning, 64k context, fast throughput tier
+            # Long-context (256k) variant, full fine-tuning, fast throughput tier
             client.create_model(
-                base_model="Qwen/Qwen3-8B",
+                base_model="Qwen/Qwen3-8B:262144",
                 training_mode="full_ft",
-                max_seq_len=65536,
                 performance_tier="fast",
             )
         """
@@ -268,11 +263,9 @@ class ServiceClient:
         if user_metadata is not None:
             payload["user_metadata"] = user_metadata
 
-        # Optional sizing hints passed through for the server to plan parallelism and pricing.
-        # Omitted -> not sent, preserving today's behavior for existing users; the server owns
-        # validation (unsupported tier / out-of-range length -> HTTP 400 -> WeaverAPIError).
-        if max_seq_len is not None:
-            payload["max_seq_len"] = max_seq_len
+        # Optional throughput tier passed through for the server to plan parallelism and
+        # pricing. Omitted -> not sent, preserving today's behavior for existing users; the
+        # server owns validation (unsupported tier -> HTTP 400 -> WeaverAPIError).
         if performance_tier is not None:
             payload["performance_tier"] = performance_tier
 
