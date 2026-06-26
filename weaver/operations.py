@@ -16,14 +16,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
+
+if TYPE_CHECKING:
+    from ._async_http import AsyncAPIClient
 
 logger = logging.getLogger(__name__)
 
@@ -100,16 +104,11 @@ class WeaverOperationError(RuntimeError):
         self.payload = payload
 
 
-@dataclass
-class OperationHandle:
-    client: APIClient
+class _OperationHandleMixin:
+    """Pure (IO-free) status accessors shared by sync and async handles."""
+
     operation_id: str
     _cached: Dict[str, Any]
-
-    @classmethod
-    def from_payload(cls, client: APIClient, payload: Dict[str, Any]) -> "OperationHandle":
-        op_id = extract_id(payload)
-        return cls(client=client, operation_id=str(op_id), _cached=payload)
 
     @property
     def status(self) -> Optional[str]:
@@ -128,6 +127,22 @@ class OperationHandle:
     def done(self) -> bool:
         status = self.status
         return status in {"done", "error"}
+
+    def _raise_if_failed(self) -> None:
+        if self.status == "error":
+            raise WeaverOperationError(self._cached)
+
+
+@dataclass
+class OperationHandle(_OperationHandleMixin):
+    client: APIClient
+    operation_id: str
+    _cached: Dict[str, Any]
+
+    @classmethod
+    def from_payload(cls, client: APIClient, payload: Dict[str, Any]) -> "OperationHandle":
+        op_id = extract_id(payload)
+        return cls(client=client, operation_id=str(op_id), _cached=payload)
 
     def refresh(self) -> Dict[str, Any]:
         path = f"/api/v1/operations/{self.operation_id}"
@@ -162,8 +177,7 @@ class OperationHandle:
                 break
         if not self.done():
             raise WeaverAPIError(504, "timeout", "Operation polling timed out", True)
-        if self.status == "error":
-            raise WeaverOperationError(self._cached)
+        self._raise_if_failed()
         return self._cached
 
     def result(self) -> Any:
@@ -183,5 +197,81 @@ class OperationHandle:
         return [h.result() for h in handles]
 
 
+@dataclass
+class AsyncOperationHandle(_OperationHandleMixin):
+    """Asyncio twin of :class:`OperationHandle`.
+
+    Polling uses ``asyncio.sleep`` so awaiting a handle yields the event loop
+    to other coroutines while the server works. The handle is also directly
+    awaitable: ``result = await handle`` is shorthand for ``await
+    handle.result()``.
+    """
+
+    client: "AsyncAPIClient"
+    operation_id: str
+    _cached: Dict[str, Any]
+
+    @classmethod
+    def from_payload(
+        cls, client: "AsyncAPIClient", payload: Dict[str, Any]
+    ) -> "AsyncOperationHandle":
+        op_id = extract_id(payload)
+        return cls(client=client, operation_id=str(op_id), _cached=payload)
+
+    async def refresh(self) -> Dict[str, Any]:
+        path = f"/api/v1/operations/{self.operation_id}"
+        self._cached = await self.client.get(path)
+        return self._cached
+
+    async def wait(self) -> Dict[str, Any]:
+        transient_error_count = 0
+        max_transient_errors = _operation_poll_transient_retries()
+        if self.done():
+            return self._cached
+        for delay in _operation_poll_delays():
+            await asyncio.sleep(delay)
+            try:
+                await self.refresh()
+            except WeaverAPIError as exc:
+                if (
+                    transient_error_count < max_transient_errors
+                    and _is_transient_operation_poll_error(exc)
+                ):
+                    transient_error_count += 1
+                    logger.warning(
+                        "Transient error while polling operation %s; retrying (%d/%d): %s",
+                        self.operation_id,
+                        transient_error_count,
+                        max_transient_errors,
+                        exc,
+                    )
+                    continue
+                raise
+            if self.done():
+                break
+        if not self.done():
+            raise WeaverAPIError(504, "timeout", "Operation polling timed out", True)
+        self._raise_if_failed()
+        return self._cached
+
+    async def result(self) -> Any:
+        payload = await self.wait()
+        return lookup_case_insensitive(payload, "response")
+
+    def __await__(self):
+        return self.result().__await__()
+
+    @classmethod
+    async def wait_all(cls, handles: List["AsyncOperationHandle"]) -> List[Any]:
+        """Concurrently wait for all handles and return results in input order."""
+        return await asyncio.gather(*(handle.result() for handle in handles))
+
+
 def build_operation_handle(client: APIClient, payload: Dict[str, Any]) -> OperationHandle:
     return OperationHandle.from_payload(client, payload)
+
+
+def build_async_operation_handle(
+    client: "AsyncAPIClient", payload: Dict[str, Any]
+) -> AsyncOperationHandle:
+    return AsyncOperationHandle.from_payload(client, payload)

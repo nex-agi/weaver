@@ -82,6 +82,61 @@ class WeaverAPIError(RuntimeError):
         self.retryable = retryable
 
 
+def extract_model_id_from_path(path: str) -> str | None:
+    """Extract ``model_id`` from an API path for trace/baggage propagation.
+
+    Patterns:
+    - ``/api/v1/models/{model_id}/...``
+    - ``/api/v1/models/{model_id}``
+
+    Returns:
+        model_id if found, None otherwise.
+    """
+    match = re.match(r"/api/v\d+/models/([^/]+)", path)
+    if match:
+        return match.group(1)
+    return None
+
+
+def raise_for_response(response: httpx.Response) -> None:
+    """Convert a non-success httpx response into a :class:`WeaverAPIError`."""
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    raise WeaverAPIError(
+        response.status_code,
+        code=payload.get("error", "unknown_error"),
+        message=payload.get("message", response.text),
+        retryable=bool(payload.get("retryable", False)),
+    )
+
+
+def apply_request_span_attributes(
+    span: trace.Span, method: str, path: str, model_id: str | None
+) -> None:
+    """Set the standard Weaver request attributes on *span* (shared sync/async)."""
+    span.set_attribute("http.method", method)
+    span.set_attribute("http.url", path)
+    span.set_attribute("http.user_agent", USER_AGENT)
+    if model_id:
+        span.set_attribute("model_id", model_id)
+        span.set_attribute("weaver.model_id", model_id)  # Alternative key
+
+    span_context = span.get_span_context()
+    if span_context.is_valid:
+        trace_id = format(span_context.trace_id, "032x")
+        if model_id:
+            logger.debug("API request trace_id: %s, model_id: %s", trace_id, model_id)
+        else:
+            logger.debug("API request trace_id: %s", trace_id)
+
+
+def compute_retry_delay(attempt: int) -> float:
+    """Exponential backoff delay for retry *attempt* (1-based)."""
+    return min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+
+
 class APIClient:
     """Thin wrapper around httpx.Client with Weaver-specific behavior."""
 
@@ -208,21 +263,7 @@ class APIClient:
             )
 
     def _extract_model_id_from_path(self, path: str) -> str | None:
-        """
-        Extract model_id from API path.
-
-        Patterns:
-        - /api/v1/models/{model_id}/...
-        - /api/v1/models/{model_id}
-
-        Returns:
-            model_id if found, None otherwise
-        """
-        # Match /api/v1/models/{model_id}/... or /api/v1/models/{model_id}
-        match = re.match(r"/api/v\d+/models/([^/]+)", path)
-        if match:
-            return match.group(1)
-        return None
+        return extract_model_id_from_path(path)
 
     def _request_with_retries(
         self,
@@ -395,16 +436,7 @@ class APIClient:
         raise RuntimeError("Unexpected retry loop exit")
 
     def _raise_error(self, response: httpx.Response) -> None:
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-        raise WeaverAPIError(
-            response.status_code,
-            code=payload.get("error", "unknown_error"),
-            message=payload.get("message", response.text),
-            retryable=bool(payload.get("retryable", False)),
-        )
+        raise_for_response(response)
 
 
 def backoff_delays(

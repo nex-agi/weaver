@@ -32,6 +32,7 @@ disable=
     too-many-statements,
     broad-except,
     duplicate-code,
+    cyclic-import,
     import-outside-toplevel
 
 [FORMAT]
