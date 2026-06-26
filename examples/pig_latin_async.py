@@ -17,13 +17,12 @@ This mirrors ``pig_latin.py`` but uses the asyncio-native client stack so the
 event loop stays free while the server works:
 
 * Training is **fully pipelined** — every step's ``forward_backward`` /
-  ``optim_step`` is submitted up front with ``wait=False`` and fired together
-  via ``asyncio.gather``; each op carries a monotonic ``seq_id`` (assigned in
-  call order), so the trainer keeps the ``fb -> optim -> fb -> ...`` sequence
-  even though the requests arrive concurrently. Each task submits and then
-  awaits its own result, so the per-step losses fall out of the same gather.
-  The submits never block and the result matches a sequential (``wait=True``)
-  loop.
+  ``optim_step`` is submitted with ``wait=False``, which returns a handle as
+  soon as the op is enqueued; each op carries a monotonic ``seq_id`` (assigned
+  in call order), so the trainer keeps the ``fb -> optim -> fb -> ...`` sequence.
+  The handles' results are then awaited together via ``asyncio.gather`` — the
+  trainer pipelines them server-side while we wait, so the result matches a
+  sequential (``wait=True``) loop.
 * Sampling is **concurrent** — several prompts are sampled at once via
   ``asyncio.gather``; each ``await`` yields the loop instead of blocking it.
   Sampling requests are independent, so concurrency here is always correct.
@@ -41,7 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Awaitable, Dict, List
+from typing import Any, Dict, List
 
 import torch
 
@@ -113,26 +112,23 @@ async def main() -> None:
 
         processed_examples = [process_example(example, tokenizer) for example in EXAMPLES]
 
-        # --- Training: submit every step at once, collect losses at the end -
-        # Fire all steps' forward_backward + optim_step concurrently with a
-        # single asyncio.gather: each task submits (wait=False returns a handle
-        # immediately) and then awaits its own result. Every op gets a monotonic
-        # seq_id assigned in call order (before the first await), so the trainer
-        # keeps the fb -> optim -> fb -> ... sequence even though the requests
-        # arrive concurrently.
+        # --- Training: submit every step in order, await all losses at once -
+        # Submit each forward_backward / optim_step with wait=False: awaiting the
+        # submit returns a handle as soon as the op is enqueued (its monotonic
+        # seq_id is assigned here, in call order). We await the submits in the
+        # loop so the fb -> optim -> fb -> ... ordering is guaranteed, then gather
+        # the handles' results — the trainer pipelines them server-side while we
+        # wait, so this matches a sequential (wait=True) loop.
         adam = types.AdamParams(learning_rate=1e-4)
-
-        async def submit_and_wait(submit: Awaitable[Any]) -> Any:
-            handle = await submit
-            return await handle.result()
-
-        submits = []
+        pending = []
         for _ in range(NUM_STEPS):
-            submits.append(
-                training_client.forward_backward(processed_examples, "cross_entropy", wait=False)
+            fb = await training_client.forward_backward(
+                processed_examples, "cross_entropy", wait=False
             )
-            submits.append(training_client.optim_step(adam, wait=False))
-        results = await asyncio.gather(*(submit_and_wait(s) for s in submits))
+            pending.append(fb.result())
+            opt = await training_client.optim_step(adam, wait=False)
+            pending.append(opt.result())
+        results = await asyncio.gather(*pending)
         for step, fb_result in enumerate(results[0::2]):  # even indices = forward_backward
             print(f"Step {step}: loss/token={_loss_per_token(fb_result, processed_examples):.4f}")
 
