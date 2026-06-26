@@ -16,12 +16,13 @@
 This mirrors ``pig_latin.py`` but uses the asyncio-native client stack so the
 event loop stays free while the server works:
 
-* Training is **pipelined** — every ``forward_backward`` / ``optim_step`` for
-  all steps is submitted with ``wait=False`` (the submit returns an
-  ``AsyncOperationHandle`` immediately, each carrying a monotonic ``seq_id``),
-  then the handles are awaited together with ``AsyncOperationHandle.wait_all``.
-  The submits never block, and the trainer applies the ops in ``seq_id`` order,
-  so the loss curve matches a blocking (``wait=True``) loop.
+* Training is a **sequential per-step loop** (mirrors tinker's
+  ``forward_backward_async`` / ``optim_step_async`` + ``.result()`` pattern):
+  each step submits ``forward_backward`` then ``optim_step`` with ``wait=False``
+  (the submits overlap and never block the loop) and then awaits both before the
+  next step. The per-step ``optim_step`` writes weights that the next step's
+  ``forward_backward`` reads, so the loss is printed each step and the curve
+  matches a blocking (``wait=True``) loop.
 * Sampling is **concurrent** — several prompts are sampled at once via
   ``asyncio.gather``; each ``await`` yields the loop instead of blocking it.
   Sampling requests are independent, so concurrency here is always correct.
@@ -43,7 +44,7 @@ from typing import Any, Dict, List
 
 import torch
 
-from weaver import AsyncOperationHandle, AsyncServiceClient, types
+from weaver import AsyncServiceClient, types
 
 EXAMPLES: List[Dict[str, str]] = [
     {"input": "banana split", "output": "anana-bay plit-say"},
@@ -111,30 +112,19 @@ async def main() -> None:
 
         processed_examples = [process_example(example, tokenizer) for example in EXAMPLES]
 
-        # --- Phase 1: submit ALL training ops without blocking -------------
-        # Each `await ...(wait=False)` only awaits the (fast) submit POST and
-        # returns a handle immediately. We fire every step's forward_backward
-        # and optim_step up front; the server executes them in seq order.
+        # --- Training: sequential per-step loop ---------------------------
+        # Each step submits forward_backward + optim_step without blocking
+        # (wait=False returns a handle right away, like tinker's *_async), then
+        # awaits both before the next step. optim_step writes the weights the
+        # next step's forward_backward reads, so steps stay strictly ordered.
         adam = types.AdamParams(learning_rate=1e-4)
-        fb_handles: List[AsyncOperationHandle] = []
-        optim_handles: List[AsyncOperationHandle] = []
-        for _ in range(NUM_STEPS):
-            fb_handles.append(
-                await training_client.forward_backward(
-                    processed_examples, "cross_entropy", wait=False
-                )
+        for step in range(NUM_STEPS):
+            fb_handle = await training_client.forward_backward(
+                processed_examples, "cross_entropy", wait=False
             )
-            optim_handles.append(await training_client.optim_step(adam, wait=False))
-        print(
-            f"Submitted {len(fb_handles)} forward_backward + {len(optim_handles)} optim_step "
-            "operations (none awaited yet)."
-        )
-
-        # --- Phase 2: await the in-flight results -------------------------
-        # wait_all awaits concurrently; the event loop is free the whole time.
-        fb_results = await AsyncOperationHandle.wait_all(fb_handles)
-        await AsyncOperationHandle.wait_all(optim_handles)
-        for step, fb_result in enumerate(fb_results):
+            optim_handle = await training_client.optim_step(adam, wait=False)
+            fb_result = await fb_handle  # loss for this step
+            await optim_handle  # ensure the update lands before the next step
             print(f"Step {step}: loss/token={_loss_per_token(fb_result, processed_examples):.4f}")
 
         # --- Phase 3: export weights and sample concurrently --------------
