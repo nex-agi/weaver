@@ -221,3 +221,45 @@ def test_create_model_debug_info_none_when_absent():
     training = client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
 
     assert training.debug_info is None
+
+
+def _make_create_model_client():
+    """Build a ServiceClient with a mocked http layer for create_model payload tests."""
+    client = ServiceClient(api_key="sk-test-key")
+    client._session_id = "session-1"
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "abc-123", "base_model": "Qwen/Qwen3-8B"}
+    client._http.get.return_value = {"items": []}
+    return client
+
+
+def _posted_payload(client):
+    """Return the json body of the last create-model POST."""
+    _, kwargs = client._http.post.call_args
+    return kwargs["json"]
+
+
+def test_create_model_passes_performance_tier():
+    """performance_tier is forwarded in the request body when provided."""
+    client = _make_create_model_client()
+
+    client.create_model(
+        base_model="Qwen/Qwen3-8B:262144",
+        training_mode="full_ft",
+        performance_tier="fast",
+    )
+
+    payload = _posted_payload(client)
+    assert payload["performance_tier"] == "fast"
+    # Sequence length lives in base_model, not a separate field.
+    assert payload["base_model"] == "Qwen/Qwen3-8B:262144"
+    assert "max_seq_len" not in payload
+
+
+def test_create_model_omits_performance_tier_when_absent():
+    """performance_tier is not present in the payload when omitted, preserving prior behavior."""
+    client = _make_create_model_client()
+
+    client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
+
+    assert "performance_tier" not in _posted_payload(client)
