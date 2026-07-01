@@ -27,6 +27,7 @@ from transformers.tokenization_utils import PreTrainedTokenizer
 
 from ._utils import lookup_case_insensitive
 from .types import LogprobsParams, ModelInput, SamplingParams
+from .types.sampling_control import PauseMode, coerce_pause_mode
 
 TokenizerProvider = Callable[[], PreTrainedTokenizer]
 
@@ -64,6 +65,11 @@ def build_logprobs_body(
 ) -> Dict[str, Any]:
     params = logprobs_params or LogprobsParams()
     return {"prompt": prompt.to_payload(), **params.to_payload()}
+
+
+def build_pause_generation_body(mode: "PauseMode | str") -> Dict[str, Any]:
+    """Build the ``pause-generation`` request body, validating ``mode``."""
+    return {"mode": coerce_pause_mode(mode)}
 
 
 def sanitize_tokens(value: Any) -> List[int]:
@@ -162,8 +168,14 @@ def sequences_from_result(
                 sequence["sampling_masks"] = raw["sampling_masks"]
             if "moe_topk_indices" in raw and raw["moe_topk_indices"] is not None:
                 sequence["moe_topk_indices"] = raw["moe_topk_indices"]
+            weight_version = lookup_case_insensitive(raw, "weight_version")
+            if weight_version is not None:
+                sequence["weight_version"] = weight_version
             sequences.append(sequence)
-        return [seq for seq in sequences if seq["tokens"]]
+        # Keep aborted sequences even when empty: a pause(mode="abort") may cut a
+        # request before any token is emitted, and NexRL still needs the partial
+        # (stop_reason="abort") signal rather than a silently dropped sequence.
+        return [seq for seq in sequences if seq["tokens"] or seq.get("stop_reason") == "abort"]
 
     choices = result.get("choices")
     if not isinstance(choices, list):
@@ -195,6 +207,11 @@ def normalize_sample_result(payload: Any, get_tokenizer: TokenizerProvider) -> A
     usage = result.get("usage")
     if usage:
         normalized["usage"] = usage
+    # Surface the engine weight version so NexRL can compute staleness /
+    # off-policy masks without digging into raw_result.
+    weight_version = lookup_case_insensitive(result, "weight_version")
+    if weight_version is not None:
+        normalized["weight_version"] = weight_version
     return normalized
 
 

@@ -24,7 +24,7 @@ from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
-from .types import LogprobsParams, ModelInput, SamplingParams
+from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
 
 
 class SamplingClient:
@@ -118,6 +118,43 @@ class SamplingClient:
             "logprobs": logprobs,
             "return_rollout_token_expert_data": result.get("return_rollout_token_expert_data"),
         }
+
+    def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Dict[str, Any]:
+        """Pause in-flight generation on the engines behind this session.
+
+        This is a stateless control primitive: it freezes the engine until
+        :meth:`continue_generation` is called. With the default
+        ``mode="abort"`` the waiting + running requests are aborted on the spot
+        and their partial output is returned to the callers of :meth:`sample`
+        (with ``stop_reason="abort"``) — this is the recovery shape used for
+        partial/async rollout weight swaps
+        (abort -> drain -> sync_weights -> continue).
+
+        Args:
+            mode: How to treat in-flight requests. One of :class:`PauseMode`
+                (``abort`` / ``retract`` / ``in_place``) or its string value.
+
+        Returns:
+            The server response payload.
+
+        Raises:
+            ValueError: If ``mode`` is not a supported pause mode.
+        """
+        body = _su.build_pause_generation_body(mode)
+        return self._service.http.post(
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation",
+            json=body,
+        )
+
+    def continue_generation(self) -> Dict[str, Any]:
+        """Resume generation after a :meth:`pause_generation` call.
+
+        Returns:
+            The server response payload.
+        """
+        return self._service.http.post(
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation",
+        )
 
     def _normalize_sample_result(self, payload: Any) -> Any:
         return _su.normalize_sample_result(payload, self._ensure_tokenizer)
