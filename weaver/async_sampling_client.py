@@ -24,7 +24,7 @@ from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle
-from .types import LogprobsParams, ModelInput, SamplingParams
+from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -139,6 +139,26 @@ class AsyncSamplingClient:
             "logprobs": logprobs,
             "return_rollout_token_expert_data": result.get("return_rollout_token_expert_data"),
         }
+
+    async def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Dict[str, Any]:
+        """Pause in-flight generation on the engines behind this session.
+
+        See :meth:`weaver.sampling_client.SamplingClient.pause_generation`.
+        """
+        body = _su.build_pause_generation_body(mode)
+        return await self._service.http.post(
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation",
+            json=body,
+        )
+
+    async def continue_generation(self) -> Dict[str, Any]:
+        """Resume generation after a :meth:`pause_generation` call.
+
+        See :meth:`weaver.sampling_client.SamplingClient.continue_generation`.
+        """
+        return await self._service.http.post(
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation",
+        )
 
     async def _ensure_tokenizer_source(self) -> None:
         """Make sure a tokenizer path or base_model is known (may fetch the session)."""

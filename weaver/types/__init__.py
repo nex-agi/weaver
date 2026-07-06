@@ -41,6 +41,7 @@ from .router_replay import (
     router_replay_shard_uri,
 )
 from .sampling import SamplingParams
+from .sampling_control import PauseMode, coerce_pause_mode
 from .tensor import TensorData
 
 __all__ = [
@@ -51,6 +52,7 @@ __all__ = [
     "LogprobsParams",
     "ModelInput",
     "ModelInputChunk",
+    "PauseMode",
     "PayloadRef",
     "PayloadRefMaterializationError",
     "ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK",
@@ -66,6 +68,7 @@ __all__ = [
     "RouterReplayModelConfig",
     "SamplingParams",
     "TensorData",
+    "coerce_pause_mode",
     "materialize_payload_ref",
     "materialize_router_replay_index",
     "materialize_router_replay_indices",

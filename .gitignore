@@ -56,3 +56,6 @@ dist/
 
 # Weights & Biases
 wandb/
+
+# DevBox sandbox tooling artifacts
+.devbox/
