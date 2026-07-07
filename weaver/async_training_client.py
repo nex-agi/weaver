@@ -36,7 +36,7 @@ from ._payloads import (
     forward_payload,
     parse_logprob_tensors,
 )
-from ._utils import UNSET, _UnsetType, lookup_case_insensitive
+from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle
 from .types import AdamParams, Datum
@@ -273,20 +273,24 @@ class AsyncTrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: "Literal[True]" = True,
     ) -> str: ...
 
     @overload
     async def save_weights_for_sampler(
-        self, *, name: str | None = None, ttl_seconds: int | None = 86400, wait: "Literal[False]"
+        self,
+        *,
+        name: str | None = None,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        wait: "Literal[False]",
     ) -> AsyncOperationHandle: ...
 
     async def save_weights_for_sampler(
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: bool = True,
     ) -> str | AsyncOperationHandle:
         """Export model weights for sampling.
@@ -319,20 +323,24 @@ class AsyncTrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: "Literal[True]" = True,
     ) -> "AsyncSamplingClient": ...
 
     @overload
     async def save_weights_and_get_sampling_client(
-        self, *, name: str | None = None, ttl_seconds: int | None = 86400, wait: "Literal[False]"
+        self,
+        *,
+        name: str | None = None,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        wait: "Literal[False]",
     ) -> AsyncOperationHandle: ...
 
     async def save_weights_and_get_sampling_client(
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: bool = True,
     ) -> "AsyncSamplingClient | AsyncOperationHandle":
         """Export model weights and create an async sampling client.
@@ -429,6 +437,11 @@ class AsyncTrainingClient:
             body["name"] = name
         if not isinstance(ttl_seconds, _UnsetType):
             body["ttl_seconds"] = ttl_seconds
+        elif checkpoint_type == "sampling":
+            # Regenerable sampling checkpoints default to a bounded TTL so they
+            # don't accumulate on shared storage; weight checkpoints stay
+            # permanent unless an explicit ttl_seconds is given.
+            body["ttl_seconds"] = DEFAULT_SAMPLER_TTL_SECONDS
         handle = await self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/checkpoints",
             body,

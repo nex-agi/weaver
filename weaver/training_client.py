@@ -28,7 +28,7 @@ from ._payloads import (
     parse_logprob_tensors,
     serialize_data,
 )
-from ._utils import UNSET, _UnsetType, lookup_case_insensitive
+from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
@@ -275,7 +275,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: Literal[True] = True,
     ) -> str: ...
 
@@ -284,7 +284,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -292,20 +292,20 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: bool = True,
     ) -> str | OperationHandle:
         """Export model weights for sampling.
 
         Sampler weights are intended for short-lived RL weight-sync use, so
-        the default TTL is **1 day (86400 s)**.  Pass ``ttl_seconds=None`` to
+        the default TTL is **1 hour (3600 s)**.  Pass ``ttl_seconds=None`` to
         keep the exported checkpoint permanently (use ``save_state`` if you
         need a durable checkpoint instead).
 
         Args:
             name: Optional custom path name for the exported weights
             ttl_seconds: Time-to-live in seconds for the exported checkpoint.
-                Defaults to ``86400`` (1 day).  Pass ``None`` for permanent.
+                Defaults to ``3600`` (1 hour).  Pass ``None`` for permanent.
             wait: If True (default), waits for export to complete and returns path.
                   If False, returns an OperationHandle immediately.
 
@@ -339,7 +339,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: Literal[True] = True,
     ) -> "SamplingClient": ...
 
@@ -348,7 +348,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -356,7 +356,7 @@ class TrainingClient:
         self,
         *,
         name: str | None = None,
-        ttl_seconds: int | None = 86400,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
         wait: bool = True,
     ) -> "SamplingClient" | OperationHandle:
         """Export model weights and create a sampling client.
@@ -365,13 +365,13 @@ class TrainingClient:
         and get_sampling_client. For more control, use those methods separately.
 
         Because this method is designed for frequent RL weight-sync calls,
-        the default TTL is **1 day (86400 s)**.  Pass ``ttl_seconds=None``
+        the default TTL is **1 hour (3600 s)**.  Pass ``ttl_seconds=None``
         to keep the checkpoint permanently.
 
         Args:
             name: Optional custom path name for the exported weights
             ttl_seconds: Time-to-live in seconds for the exported checkpoint.
-                Defaults to ``86400`` (1 day).  Pass ``None`` for permanent.
+                Defaults to ``3600`` (1 hour).  Pass ``None`` for permanent.
             wait: If True (default), waits for export and returns SamplingClient.
                   If False, returns an OperationHandle immediately.
 
@@ -466,12 +466,15 @@ class TrainingClient:
             name: Human-readable checkpoint label (e.g. ``"step-100"``).
                 The server generates the full storage path incorporating
                 the model ID automatically.
-            checkpoint_type: ``"weight"`` (default) or
-                ``"weight_and_optimizer"``.
-            ttl_seconds: Time-to-live in seconds for the checkpoint.
-                Defaults to ``None`` (permanent, backward-compatible).
-                Pass an integer to set auto-expiration, or explicit ``None``
-                to ensure permanent retention.
+            checkpoint_type: ``"weight"`` (default), ``"weight_and_optimizer"``,
+                or ``"sampling"``.
+            ttl_seconds: Time-to-live in seconds for the checkpoint. When
+                omitted, weight checkpoints are kept permanently (backward
+                compatible) while ``"sampling"`` checkpoints default to
+                ``DEFAULT_SAMPLER_TTL_SECONDS`` (1 hour), matching the sampler
+                export methods, since they are regenerable. Pass an integer to
+                set auto-expiration, or explicit ``None`` to force permanent
+                retention for any type.
             wait: If True (default), blocks until the save completes and
                 returns a :class:`~weaver.types.Checkpoint`.
 
@@ -484,6 +487,11 @@ class TrainingClient:
             body["name"] = name
         if not isinstance(ttl_seconds, _UnsetType):
             body["ttl_seconds"] = ttl_seconds
+        elif checkpoint_type == "sampling":
+            # Regenerable sampling checkpoints default to a bounded TTL so they
+            # don't accumulate on shared storage; weight checkpoints stay
+            # permanent unless an explicit ttl_seconds is given.
+            body["ttl_seconds"] = DEFAULT_SAMPLER_TTL_SECONDS
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/checkpoints",
             body,
