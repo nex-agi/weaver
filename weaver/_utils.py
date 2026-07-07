@@ -39,6 +39,14 @@ class _UnsetType:
 UNSET = _UnsetType()
 
 
+# Default time-to-live for sampling checkpoints created through the SDK. Sampler
+# exports are regenerable, short-lived RL weight-sync artifacts, so the SDK
+# stamps a bounded TTL by default instead of letting them accumulate forever on
+# shared storage. Callers can pass an explicit ``ttl_seconds`` (including
+# ``None`` for permanent retention) to override it.
+DEFAULT_SAMPLER_TTL_SECONDS = 3600  # 1 hour
+
+
 def lookup_case_insensitive(payload: Dict[str, Any], name: str) -> Any:
     variants = {
         name,

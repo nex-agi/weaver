@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from weaver._utils import DEFAULT_SAMPLER_TTL_SECONDS
 from weaver.operations import OperationHandle
 from weaver.training_client import TrainingClient
 from weaver.types.checkpoint import Checkpoint
@@ -383,6 +384,34 @@ class TestSaveStateTTL:
         body = tc._service.enqueue_operation.call_args[0][1]
         assert body["ttl_seconds"] == 3600
 
+    def test_sampling_type_defaults_to_sampler_ttl(self):
+        # A sampling checkpoint saved without an explicit TTL gets the default
+        # sampler TTL so regenerable exports don't accumulate. Weight types keep
+        # their permanent default (test_default_no_ttl_in_body).
+        tc = _make_training_client()
+        handle = _make_handle({"id": "ckpt-s", "path": "weaver://ckpt-s"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_state(name="test", checkpoint_type="sampling")
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["ttl_seconds"] == DEFAULT_SAMPLER_TTL_SECONDS
+
+    def test_sampling_type_explicit_none_stays_permanent(self):
+        tc = _make_training_client()
+        handle = _make_handle({"id": "ckpt-s", "path": "weaver://ckpt-s"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_state(name="test", checkpoint_type="sampling", ttl_seconds=None)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert "ttl_seconds" in body
+        assert body["ttl_seconds"] is None
+
+    def test_sampling_type_explicit_ttl_wins(self):
+        tc = _make_training_client()
+        handle = _make_handle({"id": "ckpt-s", "path": "weaver://ckpt-s"})
+        tc._service.enqueue_operation.return_value = handle
+        tc.save_state(name="test", checkpoint_type="sampling", ttl_seconds=3600)
+        body = tc._service.enqueue_operation.call_args[0][1]
+        assert body["ttl_seconds"] == 3600
+
 
 # ---------------------------------------------------------------------------
 # save_weights_for_sampler TTL
@@ -390,13 +419,13 @@ class TestSaveStateTTL:
 
 
 class TestSaveWeightsForSamplerTTL:
-    def test_default_is_one_day(self):
+    def test_default_is_sampler_ttl(self):
         tc = _make_training_client()
         handle = _make_handle({"model_path": "weaver://path"})
         tc._service.enqueue_operation.return_value = handle
         tc.save_weights_for_sampler(name="test")
         body = tc._service.enqueue_operation.call_args[0][1]
-        assert body["ttl_seconds"] == 86400
+        assert body["ttl_seconds"] == DEFAULT_SAMPLER_TTL_SECONDS
 
     def test_explicit_none_no_ttl_in_body(self):
         tc = _make_training_client()
@@ -421,14 +450,14 @@ class TestSaveWeightsForSamplerTTL:
 
 
 class TestSaveWeightsAndGetSamplingClientTTL:
-    def test_default_sends_86400(self):
+    def test_default_is_sampler_ttl(self):
         tc = _make_training_client()
         handle = _make_handle({"model_path": "weaver://path", "sampling_session_id": "ss-1"})
         tc._service.enqueue_operation.return_value = handle
         tc._service.get_sampling_client.return_value = MagicMock()
         tc.save_weights_and_get_sampling_client()
         body = tc._service.enqueue_operation.call_args[0][1]
-        assert body["ttl_seconds"] == 86400
+        assert body["ttl_seconds"] == DEFAULT_SAMPLER_TTL_SECONDS
 
     def test_explicit_none_no_ttl_in_body(self):
         tc = _make_training_client()
