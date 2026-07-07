@@ -20,10 +20,11 @@ import atexit
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import __version__
 from ._http import APIClient
+from ._payloads import build_router_replay_manifest_body
 from ._utils import extract_id, lookup_case_insensitive
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
@@ -433,6 +434,22 @@ class ServiceClient:
         # would create duplicate server-side operations.
         response = self.http.post(path, json=payload, max_retries=1)
         return build_operation_handle(self.http, response)
+
+    def write_router_replay_manifest(
+        self,
+        model_id: str,
+        replay_set_id: str,
+        manifest: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist a router-replay manifest server-side.
+
+        NexRL assembles the manifest (it owns the training-batch framing) but
+        delegates the GPFS write to the server, keeping filesystem logic out of
+        NexRL. Returns the opaque ``index_set_uri`` / ``manifest_uri`` the datums
+        and trainer reference.
+        """
+        body = build_router_replay_manifest_body(model_id, replay_set_id, manifest)
+        return self.http.post("/api/v1/router-replay/manifests", json=body)
 
     def list_supported_models(self) -> List[str]:
         """Return supported model names exposed by the server."""

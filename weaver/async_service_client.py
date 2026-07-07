@@ -60,10 +60,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import __version__
 from ._async_http import AsyncAPIClient
+from ._payloads import build_router_replay_manifest_body
 from ._utils import extract_id, lookup_case_insensitive
 from .config import WeaverConfig
 from .operations import AsyncOperationHandle, build_async_operation_handle
@@ -153,6 +154,20 @@ class AsyncServiceClient:
             f"/api/v1/models/{model_id}/terminate",
             json=payload if payload else None,
         )
+
+    async def write_router_replay_manifest(
+        self,
+        model_id: str,
+        replay_set_id: str,
+        manifest: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Persist a router-replay manifest server-side (async).
+
+        Mirror of :meth:`ServiceClient.write_router_replay_manifest`: NexRL
+        assembles the manifest but delegates the GPFS write to the server.
+        """
+        body = build_router_replay_manifest_body(model_id, replay_set_id, manifest)
+        return await self.http.post("/api/v1/router-replay/manifests", json=body)
 
     async def aclose(self) -> None:
         if self._closed:

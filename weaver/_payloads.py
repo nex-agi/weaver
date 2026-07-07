@@ -152,3 +152,28 @@ def build_surrogate_data(
             Datum.from_raw(model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs)
         )
     return surrogate_data
+
+
+def build_router_replay_manifest_body(
+    model_id: str,
+    replay_set_id: str,
+    manifest: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Build the request body for persisting a router-replay manifest server-side.
+
+    NexRL assembles the manifest (it owns the training-batch framing) but
+    delegates the GPFS write to the server, so both client stacks post identical
+    bytes. The server derives the write path from ``model_id`` / ``replay_set_id``
+    and treats ``manifest`` as opaque content.
+    """
+    model_id = str(model_id or "").strip().strip("/")
+    replay_set_id = str(replay_set_id or "").strip().strip("/")
+    if not model_id or not replay_set_id:
+        raise ValueError("router replay manifest requires non-empty model_id and replay_set_id")
+    if not isinstance(manifest, Mapping):
+        raise ValueError("router replay manifest must be a mapping")
+    return {
+        "model_id": model_id,
+        "replay_set_id": replay_set_id,
+        "manifest": dict(manifest),
+    }
