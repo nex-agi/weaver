@@ -138,3 +138,80 @@ def test_normalize_omits_moe_topk_indices_when_none():
     assert "sequences" in result
     seq = result["sequences"][0]
     assert "moe_topk_indices" not in seq
+
+
+def test_normalize_preserves_moe_topk_indices_ref():
+    """When the server offloads indices, it returns moe_topk_indices_ref instead
+    of the inline array; the normalized result surfaces the ref verbatim."""
+    client, _ = _make_client()
+    ref = {
+        "storage": "gpfs",
+        "format": "safetensors",
+        "uri": "weaver://m/router-replay/rollout/op/seq-0.safetensors",
+        "relative_path": "m/router-replay/rollout/op/seq-0.safetensors",
+        "dtype": "int16",
+        "shape": [3, 2, 4],
+    }
+    payload = {
+        "result": {
+            "sequences": [
+                {
+                    "tokens": [1, 2, 3],
+                    "text": "hello",
+                    "stop_reason": "stop",
+                    "moe_topk_indices_ref": ref,
+                }
+            ]
+        }
+    }
+
+    result = client._normalize_sample_result(payload)
+
+    seq = result["sequences"][0]
+    assert seq["moe_topk_indices_ref"] == ref
+    # The offloaded path must never also carry the inline array.
+    assert "moe_topk_indices" not in seq
+
+
+def test_normalize_omits_moe_topk_indices_ref_when_none():
+    """When moe_topk_indices_ref is None, it's not in the normalized result."""
+    client, _ = _make_client()
+    payload = {
+        "result": {
+            "sequences": [
+                {
+                    "tokens": [1],
+                    "text": "a",
+                    "stop_reason": "stop",
+                    "moe_topk_indices_ref": None,
+                }
+            ]
+        }
+    }
+
+    seq = client._normalize_sample_result(payload)["sequences"][0]
+    assert "moe_topk_indices_ref" not in seq
+
+
+def test_shared_normalize_surfaces_ref_for_both_stacks():
+    """Sync and async clients both call the shared normalize_sample_result;
+    verify the shared helper surfaces the ref so both stacks inherit it."""
+    from weaver._sampling_utils import normalize_sample_result
+
+    ref = {"uri": "weaver://x", "format": "safetensors"}
+    payload = {
+        "result": {
+            "sequences": [
+                {
+                    "tokens": [1, 2],
+                    "text": "hi",
+                    "stop_reason": "stop",
+                    "moe_topk_indices_ref": ref,
+                }
+            ]
+        }
+    }
+
+    result = normalize_sample_result(payload, lambda: None)
+
+    assert result["sequences"][0]["moe_topk_indices_ref"] == ref

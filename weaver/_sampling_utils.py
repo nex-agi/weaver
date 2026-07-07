@@ -168,6 +168,12 @@ def sequences_from_result(
                 sequence["sampling_masks"] = raw["sampling_masks"]
             if "moe_topk_indices" in raw and raw["moe_topk_indices"] is not None:
                 sequence["moe_topk_indices"] = raw["moe_topk_indices"]
+            # The server offloads the large routing-index tensor to a GPFS
+            # safetensors shard and returns an opaque ref instead of the inline
+            # array; surface it verbatim so NexRL can attach it as a datum ref
+            # without the indices ever crossing the wire.
+            if "moe_topk_indices_ref" in raw and raw["moe_topk_indices_ref"] is not None:
+                sequence["moe_topk_indices_ref"] = raw["moe_topk_indices_ref"]
             weight_version = lookup_case_insensitive(raw, "weight_version")
             if weight_version is not None:
                 sequence["weight_version"] = weight_version
