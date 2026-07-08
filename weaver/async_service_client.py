@@ -64,7 +64,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, 
 
 from . import __version__
 from ._async_http import AsyncAPIClient
-from ._payloads import build_router_replay_manifest_body
+from ._payloads import build_router_replay_index_set_body
 from ._utils import extract_id, lookup_case_insensitive
 from .config import WeaverConfig
 from .operations import AsyncOperationHandle, build_async_operation_handle
@@ -155,21 +155,20 @@ class AsyncServiceClient:
             json=payload if payload else None,
         )
 
-    async def _write_router_replay_manifest(
+    async def _create_router_replay_index_set(
         self,
         model_id: str,
-        replay_set_id: str,
-        manifest: Mapping[str, Any],
+        value_refs: Sequence[Mapping[str, Any]],
     ) -> Dict[str, Any]:
-        """Persist a router-replay manifest server-side (async). Internal.
+        """Create a router-replay index set server-side (async). Internal.
 
-        Mirror of :meth:`ServiceClient._write_router_replay_manifest`: router
+        Mirror of :meth:`ServiceClient._create_router_replay_index_set`: router
         replay is an internal protocol, so this is not part of the public
-        surface. NexRL assembles the manifest but delegates the GPFS write to
-        the server.
+        surface. The caller supplies only the ordered per-sample value_refs; the
+        server assembles and persists the manifest and returns its opaque URIs.
         """
-        body = build_router_replay_manifest_body(model_id, replay_set_id, manifest)
-        return await self.http.post("/api/v1/router-replay/manifests", json=body)
+        body = build_router_replay_index_set_body(model_id, value_refs)
+        return await self.http.post("/api/v1/router-replay/index-sets", json=body)
 
     async def aclose(self) -> None:
         if self._closed:

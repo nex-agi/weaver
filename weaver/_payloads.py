@@ -154,26 +154,25 @@ def build_surrogate_data(
     return surrogate_data
 
 
-def build_router_replay_manifest_body(
+def build_router_replay_index_set_body(
     model_id: str,
-    replay_set_id: str,
-    manifest: Mapping[str, Any],
+    value_refs: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Any]:
-    """Build the request body for persisting a router-replay manifest server-side.
+    """Build the request body for creating a router-replay index set server-side.
 
-    NexRL assembles the manifest (it owns the training-batch framing) but
-    delegates the GPFS write to the server, so both client stacks post identical
-    bytes. The server derives the write path from ``model_id`` / ``replay_set_id``
-    and treats ``manifest`` as opaque content.
+    The caller supplies only ``model_id`` and the ordered per-sample routing
+    ``value_refs`` (the refs the rollout server offloaded, one per training
+    sample). The server owns the whole manifest shape -- schema, parallelism
+    placement, and the generated replay-set id -- so the client never builds a
+    manifest, names the set, or touches parallelism. The sample index is the
+    position in ``value_refs``.
     """
     model_id = str(model_id or "").strip().strip("/")
-    replay_set_id = str(replay_set_id or "").strip().strip("/")
-    if not model_id or not replay_set_id:
-        raise ValueError("router replay manifest requires non-empty model_id and replay_set_id")
-    if not isinstance(manifest, Mapping):
-        raise ValueError("router replay manifest must be a mapping")
-    return {
-        "model_id": model_id,
-        "replay_set_id": replay_set_id,
-        "manifest": dict(manifest),
-    }
+    if not model_id:
+        raise ValueError("router replay index set requires a non-empty model_id")
+    samples = []
+    for i, ref in enumerate(value_refs):
+        if not isinstance(ref, Mapping):
+            raise ValueError(f"router replay value_ref {i} must be a mapping")
+        samples.append({"value_ref": dict(ref)})
+    return {"model_id": model_id, "samples": samples}
