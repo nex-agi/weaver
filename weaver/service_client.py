@@ -435,18 +435,20 @@ class ServiceClient:
         response = self.http.post(path, json=payload, max_retries=1)
         return build_operation_handle(self.http, response)
 
-    def write_router_replay_manifest(
+    def _write_router_replay_manifest(
         self,
         model_id: str,
         replay_set_id: str,
         manifest: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        """Persist a router-replay manifest server-side.
+        """Persist a router-replay manifest server-side. Internal.
 
-        NexRL assembles the manifest (it owns the training-batch framing) but
-        delegates the GPFS write to the server, keeping filesystem logic out of
-        NexRL. Returns the opaque ``index_set_uri`` / ``manifest_uri`` the datums
-        and trainer reference.
+        Router replay is an internal protocol between NexRL, weaver-server and
+        weaver-trainer, so this is deliberately not part of the SDK's public
+        surface (leading underscore). NexRL assembles the manifest (it owns the
+        training-batch framing) but delegates the GPFS write to the server,
+        keeping filesystem logic out of NexRL. Returns the opaque
+        ``index_set_uri`` / ``manifest_uri`` the datums and trainer reference.
         """
         body = build_router_replay_manifest_body(model_id, replay_set_id, manifest)
         return self.http.post("/api/v1/router-replay/manifests", json=body)

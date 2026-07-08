@@ -53,7 +53,7 @@ def test_service_client_posts_manifest_to_endpoint():
         "manifest_uri": "weaver://model-a/router-replay/set-1/manifest.json",
     }
 
-    out = client.write_router_replay_manifest("model-a", "set-1", _MANIFEST)
+    out = client._write_router_replay_manifest("model-a", "set-1", _MANIFEST)
 
     args, kwargs = client._http.post.call_args
     assert args[0] == _ENDPOINT
@@ -71,7 +71,7 @@ def test_async_service_client_posts_manifest_to_endpoint():
     http.post.return_value = {"manifest_uri": "weaver://model-a/router-replay/set-1/manifest.json"}
     client._http = http
 
-    out = asyncio.run(client.write_router_replay_manifest("model-a", "set-1", _MANIFEST))
+    out = asyncio.run(client._write_router_replay_manifest("model-a", "set-1", _MANIFEST))
 
     args, kwargs = http.post.call_args
     assert args[0] == _ENDPOINT

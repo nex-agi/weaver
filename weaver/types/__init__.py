@@ -20,6 +20,13 @@ from .logprobs import LogprobsParams
 from .lora_config import LoraConfig
 from .model_input import ModelInput, ModelInputChunk
 from .optim import AdamParams
+
+# Router-replay / payload-ref types are an internal protocol shared by NexRL and
+# weaver-trainer, not part of the SDK's public surface. They are re-exported here
+# only so those privileged consumers keep working, and are deliberately excluded
+# from __all__ below so a general SDK user never sees router-replay / ref
+# machinery. New consumers should import them from the submodule directly
+# (weaver.types.router_replay / weaver.types.payload_ref).
 from .payload_ref import PayloadRef, PayloadRefMaterializationError, materialize_payload_ref
 from .router_replay import (
     ROUTER_REPLAY_DATUM_SCHEMA,
@@ -44,6 +51,9 @@ from .sampling import SamplingParams
 from .sampling_control import PauseMode, coerce_pause_mode
 from .tensor import TensorData
 
+# Public API only. Router-replay / payload-ref symbols are imported above for
+# internal consumers (NexRL, weaver-trainer) but intentionally omitted here so
+# they are not part of the SDK's public surface.
 __all__ = [
     "AdamParams",
     "Checkpoint",
@@ -53,27 +63,7 @@ __all__ = [
     "ModelInput",
     "ModelInputChunk",
     "PauseMode",
-    "PayloadRef",
-    "PayloadRefMaterializationError",
-    "ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK",
-    "ROUTER_REPLAY_MODE_R2",
-    "ROUTER_REPLAY_MODE_R3",
-    "ROUTER_REPLAY_SOURCE_RECOMPUTE",
-    "ROUTER_REPLAY_SOURCE_ROLLOUT",
-    "ROUTER_REPLAY_TOKEN_ALIGNMENT_TARGET_ALIGNED",
-    "ROUTER_REPLAY_DATUM_SCHEMA",
-    "ROUTER_REPLAY_INDEX_SET_SCHEMA",
-    "RouterReplayIndices",
-    "RouterReplayMetadata",
-    "RouterReplayModelConfig",
     "SamplingParams",
     "TensorData",
     "coerce_pause_mode",
-    "materialize_payload_ref",
-    "materialize_router_replay_index",
-    "materialize_router_replay_indices",
-    "router_replay_manifest_uri",
-    "router_replay_sample_uri",
-    "router_replay_set_uri",
-    "router_replay_shard_uri",
 ]

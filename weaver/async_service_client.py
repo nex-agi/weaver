@@ -155,16 +155,18 @@ class AsyncServiceClient:
             json=payload if payload else None,
         )
 
-    async def write_router_replay_manifest(
+    async def _write_router_replay_manifest(
         self,
         model_id: str,
         replay_set_id: str,
         manifest: Mapping[str, Any],
     ) -> Dict[str, Any]:
-        """Persist a router-replay manifest server-side (async).
+        """Persist a router-replay manifest server-side (async). Internal.
 
-        Mirror of :meth:`ServiceClient.write_router_replay_manifest`: NexRL
-        assembles the manifest but delegates the GPFS write to the server.
+        Mirror of :meth:`ServiceClient._write_router_replay_manifest`: router
+        replay is an internal protocol, so this is not part of the public
+        surface. NexRL assembles the manifest but delegates the GPFS write to
+        the server.
         """
         body = build_router_replay_manifest_body(model_id, replay_set_id, manifest)
         return await self.http.post("/api/v1/router-replay/manifests", json=body)
