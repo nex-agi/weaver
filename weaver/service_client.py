@@ -20,11 +20,10 @@ import atexit
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 from . import __version__
 from ._http import APIClient
-from ._payloads import build_router_replay_index_set_body
 from ._utils import extract_id, lookup_case_insensitive
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
@@ -434,24 +433,6 @@ class ServiceClient:
         # would create duplicate server-side operations.
         response = self.http.post(path, json=payload, max_retries=1)
         return build_operation_handle(self.http, response)
-
-    def _create_router_replay_index_set(
-        self,
-        model_id: str,
-        value_refs: Sequence[Mapping[str, Any]],
-    ) -> Dict[str, Any]:
-        """Create a router-replay index set server-side. Internal.
-
-        Router replay is an internal protocol between NexRL, weaver-server and
-        weaver-trainer, so this is deliberately not part of the SDK's public
-        surface (leading underscore). The caller supplies only the ordered
-        per-sample routing ``value_refs``; the server assembles and persists the
-        manifest -- owning its schema, parallelism placement, and the generated
-        replay-set id -- and returns the opaque ``replay_set_id`` /
-        ``index_set_uri`` / ``manifest_uri`` the datums and trainer reference.
-        """
-        body = build_router_replay_index_set_body(model_id, value_refs)
-        return self.http.post("/api/v1/router-replay/index-sets", json=body)
 
     def list_supported_models(self) -> List[str]:
         """Return supported model names exposed by the server."""

@@ -152,27 +152,3 @@ def build_surrogate_data(
             Datum.from_raw(model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs)
         )
     return surrogate_data
-
-
-def build_router_replay_index_set_body(
-    model_id: str,
-    value_refs: Sequence[Mapping[str, Any]],
-) -> Dict[str, Any]:
-    """Build the request body for creating a router-replay index set server-side.
-
-    The caller supplies only ``model_id`` and the ordered per-sample routing
-    ``value_refs`` (the refs the rollout server offloaded, one per training
-    sample). The server owns the whole manifest shape -- schema, parallelism
-    placement, and the generated replay-set id -- so the client never builds a
-    manifest, names the set, or touches parallelism. The sample index is the
-    position in ``value_refs``.
-    """
-    model_id = str(model_id or "").strip().strip("/")
-    if not model_id:
-        raise ValueError("router replay index set requires a non-empty model_id")
-    samples = []
-    for i, ref in enumerate(value_refs):
-        if not isinstance(ref, Mapping):
-            raise ValueError(f"router replay value_ref {i} must be a mapping")
-        samples.append({"value_ref": dict(ref)})
-    return {"model_id": model_id, "samples": samples}

@@ -60,11 +60,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 from . import __version__
 from ._async_http import AsyncAPIClient
-from ._payloads import build_router_replay_index_set_body
 from ._utils import extract_id, lookup_case_insensitive
 from .config import WeaverConfig
 from .operations import AsyncOperationHandle, build_async_operation_handle
@@ -154,21 +153,6 @@ class AsyncServiceClient:
             f"/api/v1/models/{model_id}/terminate",
             json=payload if payload else None,
         )
-
-    async def _create_router_replay_index_set(
-        self,
-        model_id: str,
-        value_refs: Sequence[Mapping[str, Any]],
-    ) -> Dict[str, Any]:
-        """Create a router-replay index set server-side (async). Internal.
-
-        Mirror of :meth:`ServiceClient._create_router_replay_index_set`: router
-        replay is an internal protocol, so this is not part of the public
-        surface. The caller supplies only the ordered per-sample value_refs; the
-        server assembles and persists the manifest and returns its opaque URIs.
-        """
-        body = build_router_replay_index_set_body(model_id, value_refs)
-        return await self.http.post("/api/v1/router-replay/index-sets", json=body)
 
     async def aclose(self) -> None:
         if self._closed:
