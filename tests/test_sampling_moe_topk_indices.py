@@ -173,6 +173,35 @@ def test_normalize_preserves_moe_topk_indices_ref():
     assert "moe_topk_indices" not in seq
 
 
+def test_normalize_ref_wins_when_both_present():
+    """A malformed response may carry both the inline moe_topk_indices and the
+    offloaded moe_topk_indices_ref. The ref is authoritative: surface only the
+    ref and drop the inline array so the consumer never sees both."""
+    client, _ = _make_client()
+    ref = {
+        "storage": "gpfs",
+        "format": "safetensors",
+        "uri": "weaver://m/router-replay/rollout/op/seq-0.safetensors",
+    }
+    payload = {
+        "result": {
+            "sequences": [
+                {
+                    "tokens": [1, 2, 3],
+                    "text": "hello",
+                    "stop_reason": "stop",
+                    "moe_topk_indices": [[1, 7, 3, 5], [2, 4, 0, 6], [1, 3, 5, 7]],
+                    "moe_topk_indices_ref": ref,
+                }
+            ]
+        }
+    }
+
+    seq = client._normalize_sample_result(payload)["sequences"][0]
+    assert seq["moe_topk_indices_ref"] == ref
+    assert "moe_topk_indices" not in seq
+
+
 def test_normalize_omits_moe_topk_indices_ref_when_none():
     """When moe_topk_indices_ref is None, it's not in the normalized result."""
     client, _ = _make_client()
