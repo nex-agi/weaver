@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import math
+import tempfile
 import time
 from datetime import datetime, timezone
 from functools import cached_property
@@ -30,15 +31,20 @@ from ._http import WeaverAPIError
 from ._payloads import (
     build_request_metadata,
     build_surrogate_data,
-    forward_backward_payload,
-    forward_payload,
     parse_logprob_tensors,
+    prepare_forward_backward_operation,
+    prepare_forward_operation,
     serialize_data,
 )
 from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .operations import OperationHandle, build_operation_handle
 from .service_client import ServiceClient
+from .tensor_transport import (
+    PreparedOperationBody,
+    result_tensor_pack_metadata,
+    result_uses_http_tensor_pack,
+)
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.deployment import Deployment
@@ -140,6 +146,13 @@ class TrainingClient:
     ) -> Dict[str, Any] | None:
         return build_request_metadata(metadata, router_replay)
 
+    def _enqueue_prepared(self, path: str, prepared: PreparedOperationBody) -> OperationHandle:
+        if prepared.tensor_pack is None:
+            return self._service.enqueue_operation(path, prepared.body)
+        return self._service.enqueue_operation(
+            path, prepared.body, tensor_pack=prepared.tensor_pack
+        )
+
     @overload
     def forward(
         self,
@@ -187,18 +200,21 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        payload = forward_payload(
+        prepared = prepare_forward_operation(
             model_id=self.model_id,
             seq_id=self._next_seq(),
             data=data,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
             request_metadata=build_request_metadata(metadata, router_replay),
+            tensor_transport=self._service.tensor_transport,
+            tensor_compression=self._service.tensor_compression,
         )
-        handle = self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/forward-passes",
-            {"payload": payload},
-        )
+        try:
+            path = f"/api/v1/models/{self.model_id}/forward-passes"
+            handle = self._enqueue_prepared(path, prepared)
+        finally:
+            prepared.close()
         return handle.result() if wait else handle
 
     @overload
@@ -248,18 +264,21 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        payload = forward_backward_payload(
+        prepared = prepare_forward_backward_operation(
             model_id=self.model_id,
             seq_id=self._next_seq(),
             data=data,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
             request_metadata=build_request_metadata(metadata, router_replay),
+            tensor_transport=self._service.tensor_transport,
+            tensor_compression=self._service.tensor_compression,
         )
-        handle = self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/forward-backward-passes",
-            {"payload": payload},
-        )
+        try:
+            path = f"/api/v1/models/{self.model_id}/forward-backward-passes"
+            handle = self._enqueue_prepared(path, prepared)
+        finally:
+            prepared.close()
         return handle.result() if wait else handle
 
     def forward_backward_custom(
@@ -287,13 +306,29 @@ class TrainingClient:
             data: Sequence of training data.
             loss_fn: ``(data, logprob_tensors) -> (loss, metrics)``
         """
-        # Step A: forward pass to get logprobs
-        fwd_result = self.forward(data, "forward_logprob", loss_fn_config=loss_fn_config, wait=True)
+        fwd_handle = self.forward(
+            data,
+            "forward_logprob",
+            loss_fn_config=loss_fn_config,
+            wait=False,
+        )
+        fwd_result = fwd_handle.result()
 
-        # Step B: parse logprobs from response
-        logprob_tensors = parse_logprob_tensors(fwd_result, data)
+        if result_uses_http_tensor_pack(fwd_result):
+            with tempfile.TemporaryFile(mode="w+b") as tensor_pack:
+                metadata = result_tensor_pack_metadata(fwd_result)
+                fwd_handle.client.download_tensor_pack(
+                    fwd_handle.operation_id,
+                    tensor_pack,
+                    size_bytes=metadata.size_bytes,
+                    sha256=metadata.sha256,
+                    codec=metadata.codec,
+                    decoded_size_bytes=metadata.decoded_size_bytes,
+                )
+                logprob_tensors = parse_logprob_tensors(fwd_result, data, tensor_pack=tensor_pack)
+        else:
+            logprob_tensors = parse_logprob_tensors(fwd_result, data)
 
-        # Step C: run user's loss function
         try:
             loss, metrics = loss_fn(data, logprob_tensors)
         except Exception as exc:
@@ -302,16 +337,9 @@ class TrainingClient:
         if loss.dim() != 0:
             raise ValueError(f"loss_fn must return a scalar loss, got shape {loss.shape}")
 
-        # Step D: backprop through user graph into logprob tensors
         loss.backward()
-
-        # Step E: build surrogate Datum objects from the propagated gradients
         surrogate_data = build_surrogate_data(data, logprob_tensors)
-
-        # Step F: surrogate backward pass
         self.forward_backward(surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True)
-
-        # Step G: return loss and metrics
         return {"loss": loss.detach(), "metrics": metrics}
 
     @overload

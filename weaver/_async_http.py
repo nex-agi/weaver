@@ -23,8 +23,10 @@ backoff sleeps) is awaited so the event loop stays free for other coroutines.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import tempfile
 from typing import Any, BinaryIO, Mapping, MutableMapping
 
 import httpx
@@ -39,17 +41,22 @@ from ._http import (
     DEFAULT_TIMEOUT,
     DOWNLOAD_CHUNK_SIZE,
     DOWNLOAD_TIMEOUT,
+    TENSOR_PACK_CHUNK_BYTES,
     USER_AGENT,
     DownloadURLExpiredError,
     WeaverAPIError,
     _is_connection_error,
+    _validate_tensor_pack_download,
+    _validate_tensor_pack_response_length,
+    _validate_tensor_pack_response_metadata,
     apply_request_span_attributes,
     compute_retry_delay,
     extract_model_id_from_path,
     raise_for_response,
 )
 from ._telemetry import get_tracer
-from .config import WeaverConfig
+from .config import TensorCompression, WeaverConfig
+from .tensor_transport import MultipartLayout, TensorPack, decompress_zstd_tensor_pack
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +136,38 @@ async def async_stream_download_to_file(
     return written
 
 
+async def _await_blocking_io(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Finish one in-flight file operation before propagating cancellation."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        except BaseException:
+            pass
+        raise
+
+
+async def _open_temporary_file() -> BinaryIO:
+    """Open a temporary file off-loop without leaking it on cancellation."""
+
+    task = asyncio.create_task(asyncio.to_thread(tempfile.TemporaryFile, mode="w+b"))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.add_done_callback(_close_completed_file)
+        raise
+
+
+def _close_completed_file(task: "asyncio.Task[BinaryIO]") -> None:
+    try:
+        task.result().close()
+    except BaseException:
+        pass
+
+
 class AsyncAPIClient:
     """Thin wrapper around ``httpx.AsyncClient`` with Weaver-specific behaviour."""
 
@@ -197,6 +236,117 @@ class AsyncAPIClient:
         max_retries: int | None = None,
     ) -> Any:
         return await self._request("POST", path, params=params, json=json, max_retries=max_retries)
+
+    async def post_tensor_multipart(
+        self,
+        path: str,
+        *,
+        request: Mapping[str, Any],
+        tensor_pack: TensorPack,
+    ) -> Any:
+        """Submit one non-retryable operation with a binary tensor attachment."""
+
+        layout = MultipartLayout(request, tensor_pack)
+        model_id = extract_model_id_from_path(path)
+        with self._tracer.start_as_current_span("weaver.post", kind=trace.SpanKind.CLIENT) as span:
+            apply_request_span_attributes(span, "POST", path, model_id)
+            self._ensure_fresh_client()
+            headers = dict(self._client.headers or {})
+            headers["Content-Type"] = layout.content_type
+            headers["Content-Length"] = str(layout.content_length)
+            inject(headers)
+            try:
+                response = await self._client.request(
+                    "POST",
+                    path,
+                    content=layout.async_stream(),
+                    headers=headers,
+                )
+                span.set_attribute("http.status_code", response.status_code)
+                if not response.is_success:
+                    span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                    raise_for_response(response)
+                span.set_status(Status(StatusCode.OK))
+                if response.status_code == httpx.codes.NO_CONTENT or not response.content:
+                    return None
+                return response.json()
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
+
+    async def download_tensor_pack(
+        self,
+        operation_id: str,
+        destination: BinaryIO,
+        *,
+        size_bytes: int,
+        sha256: str,
+        codec: TensorCompression = "raw",
+        decoded_size_bytes: int | None = None,
+    ) -> None:
+        """Download one bounded, verified operation result tensor pack."""
+
+        path = f"/api/v1/operations/{operation_id}/tensor-pack"
+        expected_digest, expected_decoded_size = _validate_tensor_pack_download(
+            size_bytes, sha256, codec, decoded_size_bytes
+        )
+        digest = hashlib.sha256()
+        received = 0
+        compressed = await _open_temporary_file() if codec == "zstd" else None
+        wire_destination = compressed if compressed is not None else destination
+        with self._tracer.start_as_current_span("weaver.get", kind=trace.SpanKind.CLIENT) as span:
+            apply_request_span_attributes(span, "GET", path, None)
+            self._ensure_fresh_client()
+            headers = dict(self._client.headers or {})
+            headers["Accept-Encoding"] = "identity"
+            inject(headers)
+            try:
+                async with self._client.stream("GET", path, headers=headers) as response:
+                    span.set_attribute("http.status_code", response.status_code)
+                    if not response.is_success:
+                        await response.aread()
+                        span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                        raise_for_response(response)
+                    _validate_tensor_pack_response_length(response, size_bytes)
+                    _validate_tensor_pack_response_metadata(
+                        response,
+                        codec=codec,
+                        decoded_size_bytes=expected_decoded_size,
+                    )
+                    async for chunk in response.aiter_raw(chunk_size=TENSOR_PACK_CHUNK_BYTES):
+                        if received + len(chunk) > size_bytes:
+                            raise ValueError(
+                                f"downloaded tensor pack exceeds expected {size_bytes} bytes"
+                            )
+                        await _await_blocking_io(wire_destination.write, chunk)
+                        digest.update(chunk)
+                        received += len(chunk)
+                if received != size_bytes:
+                    raise ValueError(
+                        f"downloaded tensor pack has {received} bytes, expected {size_bytes}"
+                    )
+                if digest.hexdigest() != expected_digest:
+                    raise ValueError(
+                        "downloaded tensor pack SHA-256 does not match operation metadata"
+                    )
+                await _await_blocking_io(wire_destination.flush)
+                await _await_blocking_io(wire_destination.seek, 0)
+                if compressed is not None:
+                    await _await_blocking_io(
+                        decompress_zstd_tensor_pack,
+                        compressed,
+                        destination,
+                        expected_decoded_size,
+                    )
+                span.set_status(Status(StatusCode.OK))
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
+            finally:
+                if compressed is not None:
+                    await _await_blocking_io(compressed.close)
 
     async def patch(self, path: str, *, json: Any) -> Any:
         return await self._request("PATCH", path, json=json)

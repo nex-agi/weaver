@@ -12,16 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pure request/response helpers shared by the sync and async clients.
-
-Keeping these IO-free and tokenizer-free means the synchronous and asyncio
-client implementations build identical payloads from a single source of truth.
-"""
+"""Request/response helpers shared by the sync and async clients."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, BinaryIO, Dict, List, Mapping, Sequence
 
+from .config import TensorCompression, TensorTransport
+from .tensor_transport import PreparedOperationBody, serialize_training_data
 from .types import Datum
 
 if TYPE_CHECKING:
@@ -61,6 +59,94 @@ def build_request_metadata(
 
 def serialize_data(data: Sequence[Datum]) -> List[Dict[str, Any]]:
     return [datum.to_payload() for datum in data]
+
+
+def _prepare_training_operation(
+    *,
+    input_key: str,
+    model_id: str,
+    seq_id: int,
+    data: Sequence[Datum],
+    loss_fn: str,
+    loss_fn_config: Mapping[str, Any] | None,
+    request_metadata: Dict[str, Any] | None,
+    tensor_transport: TensorTransport,
+    tensor_compression: TensorCompression,
+) -> PreparedOperationBody:
+    serialized = serialize_training_data(
+        data,
+        loss_fn=loss_fn,
+        transport=tensor_transport,
+        compression=tensor_compression,
+    )
+    payload: Dict[str, Any] = {
+        "model_id": model_id,
+        "seq_id": seq_id,
+        "tensor_transport": tensor_transport,
+        input_key: {
+            "loss_fn": loss_fn,
+            "data": serialized.data,
+        },
+    }
+    if tensor_transport == "http-binary":
+        payload["tensor_compression"] = tensor_compression
+    if loss_fn_config:
+        payload[input_key]["loss_fn_config"] = dict(loss_fn_config)
+    if request_metadata:
+        payload["metadata"] = request_metadata
+    return PreparedOperationBody({"payload": payload}, serialized.tensor_pack)
+
+
+def prepare_forward_operation(
+    *,
+    model_id: str,
+    seq_id: int,
+    data: Sequence[Datum],
+    loss_fn: str,
+    loss_fn_config: Mapping[str, Any] | None,
+    request_metadata: Dict[str, Any] | None,
+    tensor_transport: TensorTransport,
+    tensor_compression: TensorCompression = "raw",
+) -> PreparedOperationBody:
+    """Prepare a forward operation and optional HTTP tensor attachment."""
+
+    return _prepare_training_operation(
+        input_key="forward_input",
+        model_id=model_id,
+        seq_id=seq_id,
+        data=data,
+        loss_fn=loss_fn,
+        loss_fn_config=loss_fn_config,
+        request_metadata=request_metadata,
+        tensor_transport=tensor_transport,
+        tensor_compression=tensor_compression,
+    )
+
+
+def prepare_forward_backward_operation(
+    *,
+    model_id: str,
+    seq_id: int,
+    data: Sequence[Datum],
+    loss_fn: str,
+    loss_fn_config: Mapping[str, Any] | None,
+    request_metadata: Dict[str, Any] | None,
+    tensor_transport: TensorTransport,
+    tensor_compression: TensorCompression = "raw",
+) -> PreparedOperationBody:
+    """Prepare a forward/backward operation and optional HTTP tensor attachment."""
+
+    return _prepare_training_operation(
+        input_key="forward_backward_input",
+        model_id=model_id,
+        seq_id=seq_id,
+        data=data,
+        loss_fn=loss_fn,
+        loss_fn_config=loss_fn_config,
+        request_metadata=request_metadata,
+        tensor_transport=tensor_transport,
+        tensor_compression=tensor_compression,
+    )
 
 
 def forward_payload(
@@ -106,7 +192,10 @@ def forward_backward_payload(
 
 
 def parse_logprob_tensors(
-    fwd_result: Dict[str, Any], data: Sequence[Datum]
+    fwd_result: Dict[str, Any],
+    data: Sequence[Datum],
+    *,
+    tensor_pack: BinaryIO | None = None,
 ) -> List["torch.Tensor"]:
     """Extract per-datum logprob tensors (``requires_grad=True``) from a forward result."""
     import torch
@@ -119,12 +208,21 @@ def parse_logprob_tensors(
 
     logprob_tensors: List[torch.Tensor] = []
     for output in outputs:
-        lp = output.get("logprobs") or output.get("Logprobs")
-        if isinstance(lp, dict):
+        lp = output.get("logprobs")
+        if lp is None:
+            lp = output.get("Logprobs")
+        if isinstance(lp, dict) and "$tensor" in lp:
+            if tensor_pack is None:
+                raise ValueError("HTTP tensor logprobs require the operation tensor pack")
+            from .tensor_transport import materialize_http_tensor
+
+            lp = materialize_http_tensor(lp, tensor_pack)
+        elif isinstance(lp, dict):
             lp = lp["data"]
         if lp is None:
             raise ValueError("Missing logprobs in forward/backward output")
-        logprob_tensors.append(torch.tensor(lp, dtype=torch.float32).requires_grad_(True))
+        tensor = torch.as_tensor(lp, dtype=torch.float32).detach().clone()
+        logprob_tensors.append(tensor.requires_grad_(True))
     return logprob_tensors
 
 

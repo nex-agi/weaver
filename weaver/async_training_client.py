@@ -30,23 +30,39 @@ import asyncio
 import logging
 import math
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Sequence,
+    Tuple,
+    overload,
+)
 
 from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
+from ._async_http import _await_blocking_io, _open_temporary_file
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
     build_request_metadata,
     build_surrogate_data,
-    forward_backward_payload,
-    forward_payload,
     parse_logprob_tensors,
+    prepare_forward_backward_operation,
+    prepare_forward_operation,
 )
 from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle, build_async_operation_handle
+from .tensor_transport import (
+    PreparedOperationBody,
+    result_tensor_pack_metadata,
+    result_uses_http_tensor_pack,
+)
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.deployment import Deployment
@@ -61,6 +77,31 @@ if TYPE_CHECKING:
     from .types.router_replay import RouterReplayMetadata
 
 logger = logging.getLogger(__name__)
+
+
+def _close_prepared_payload(task: "asyncio.Task[PreparedOperationBody]") -> None:
+    """Release a payload whose background build outlived its caller."""
+
+    try:
+        task.result().close()
+    except BaseException:
+        pass
+
+
+async def _build_training_payload(
+    builder: Callable[..., PreparedOperationBody],
+    **kwargs: Any,
+) -> PreparedOperationBody:
+    """Build an async request without blocking the loop on pack file I/O."""
+
+    if kwargs.get("loss_fn") == "cross_entropy" and kwargs.get("tensor_transport") != "default":
+        task = asyncio.create_task(asyncio.to_thread(builder, **kwargs))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(_close_prepared_payload)
+            raise
+    return builder(**kwargs)
 
 
 class AsyncTrainingClient:
@@ -131,6 +172,15 @@ class AsyncTrainingClient:
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
 
+    async def _enqueue_prepared(
+        self, path: str, prepared: PreparedOperationBody
+    ) -> AsyncOperationHandle:
+        if prepared.tensor_pack is None:
+            return await self._service.enqueue_operation(path, prepared.body)
+        return await self._service.enqueue_operation(
+            path, prepared.body, tensor_pack=prepared.tensor_pack
+        )
+
     @overload
     async def forward(
         self,
@@ -178,18 +228,22 @@ class AsyncTrainingClient:
             wait: If True (default), awaits completion and returns the result dict;
                 if False, returns an ``AsyncOperationHandle`` immediately.
         """
-        payload = forward_payload(
+        payload = await _build_training_payload(
+            prepare_forward_operation,
             model_id=self.model_id,
             seq_id=self._next_seq(),
             data=data,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
             request_metadata=build_request_metadata(metadata, router_replay),
+            tensor_transport=self._service.tensor_transport,
+            tensor_compression=self._service.tensor_compression,
         )
-        handle = await self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/forward-passes",
-            {"payload": payload},
-        )
+        try:
+            path = f"/api/v1/models/{self.model_id}/forward-passes"
+            handle = await self._enqueue_prepared(path, payload)
+        finally:
+            payload.close()
         return await handle.result() if wait else handle
 
     @overload
@@ -239,18 +293,22 @@ class AsyncTrainingClient:
             wait: If True (default), awaits completion and returns the result dict;
                 if False, returns an ``AsyncOperationHandle`` immediately.
         """
-        payload = forward_backward_payload(
+        payload = await _build_training_payload(
+            prepare_forward_backward_operation,
             model_id=self.model_id,
             seq_id=self._next_seq(),
             data=data,
             loss_fn=loss_fn,
             loss_fn_config=loss_fn_config,
             request_metadata=build_request_metadata(metadata, router_replay),
+            tensor_transport=self._service.tensor_transport,
+            tensor_compression=self._service.tensor_compression,
         )
-        handle = await self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/forward-backward-passes",
-            {"payload": payload},
-        )
+        try:
+            path = f"/api/v1/models/{self.model_id}/forward-backward-passes"
+            handle = await self._enqueue_prepared(path, payload)
+        finally:
+            payload.close()
         return await handle.result() if wait else handle
 
     async def forward_backward_custom(
@@ -269,15 +327,34 @@ class AsyncTrainingClient:
         user-computed gradients. See
         :meth:`weaver.training_client.TrainingClient.forward_backward_custom`.
         """
-        # Step A: forward pass to get logprobs
-        fwd_result = await self.forward(
-            data, "forward_logprob", loss_fn_config=loss_fn_config, wait=True
+        fwd_handle = await self.forward(
+            data, "forward_logprob", loss_fn_config=loss_fn_config, wait=False
         )
+        fwd_result = await fwd_handle.result()
 
-        # Step B: parse logprobs from response
-        logprob_tensors = parse_logprob_tensors(fwd_result, data)
+        if result_uses_http_tensor_pack(fwd_result):
+            tensor_pack = await _open_temporary_file()
+            try:
+                metadata = result_tensor_pack_metadata(fwd_result)
+                await fwd_handle.client.download_tensor_pack(
+                    fwd_handle.operation_id,
+                    tensor_pack,
+                    size_bytes=metadata.size_bytes,
+                    sha256=metadata.sha256,
+                    codec=metadata.codec,
+                    decoded_size_bytes=metadata.decoded_size_bytes,
+                )
+                logprob_tensors = await _await_blocking_io(
+                    parse_logprob_tensors,
+                    fwd_result,
+                    data,
+                    tensor_pack=tensor_pack,
+                )
+            finally:
+                await _await_blocking_io(tensor_pack.close)
+        else:
+            logprob_tensors = await _await_blocking_io(parse_logprob_tensors, fwd_result, data)
 
-        # Step C: run user's loss function
         try:
             loss, metrics = loss_fn(data, logprob_tensors)
         except Exception as exc:
@@ -286,18 +363,11 @@ class AsyncTrainingClient:
         if loss.dim() != 0:
             raise ValueError(f"loss_fn must return a scalar loss, got shape {loss.shape}")
 
-        # Step D: backprop through user graph into logprob tensors
         loss.backward()
-
-        # Step E: build surrogate Datum objects from the propagated gradients
         surrogate_data = build_surrogate_data(data, logprob_tensors)
-
-        # Step F: surrogate backward pass
         await self.forward_backward(
             surrogate_data, "surrogate", loss_fn_config=loss_fn_config, wait=True
         )
-
-        # Step G: return loss and metrics
         return {"loss": loss.detach(), "metrics": metrics}
 
     @overload

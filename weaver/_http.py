@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Any, BinaryIO, Mapping, MutableMapping
 
@@ -29,7 +31,8 @@ from opentelemetry.trace import Status, StatusCode
 
 from . import __version__
 from ._telemetry import get_tracer
-from .config import WeaverConfig
+from .config import TensorCompression, WeaverConfig
+from .tensor_transport import MultipartLayout, TensorPack, decompress_zstd_tensor_pack
 
 USER_AGENT: str = f"weaver-sdk/{__version__}"  # type: ignore[has-type]
 
@@ -38,6 +41,7 @@ DEFAULT_TIMEOUT = httpx.Timeout(timeout=60, connect=5.0)
 DEFAULT_MAX_RETRIES = 10
 DEFAULT_CONNECTION_RETRIES = 3
 DEFAULT_CONNECTION_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=20)
+TENSOR_PACK_CHUNK_BYTES = 8 * 1024 * 1024
 
 INITIAL_RETRY_DELAY = 0.5
 MAX_RETRY_DELAY = 10.0
@@ -312,6 +316,79 @@ def stream_download_to_file(
     return written
 
 
+def _validate_tensor_pack_expectation(size_bytes: int, sha256: str) -> str:
+    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+        raise ValueError("tensor pack size_bytes must be a non-negative integer")
+    if not isinstance(sha256, str) or len(sha256) != 64:
+        raise ValueError("tensor pack sha256 must be a SHA-256 hex digest")
+    try:
+        bytes.fromhex(sha256)
+    except ValueError as exc:
+        raise ValueError("tensor pack sha256 must be a SHA-256 hex digest") from exc
+    return sha256.lower()
+
+
+def _validate_tensor_pack_download(
+    size_bytes: int,
+    sha256: str,
+    codec: TensorCompression,
+    decoded_size_bytes: int | None,
+) -> tuple[str, int]:
+    digest = _validate_tensor_pack_expectation(size_bytes, sha256)
+    if codec not in {"raw", "zstd"}:
+        raise ValueError("tensor pack codec must be 'raw' or 'zstd'")
+    decoded_size = size_bytes if decoded_size_bytes is None else decoded_size_bytes
+    if isinstance(decoded_size, bool) or not isinstance(decoded_size, int) or decoded_size < 0:
+        raise ValueError("tensor pack decoded_size_bytes must be a non-negative integer")
+    if codec == "raw" and decoded_size != size_bytes:
+        raise ValueError("raw tensor pack decoded_size_bytes must equal size_bytes")
+    return digest, decoded_size
+
+
+def _validate_tensor_pack_response_length(response: httpx.Response, expected: int) -> None:
+    raw_length = response.headers.get("Content-Length")
+    if raw_length is None:
+        raise ValueError("tensor pack response is missing Content-Length")
+    try:
+        content_length = int(raw_length)
+    except ValueError as exc:
+        raise ValueError("tensor pack response has invalid Content-Length") from exc
+    if content_length != expected:
+        raise ValueError(
+            f"tensor pack response Content-Length is {content_length}, expected {expected}"
+        )
+
+
+def _validate_tensor_pack_response_metadata(
+    response: httpx.Response,
+    *,
+    codec: TensorCompression,
+    decoded_size_bytes: int,
+) -> None:
+    response_codec = response.headers.get("X-Weaver-Tensor-Codec", "raw")
+    if response_codec not in {"raw", "zstd"}:
+        raise ValueError(f"tensor pack response has unsupported codec {response_codec!r}")
+    raw_decoded_size = response.headers.get("X-Weaver-Tensor-Decoded-Size")
+    if raw_decoded_size is None:
+        if response_codec != "raw":
+            raise ValueError("zstd tensor pack response is missing decoded size")
+        response_decoded_size = int(response.headers["Content-Length"])
+    else:
+        try:
+            response_decoded_size = int(raw_decoded_size)
+        except ValueError as exc:
+            raise ValueError("tensor pack response has invalid decoded size") from exc
+        if response_decoded_size < 0:
+            raise ValueError("tensor pack response has invalid decoded size")
+    if response_codec != codec:
+        raise ValueError(f"tensor pack response codec is {response_codec!r}, expected {codec!r}")
+    if response_decoded_size != decoded_size_bytes:
+        raise ValueError(
+            "tensor pack response decoded size is "
+            f"{response_decoded_size}, expected {decoded_size_bytes}"
+        )
+
+
 class APIClient:
     """Thin wrapper around httpx.Client with Weaver-specific behavior."""
 
@@ -390,6 +467,116 @@ class APIClient:
         max_retries: int | None = None,
     ) -> Any:
         return self._request("POST", path, params=params, json=json, max_retries=max_retries)
+
+    def post_tensor_multipart(
+        self,
+        path: str,
+        *,
+        request: Mapping[str, Any],
+        tensor_pack: TensorPack,
+    ) -> Any:
+        """Submit one non-retryable operation with a binary tensor attachment."""
+
+        layout = MultipartLayout(request, tensor_pack)
+        model_id = self._extract_model_id_from_path(path)
+        with self._tracer.start_as_current_span("weaver.post", kind=trace.SpanKind.CLIENT) as span:
+            apply_request_span_attributes(span, "POST", path, model_id)
+            self._ensure_fresh_client()
+            headers = dict(self._client.headers or {})
+            headers["Content-Type"] = layout.content_type
+            headers["Content-Length"] = str(layout.content_length)
+            inject(headers)
+            try:
+                response = self._client.request(
+                    "POST",
+                    path,
+                    content=layout.sync_stream(),
+                    headers=headers,
+                )
+                span.set_attribute("http.status_code", response.status_code)
+                if not response.is_success:
+                    span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                    self._raise_error(response)
+                span.set_status(Status(StatusCode.OK))
+                if response.status_code == httpx.codes.NO_CONTENT or not response.content:
+                    return None
+                return response.json()
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
+
+    def download_tensor_pack(
+        self,
+        operation_id: str,
+        destination: BinaryIO,
+        *,
+        size_bytes: int,
+        sha256: str,
+        codec: TensorCompression = "raw",
+        decoded_size_bytes: int | None = None,
+    ) -> None:
+        """Download one bounded, verified operation result tensor pack."""
+
+        path = f"/api/v1/operations/{operation_id}/tensor-pack"
+        expected_digest, expected_decoded_size = _validate_tensor_pack_download(
+            size_bytes, sha256, codec, decoded_size_bytes
+        )
+        digest = hashlib.sha256()
+        received = 0
+        compressed = tempfile.TemporaryFile(mode="w+b") if codec == "zstd" else None
+        wire_destination = compressed if compressed is not None else destination
+        with self._tracer.start_as_current_span("weaver.get", kind=trace.SpanKind.CLIENT) as span:
+            apply_request_span_attributes(span, "GET", path, None)
+            self._ensure_fresh_client()
+            headers = dict(self._client.headers or {})
+            headers["Accept-Encoding"] = "identity"
+            inject(headers)
+            try:
+                with self._client.stream("GET", path, headers=headers) as response:
+                    span.set_attribute("http.status_code", response.status_code)
+                    if not response.is_success:
+                        response.read()
+                        span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                        self._raise_error(response)
+                    _validate_tensor_pack_response_length(response, size_bytes)
+                    _validate_tensor_pack_response_metadata(
+                        response,
+                        codec=codec,
+                        decoded_size_bytes=expected_decoded_size,
+                    )
+                    for chunk in response.iter_raw(chunk_size=TENSOR_PACK_CHUNK_BYTES):
+                        if received + len(chunk) > size_bytes:
+                            raise ValueError(
+                                f"downloaded tensor pack exceeds expected {size_bytes} bytes"
+                            )
+                        wire_destination.write(chunk)
+                        digest.update(chunk)
+                        received += len(chunk)
+                if received != size_bytes:
+                    raise ValueError(
+                        f"downloaded tensor pack has {received} bytes, expected {size_bytes}"
+                    )
+                if digest.hexdigest() != expected_digest:
+                    raise ValueError(
+                        "downloaded tensor pack SHA-256 does not match operation metadata"
+                    )
+                wire_destination.flush()
+                wire_destination.seek(0)
+                if compressed is not None:
+                    decompress_zstd_tensor_pack(
+                        compressed,
+                        destination,
+                        expected_decoded_size,
+                    )
+                span.set_status(Status(StatusCode.OK))
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
+            finally:
+                if compressed is not None:
+                    compressed.close()
 
     def patch(self, path: str, *, json: Any) -> Any:
         return self._request("PATCH", path, json=json)

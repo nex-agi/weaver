@@ -26,6 +26,8 @@ def test_config_defaults():
     config = WeaverConfig()
     assert config.base_url == "https://weaver-console.nex-agi.cn"
     assert config.api_key is None
+    assert config.tensor_transport == "default"
+    assert config.tensor_compression == "raw"
 
 
 def test_config_from_kwargs():
@@ -42,23 +44,58 @@ def test_config_from_env(monkeypatch):
     """Test config loading from environment variables."""
     monkeypatch.setenv("WEAVER_BASE_URL", "https://env.example.com")
     monkeypatch.setenv("WEAVER_API_KEY", "sk-env-key")
+    monkeypatch.setenv("WEAVER_TENSOR_TRANSPORT", "http-binary")
+    monkeypatch.setenv("WEAVER_TENSOR_COMPRESSION", "zstd")
 
     config = WeaverConfig.from_env()
     assert config.base_url == "https://env.example.com"
     assert config.api_key == "sk-env-key"
+    assert config.tensor_transport == "http-binary"
+    assert config.tensor_compression == "zstd"
 
 
 def test_config_kwargs_override_env(monkeypatch):
     """Test that kwargs override environment variables."""
     monkeypatch.setenv("WEAVER_BASE_URL", "https://env.example.com")
     monkeypatch.setenv("WEAVER_API_KEY", "sk-env-key")
+    monkeypatch.setenv("WEAVER_TENSOR_TRANSPORT", "http-binary")
+    monkeypatch.setenv("WEAVER_TENSOR_COMPRESSION", "zstd")
 
     config = WeaverConfig.from_env(
         base_url="https://override.example.com",
         api_key="sk-override-key",
+        tensor_transport="default",
+        tensor_compression="raw",
     )
     assert config.base_url == "https://override.example.com"
     assert config.api_key == "sk-override-key"
+    assert config.tensor_transport == "default"
+    assert config.tensor_compression == "raw"
+
+
+def test_config_rejects_unknown_tensor_transport(monkeypatch):
+    monkeypatch.setenv("WEAVER_TENSOR_TRANSPORT", "magic")
+
+    with pytest.raises(ValueError, match="Unsupported tensor transport"):
+        WeaverConfig.from_env()
+
+    with pytest.raises(ValueError, match="Unsupported tensor transport"):
+        WeaverConfig(tensor_transport="magic")  # type: ignore[arg-type]
+
+
+def test_config_rejects_unknown_tensor_compression(monkeypatch):
+    monkeypatch.setenv("WEAVER_TENSOR_COMPRESSION", "magic")
+
+    with pytest.raises(ValueError, match="Unsupported tensor compression"):
+        WeaverConfig.from_env()
+
+    with pytest.raises(ValueError, match="Unsupported tensor compression"):
+        WeaverConfig(tensor_compression="magic")  # type: ignore[arg-type]
+
+
+def test_config_rejects_compression_without_http_transport():
+    with pytest.raises(ValueError, match="requires tensor_transport"):
+        WeaverConfig(tensor_compression="zstd")
 
 
 def test_require_auth_with_credentials():
