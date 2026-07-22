@@ -15,6 +15,11 @@
 """Tests for the asyncio client stack (AsyncAPIClient + AsyncOperationHandle)."""
 
 import asyncio
+import atexit as _atexit
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -22,6 +27,7 @@ import pytest
 
 from weaver import _async_http
 from weaver._async_http import AsyncAPIClient
+from weaver.async_service_client import AsyncServiceClient
 from weaver.config import WeaverConfig
 from weaver.operations import AsyncOperationHandle, WeaverOperationError
 
@@ -223,3 +229,176 @@ class TestAsyncOperationHandle:
             return await AsyncOperationHandle.wait_all(handles)
 
         assert asyncio.run(run()) == [0, 1, 2]
+
+
+# ---------------------------------------------------------------------------
+# AsyncServiceClient atexit safety net (parity with sync ServiceClient)
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncAtexit:
+    """The async client must terminate created models on exit, like the sync one."""
+
+    def test_handler_terminates_created_models_on_fresh_client(self, monkeypatch):
+        """The atexit handler spins a throwaway loop + fresh client and reuses
+        ``terminate_model`` for every created model."""
+        svc = AsyncServiceClient(base_url="https://test.example.com", api_key="sk-test")
+        svc._created_models = ["m1", "m2"]
+
+        fresh = MagicMock()
+        fresh.post = AsyncMock(return_value={})
+        fresh.aclose = AsyncMock()
+        monkeypatch.setattr("weaver.async_service_client.AsyncAPIClient", lambda config: fresh)
+
+        svc._atexit_terminate_created_models()
+
+        posted_paths = [call.args[0] for call in fresh.post.call_args_list]
+        assert posted_paths == [
+            "/api/v1/models/m1/terminate",
+            "/api/v1/models/m2/terminate",
+        ]
+        fresh.aclose.assert_awaited_once()
+        assert svc._closed is True
+        assert svc._http is None  # fresh client is dropped after use
+
+    def test_handler_is_noop_after_aclose(self, monkeypatch):
+        svc = AsyncServiceClient(base_url="https://test.example.com", api_key="sk-test")
+        svc._created_models = ["m1"]
+        svc._closed = True
+
+        factory = MagicMock()
+        monkeypatch.setattr("weaver.async_service_client.AsyncAPIClient", factory)
+
+        svc._atexit_terminate_created_models()
+
+        factory.assert_not_called()  # already closed -> nothing to do
+
+    def test_handler_is_noop_without_created_models(self, monkeypatch):
+        svc = AsyncServiceClient(base_url="https://test.example.com", api_key="sk-test")
+
+        factory = MagicMock()
+        monkeypatch.setattr("weaver.async_service_client.AsyncAPIClient", factory)
+
+        svc._atexit_terminate_created_models()
+
+        factory.assert_not_called()
+
+    def test_connect_registers_and_aclose_unregisters(self, monkeypatch):
+        svc = AsyncServiceClient(base_url="https://test.example.com", api_key="sk-test")
+
+        registered: list = []
+        unregistered: list = []
+        monkeypatch.setattr(_atexit, "register", lambda fn: registered.append(fn))
+        monkeypatch.setattr(_atexit, "unregister", lambda fn: unregistered.append(fn))
+
+        svc._register_atexit()
+        assert svc._atexit_registered is True
+        assert registered == [svc._atexit_terminate_created_models]
+
+        asyncio.run(svc.aclose())
+        assert svc._atexit_registered is False
+        assert unregistered == [svc._atexit_terminate_created_models]
+
+
+def _build_async_atexit_script(marker_path: str, exit_code: str = "") -> str:
+    """Build a subprocess script that verifies the atexit handler terminates
+    created models when the process exits without ``aclose()``.
+
+    Runs a real in-process HTTP server so the handler's throwaway-loop request
+    path is exercised end-to-end; the server appends to ``marker_path`` whenever
+    a ``/terminate`` is received.
+    """
+    return f"""
+import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from weaver.async_service_client import AsyncServiceClient
+
+MARKER = {marker_path!r}
+
+
+class _H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, payload):
+        body = json.dumps(payload).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        self.rfile.read(length)
+        path = self.path
+        if path.endswith("/terminate"):
+            with open(MARKER, "a") as fh:
+                fh.write(path + chr(10))
+            return self._send({{}})
+        if path == "/api/v1/sessions":
+            return self._send({{"id": "sess-1"}})
+        if path.endswith("/models"):
+            return self._send({{"id": "model-xyz", "base_model": "x"}})
+        return self._send({{}})
+
+    def do_GET(self):
+        return self._send({{"items": []}})
+
+    def log_message(self, *a, **k):
+        return
+
+
+httpd = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+threading.Thread(target=httpd.serve_forever, daemon=True).start()
+host, port = httpd.server_address
+base_url = "http://%s:%d" % (host, port)
+
+
+async def setup():
+    client = AsyncServiceClient(base_url=base_url, api_key="sk-test", heartbeat_interval=1000)
+    await client.connect()
+    await client.create_model(base_model="x", training_mode="full_ft")
+    # NOTE: deliberately no `await client.aclose()` -> exercise the atexit net.
+
+
+asyncio.run(setup())
+{exit_code}
+"""
+
+
+def test_atexit_terminates_created_models_on_normal_exit():
+    """A process that creates a model via AsyncServiceClient and exits without
+    aclose() must still terminate the model through the atexit handler."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = Path(tmpdir) / "terminated.marker"
+        result = subprocess.run(
+            [sys.executable, "-c", _build_async_atexit_script(str(marker))],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, f"subprocess failed: {result.stderr}"
+        assert marker.exists(), "no /terminate sent on normal exit"
+        assert "/models/model-xyz/terminate" in marker.read_text()
+
+
+def test_atexit_terminates_created_models_on_exception_exit():
+    """The atexit safety net must also fire on an unhandled-exception exit."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        marker = Path(tmpdir) / "terminated.marker"
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _build_async_atexit_script(str(marker), 'raise RuntimeError("boom")'),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode != 0
+        assert marker.exists(), "no /terminate sent on exception exit"
+        assert "/models/model-xyz/terminate" in marker.read_text()

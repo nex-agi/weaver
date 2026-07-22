@@ -51,14 +51,27 @@ Integrating without hangs:
   it repeatedly.
 * **Always close** via ``async with`` or ``await svc.aclose()`` so the heartbeat
   task is cancelled before the loop closes (otherwise asyncio cancels it at
-  shutdown and may log a "Task was destroyed but it is pending" warning).
+  shutdown and may log a "Task was destroyed but it is pending" warning), and so
+  models created through this client are terminated promptly (see below).
 * **Multiple threads**: give each thread its own loop and its own client, or
   marshal calls onto the owning loop with ``asyncio.run_coroutine_threadsafe``.
+
+atexit safety net
+~~~~~~~~~~~~~~~~~
+For parity with the sync ``ServiceClient``, ``connect()`` registers an
+``atexit`` handler that terminates any models this client created if the process
+exits without an explicit ``aclose()``. Because the owning loop is usually
+already closed at interpreter shutdown, the handler creates a **throwaway** event
+loop and a fresh ``AsyncAPIClient`` solely to fire the terminate requests — the
+library still never runs coroutines on the caller's loop. Prefer ``async with``
+or ``await svc.aclose()``: the atexit path is only a best-effort backstop and,
+like the sync client, does not cover ``SIGKILL`` (the server-side reaper does).
 """
 
 from __future__ import annotations
 
 import asyncio
+import atexit
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
@@ -112,6 +125,7 @@ class AsyncServiceClient:
         self._sampling_seq_counter = 1
         self._operation_seq_by_model: Dict[str, int] = {}
         self._created_models: List[str] = []
+        self._atexit_registered = False
 
     async def __aenter__(self) -> "AsyncServiceClient":
         await self.connect()
@@ -135,6 +149,7 @@ class AsyncServiceClient:
         else:
             await self.ensure_session()
         self._start_heartbeat()
+        self._register_atexit()
 
     async def _ensure_connected(self) -> None:
         if self._http is None:
@@ -154,7 +169,66 @@ class AsyncServiceClient:
             json=payload if payload else None,
         )
 
+    def _register_atexit(self) -> None:
+        """Register a best-effort atexit safety net (sync-client parity).
+
+        Mirrors ``ServiceClient.connect()``'s ``atexit.register(self.close)``: on
+        interpreter shutdown, models created through this client are terminated
+        even if the caller forgot to ``await aclose()`` or use ``async with``.
+        """
+        if self._atexit_registered:
+            return
+        atexit.register(self._atexit_terminate_created_models)
+        self._atexit_registered = True
+
+    def _atexit_terminate_created_models(self) -> None:
+        """Terminate created models at interpreter shutdown (best-effort).
+
+        Runs from ``atexit``, where the client's owning event loop is typically
+        already closed, so we cannot ``await aclose()`` on it. Instead we spin up
+        a throwaway loop with a fresh HTTP client and fire the terminate
+        requests. This is the async twin of the sync client's
+        ``atexit.register(self.close)`` safety net. It does not cover ``SIGKILL``;
+        the server-side reaper remains the backstop for that.
+        """
+        if self._closed or not self._created_models:
+            return
+        self._closed = True
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(self._terminate_created_models_isolated())
+            finally:
+                loop.close()
+        except Exception as exc:  # pragma: no cover - best effort cleanup
+            logger.debug("atexit model cleanup failed: %s", exc)
+
+    async def _terminate_created_models_isolated(self) -> None:
+        """Terminate every created model on a fresh HTTP client.
+
+        Used only by the atexit safety net: the original ``AsyncAPIClient`` is
+        bound to the (now closed) owning loop, so a fresh client is created on
+        the throwaway loop to issue the terminate requests. Reuses
+        :meth:`terminate_model` so the request logic is not forked.
+        """
+        self._http = AsyncAPIClient(self._config)
+        try:
+            for model_id in list(self._created_models):
+                try:
+                    logger.debug("Terminating model %s during atexit cleanup", model_id)
+                    await self.terminate_model(model_id)
+                except Exception as exc:  # pragma: no cover - best effort cleanup
+                    logger.debug("Failed to terminate model %s: %s", model_id, exc)
+        finally:
+            try:
+                await self._http.aclose()
+            finally:
+                self._http = None
+
     async def aclose(self) -> None:
+        if self._atexit_registered:
+            atexit.unregister(self._atexit_terminate_created_models)
+            self._atexit_registered = False
         if self._closed:
             return
         self._closed = True
