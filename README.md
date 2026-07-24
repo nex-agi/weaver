@@ -42,6 +42,8 @@ walkthrough of the full SDK workflow using a Pig Latin translation task — cove
 preparation, LoRA / full fine-tuning, sampling, and checkpoint management.
 
 For a complete runnable script, see [`examples/pig_latin.py`](examples/pig_latin.py).
+For large packed datasets, [`examples/streaming_sft.py`](examples/streaming_sft.py)
+shows bounded token-budget batching and submit-ahead.
 
 ## Ecosystem
 
