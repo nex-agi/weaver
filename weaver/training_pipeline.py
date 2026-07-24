@@ -281,13 +281,8 @@ class TokenBudgetBatcher(Generic[T]):
                         max_tokens_per_gpu=self._max_tokens_per_gpu,
                     )
                     if previous.microbatches_per_dp == target and previous.dp_safe:
-                        global_capacity = (
-                            self._global_batch_size * self._max_tokens_per_gpu
-                        )
-                        if (
-                            previous.tokens * 100
-                            >= global_capacity * _MIN_SAFE_FILL_PERCENT
-                        ):
+                        global_capacity = self._global_batch_size * self._max_tokens_per_gpu
+                        if previous.tokens * 100 >= global_capacity * _MIN_SAFE_FILL_PERCENT:
                             yield TokenBudgetBatch(tuple(items[:-1]), previous)
                             items = [item]
                             lengths = [length]
