@@ -39,8 +39,35 @@ def test_predict_packed_batch_shape_balances_dp_and_microbatches():
     assert shape.tokens_per_dp == (13, 13)
     assert shape.samples_per_dp == (2, 2)
     assert shape.microbatches_per_dp == 2
+    assert shape.max_microbatch_tokens == 8
     assert shape.global_microbatches == 4
     assert shape.dp_safe
+
+
+def test_predict_packed_batch_shape_detects_second_stage_overflow():
+    shape = predict_packed_batch_shape(
+        [6, 6, 6],
+        dp_size=1,
+        max_tokens_per_gpu=10,
+    )
+
+    assert shape.microbatches_per_dp == 2
+    assert shape.max_microbatch_tokens == 12
+
+
+def test_token_budget_batcher_carries_second_stage_overflow():
+    batches = list(
+        TokenBudgetBatcher(
+            range(4),
+            length_fn=lambda _: 6,
+            global_batch_size=2,
+            dp_size=1,
+            max_tokens_per_gpu=10,
+        )
+    )
+
+    assert [batch.items for batch in batches] == [(0, 1), (2, 3)]
+    assert all(batch.shape.max_microbatch_tokens <= 10 for batch in batches)
 
 
 def test_token_budget_batcher_reads_only_through_next_boundary():
