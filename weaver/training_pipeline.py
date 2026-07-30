@@ -63,6 +63,7 @@ class PackedBatchShape:
         microbatches_per_dp: Synchronized microbatch count on each DP rank.
         samples_per_dp: Source-sample counts assigned to each DP rank.
         tokens_per_dp: Token counts assigned to each DP rank.
+        max_microbatch_tokens: Largest predicted packed microbatch.
     """
 
     samples: int
@@ -70,6 +71,7 @@ class PackedBatchShape:
     microbatches_per_dp: int
     samples_per_dp: tuple[int, ...]
     tokens_per_dp: tuple[int, ...]
+    max_microbatch_tokens: int = 0
 
     @property
     def global_microbatches(self) -> int:
@@ -193,12 +195,18 @@ def predict_packed_batch_shape(
     tokens_per_dp = tuple(sum(lengths[index] for index in part) for part in partitions)
     samples_per_dp = tuple(len(part) for part in partitions)
     microbatches = max(math.ceil(tokens / max_tokens_per_gpu) for tokens in tokens_per_dp)
+    microbatch_tokens: list[int] = []
+    for part in partitions:
+        rank_lengths = [lengths[index] for index in part]
+        for microbatch in _balanced_partitions(rank_lengths, microbatches):
+            microbatch_tokens.append(sum(rank_lengths[index] for index in microbatch))
     return PackedBatchShape(
         samples=len(lengths),
         tokens=sum(lengths),
         microbatches_per_dp=microbatches,
         samples_per_dp=samples_per_dp,
         tokens_per_dp=tokens_per_dp,
+        max_microbatch_tokens=max(microbatch_tokens, default=0),
     )
 
 
@@ -280,7 +288,11 @@ class TokenBudgetBatcher(Generic[T]):
                         dp_size=self._dp_size,
                         max_tokens_per_gpu=self._max_tokens_per_gpu,
                     )
-                    if previous.microbatches_per_dp == target and previous.dp_safe:
+                    if (
+                        previous.microbatches_per_dp == target
+                        and previous.dp_safe
+                        and previous.max_microbatch_tokens <= self._max_tokens_per_gpu
+                    ):
                         global_capacity = self._global_batch_size * self._max_tokens_per_gpu
                         if previous.tokens * 100 >= global_capacity * _MIN_SAFE_FILL_PERCENT:
                             yield TokenBudgetBatch(tuple(items[:-1]), previous)
@@ -301,7 +313,11 @@ class TokenBudgetBatcher(Generic[T]):
             )
             boundary_probes += 1
             if candidate.microbatches_per_dp <= target:
-                if candidate.microbatches_per_dp == target and candidate.dp_safe:
+                if (
+                    candidate.microbatches_per_dp == target
+                    and candidate.dp_safe
+                    and candidate.max_microbatch_tokens <= self._max_tokens_per_gpu
+                ):
                     shape = candidate
                     if boundary_probes >= _MAX_BOUNDARY_PROBES:
                         yield TokenBudgetBatch(tuple(items), shape)
@@ -312,7 +328,9 @@ class TokenBudgetBatcher(Generic[T]):
                         max_length = 0
                         probing_boundary = False
                         boundary_probes = 0
-                continue
+                    continue
+                if shape is None:
+                    continue
 
             overflow_item = items.pop()
             overflow_length = lengths.pop()
@@ -344,12 +362,15 @@ class TokenBudgetBatcher(Generic[T]):
             and final_shape is not None
             and final_shape.microbatches_per_dp == target
             and final_shape.dp_safe
+            and final_shape.max_microbatch_tokens <= self._max_tokens_per_gpu
         ):
             yield TokenBudgetBatch(tuple(items), final_shape)
         elif items and not self._drop_last:
             assert final_shape is not None
             if not final_shape.dp_safe:
                 raise ValueError("incomplete final request is not DP-safe")
+            if final_shape.max_microbatch_tokens > self._max_tokens_per_gpu:
+                raise ValueError("incomplete final request exceeds max_tokens_per_gpu")
             yield TokenBudgetBatch(tuple(items), final_shape)
 
 

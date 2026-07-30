@@ -171,6 +171,8 @@ async def run(args: argparse.Namespace) -> None:
         tokenizer = await asyncio.to_thread(training.get_tokenizer)
         batches = iter(
             TokenBudgetBatcher(
+                # Requires Megatron Bridge balanced packing: TRAINER_MICRO_BATCH_SIZE=0,
+                # matching DP/token budget, and router replay disabled.
                 iter_tokenized_examples(args.data, tokenizer),
                 length_fn=lambda example: len(example.input_tokens),
                 global_batch_size=args.global_batch_size,
