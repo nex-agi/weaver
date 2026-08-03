@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 from . import __version__
 from ._http import APIClient
-from ._utils import extract_id, lookup_case_insensitive
+from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
 from .types import LoraConfig
@@ -72,8 +72,8 @@ class ServiceClient:
         )
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
-        self._organization_id = organization_id
-        self._project_id = project_id
+        self._organization_id = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
+        self._project_id = optional_scope_id(project_id, "WEAVER_PROJECT_ID")
         self._session_user_metadata = dict(user_metadata or {})
         self._heartbeat_interval = heartbeat_interval
 
@@ -100,16 +100,19 @@ class ServiceClient:
             raise RuntimeError("ServiceClient is not connected")
         return self._http
 
-    def connect(self) -> None:
-        if self._http is not None:
+    def connect(self, *, ensure_session: bool = True) -> None:
+        """Connect, optionally without creating or fetching a Session."""
+
+        if self._http is None:
+            self._http = APIClient(self._config)
+            atexit.register(self.close)
+        if not ensure_session or self._session is not None:
             return
-        self._http = APIClient(self._config)
         if self._session_id:
             self._fetch_session(self._session_id)
         else:
             self.ensure_session()
         self._start_heartbeat()
-        atexit.register(self.close)
 
     def terminate_model(
         self,
@@ -461,7 +464,6 @@ class ServiceClient:
     def list_supported_models(self) -> List[str]:
         """Return supported model names exposed by the server."""
         payload = self.http.get("/api/v1/supported-models")
-        print(f"payload: {payload}")
         if not isinstance(payload, dict):
             return []
         items = payload.get("items")
@@ -477,6 +479,32 @@ class ServiceClient:
                 if name:
                     names.append(str(name))
         return names
+
+    def list_organizations(self) -> List[Dict[str, Any]]:
+        """List organizations available to the authenticated user."""
+
+        payload = self.http.get("/api/v1/organizations")
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def list_projects(self, organization_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List projects, falling back to the user's first organization."""
+
+        resolved = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
+        if resolved is None:
+            resolved = self._organization_id
+        if resolved is None:
+            organizations = self.list_organizations()
+            if not organizations:
+                return []
+            resolved = str(organizations[0].get("id", "")).strip() or None
+        if resolved is None:
+            return []
+        payload = self.http.get(f"/api/v1/organizations/{resolved}/projects")
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
 
     def get_supported_model_config(self, base_model: str) -> Optional[Dict[str, Any]]:
         """Get configuration for a specific supported model.
