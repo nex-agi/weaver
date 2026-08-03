@@ -381,21 +381,40 @@ class AsyncServiceClient:
         sampling_session_id: Optional[str] = None,
         model_id: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        experimental_nccl_weight_sync_v1: bool = False,
     ) -> "AsyncSamplingClient":
         from .async_sampling_client import AsyncSamplingClient  # local import to avoid cycles
 
         await self._ensure_connected()
         if sampling_session_id is None:
-            if model_id and not model_path:
-                raise ValueError("model_path is required when model_id is provided")
-            seq_id = sampling_session_seq_id or self._next_sampling_seq()
-            body: Dict[str, Any] = {
-                "sampling_session_seq_id": seq_id,
-                "base_model": base_model,
-                "model_path": model_path,
-            }
-            if model_id:
-                body["model_id"] = model_id
+            if experimental_nccl_weight_sync_v1:
+                if not model_id or not base_model:
+                    raise ValueError(
+                        "experimental NCCL-v1 sampling requires model_id and base_model"
+                    )
+                if model_path:
+                    raise ValueError(
+                        "experimental NCCL-v1 sampling forbids model_path/DCP synchronization"
+                    )
+                seq_id = sampling_session_seq_id or self._next_sampling_seq()
+                from ._payloads import nccl_v1_sampling_session_payload
+
+                body = nccl_v1_sampling_session_payload(
+                    sampling_session_seq_id=seq_id,
+                    base_model=base_model,
+                    model_id=model_id,
+                )
+            else:
+                if model_id and not model_path:
+                    raise ValueError("model_path is required when model_id is provided")
+                seq_id = sampling_session_seq_id or self._next_sampling_seq()
+                body = {
+                    "sampling_session_seq_id": seq_id,
+                    "base_model": base_model,
+                    "model_path": model_path,
+                }
+                if model_id:
+                    body["model_id"] = model_id
 
             resp = await self.http.post(
                 f"/api/v1/sessions/{self.session_id}/sampling-sessions",

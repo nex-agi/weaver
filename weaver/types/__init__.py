@@ -19,6 +19,7 @@ from .datum import Datum
 from .logprobs import LogprobsParams
 from .lora_config import LoraConfig
 from .model_input import ModelInput, ModelInputChunk
+from .nccl_weight_sync import NCCLWeightSyncV1Result
 from .optim import AdamParams
 from .payload_ref import PayloadRef, PayloadRefMaterializationError, materialize_payload_ref
 from .router_replay import (
@@ -52,6 +53,7 @@ __all__ = [
     "LogprobsParams",
     "ModelInput",
     "ModelInputChunk",
+    "NCCLWeightSyncV1Result",
     "PauseMode",
     "PayloadRef",
     "PayloadRefMaterializationError",

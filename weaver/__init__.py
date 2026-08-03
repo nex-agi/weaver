@@ -28,6 +28,7 @@ from .async_sampling_client import AsyncSamplingClient  # noqa: F401
 from .async_service_client import AsyncServiceClient  # noqa: F401
 from .async_training_client import AsyncTrainingClient  # noqa: F401
 from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
+from .types.nccl_weight_sync import NCCLWeightSyncV1Result  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
 
 __all__ = [
@@ -37,6 +38,7 @@ __all__ = [
     "AsyncTrainingClient",
     "AsyncSamplingClient",
     "AsyncOperationHandle",
+    "NCCLWeightSyncV1Result",
     "types",
     "__version__",
 ]

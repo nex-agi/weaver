@@ -26,12 +26,14 @@ from ._payloads import (
     forward_backward_payload,
     forward_payload,
     parse_logprob_tensors,
+    publish_live_weights_nccl_v1_payload,
     serialize_data,
 )
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
+from .types.nccl_weight_sync import NCCLWeightSyncV1Result
 from .types.checkpoint import Checkpoint
 
 if TYPE_CHECKING:
@@ -269,6 +271,69 @@ class TrainingClient:
             {"payload": payload},
         )
         return handle.result() if wait else handle
+
+    @overload
+    def publish_live_weights_to_sampler_nccl_v1(
+        self,
+        sampling_client: "SamplingClient",
+        *,
+        expected_weight_version: str,
+        proposed_weight_version: str,
+        transaction_id: str | None = None,
+        wait: Literal[True] = True,
+    ) -> NCCLWeightSyncV1Result: ...
+
+    @overload
+    def publish_live_weights_to_sampler_nccl_v1(
+        self,
+        sampling_client: "SamplingClient",
+        *,
+        expected_weight_version: str,
+        proposed_weight_version: str,
+        transaction_id: str | None = None,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
+
+    def publish_live_weights_to_sampler_nccl_v1(
+        self,
+        sampling_client: "SamplingClient",
+        *,
+        expected_weight_version: str,
+        proposed_weight_version: str,
+        transaction_id: str | None = None,
+        wait: bool = True,
+    ) -> NCCLWeightSyncV1Result | OperationHandle:
+        """Experimentally publish live CUDA weights through NCCL-v1.
+
+        This operation is intentionally separate from
+        :meth:`save_weights_for_sampler`: it never exports a checkpoint and it
+        returns only after the existing target globally commits and resumes.
+        """
+
+        if getattr(sampling_client, "_service", None) is not self._service:
+            raise ValueError("sampling client belongs to another Weaver service")
+        if sampling_client.model_id != self.model_id:
+            raise ValueError("sampling client is not bound to this training model")
+        if sampling_client.model_path:
+            raise ValueError("NCCL-v1 sampling client must not carry a model_path")
+        payload = publish_live_weights_nccl_v1_payload(
+            seq_id=self._next_seq(),
+            sampling_session_id=sampling_client.sampling_session_id,
+            expected_weight_version=expected_weight_version,
+            proposed_weight_version=proposed_weight_version,
+            transaction_id=transaction_id,
+        )
+        handle = self._service.enqueue_operation(
+            f"/api/v1/models/{self.model_id}/publish-live-weights-nccl-v1",
+            payload,
+        )
+        if not wait:
+            return handle
+        return NCCLWeightSyncV1Result.from_payload(handle.result()).validate_request(
+            transaction_id=payload["transaction_id"],
+            expected_weight_version=payload["expected_weight_version"],
+            proposed_weight_version=payload["proposed_weight_version"],
+        )
 
     @overload
     def save_weights_for_sampler(
