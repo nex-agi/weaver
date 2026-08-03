@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from datetime import datetime, timezone
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
@@ -62,6 +64,60 @@ class TrainingClient:
         self.session_id = session_id
         self.tokenizer_path = tokenizer_path
         self.debug_info = debug_info
+
+    @property
+    def training_run_id(self) -> str:
+        """Canonical identifier for this Training Run.
+
+        ``model_id`` remains available as a compatibility alias.
+        """
+
+        return self.model_id
+
+    def log_metrics(
+        self,
+        metrics: Mapping[str, float],
+        *,
+        step: int,
+        occurred_at: datetime | None = None,
+        labels: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Persist user-defined scalar metrics in Weaver.
+
+        Trainer-produced loss and optimizer metrics are captured by the server
+        completion protocol automatically; this method is for application-side
+        metrics such as rewards and evaluation scores.
+        """
+
+        if step < 0:
+            raise ValueError("step must be non-negative")
+        if len(metrics) > 1000:
+            raise ValueError("at most 1000 metrics may be logged per call")
+        at = occurred_at or datetime.now(timezone.utc)
+        if at.tzinfo is None:
+            at = at.replace(tzinfo=timezone.utc)
+        points = []
+        for name, raw_value in metrics.items():
+            metric_name = str(name).strip()
+            if not metric_name:
+                raise ValueError("metric names must not be empty")
+            value = float(raw_value)
+            if not math.isfinite(value):
+                raise ValueError(f"metric {metric_name!r} must be finite")
+            points.append(
+                {
+                    "model_id": self.model_id,
+                    "name": metric_name,
+                    "value": value,
+                    "step": step,
+                    "occurred_at": at.isoformat(),
+                    "labels": dict(labels or {}),
+                }
+            )
+        if points:
+            self._service.http.post(
+                f"/api/v1/sessions/{self.session_id}/metrics", json={"metrics": points}
+            )
 
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)

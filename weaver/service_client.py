@@ -49,6 +49,8 @@ class ServiceClient:
         api_key: Optional[str] = None,
         default_tags: Optional[Sequence[str]] = None,
         session_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        user_metadata: Optional[Dict[str, Any]] = None,
         heartbeat_interval: float = 30.0,
     ) -> None:
         """Initialize ServiceClient.
@@ -58,6 +60,8 @@ class ServiceClient:
             api_key: API key for authentication (starts with 'sk-'). Get from admin UI at /api-keys
             default_tags: Default tags for sessions
             session_id: Optional existing session ID to reuse
+            project_id: Optional Project used for a newly created session
+            user_metadata: Metadata attached when a new session is created
             heartbeat_interval: Interval in seconds for session heartbeat
         """
         self._config = WeaverConfig.from_env(
@@ -66,6 +70,8 @@ class ServiceClient:
         )
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
+        self._project_id = project_id
+        self._session_user_metadata = dict(user_metadata or {})
         self._heartbeat_interval = heartbeat_interval
 
         self._http: APIClient | None = None
@@ -156,9 +162,13 @@ class ServiceClient:
             return self._session
         payload = {
             "tags": list(tags or self._default_tags),
-            "user_metadata": user_metadata or {},
+            "user_metadata": (
+                user_metadata if user_metadata is not None else self._session_user_metadata
+            ),
             "sdk_version": __version__,
         }
+        if self._project_id:
+            payload["project_id"] = self._project_id
         session = self.http.post("/api/v1/sessions", json=payload)
         self._session_id = extract_id(session)
         self._session = session
@@ -303,6 +313,15 @@ class ServiceClient:
             tokenizer_path=tokenizer_path,
             debug_info=debug_info,
         )
+
+    def create_training_client(self, **kwargs: Any) -> "TrainingClient":
+        """Create a Training Run client.
+
+        This is the canonical product name for :meth:`create_model`. The old
+        method remains supported for compatibility with existing recipes.
+        """
+
+        return self.create_model(**kwargs)
 
     def _next_model_seq(self) -> int:
         value = self._model_seq_counter
