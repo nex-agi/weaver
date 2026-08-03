@@ -88,6 +88,7 @@ class AsyncServiceClient:
         api_key: Optional[str] = None,
         default_tags: Optional[Sequence[str]] = None,
         session_id: Optional[str] = None,
+        organization_id: Optional[str] = None,
         project_id: Optional[str] = None,
         user_metadata: Optional[Dict[str, Any]] = None,
         heartbeat_interval: float = 30.0,
@@ -99,6 +100,7 @@ class AsyncServiceClient:
             api_key: API key for authentication (starts with 'sk-'). Get from admin UI at /api-keys
             default_tags: Default tags for sessions
             session_id: Optional existing session ID to reuse
+            organization_id: Optional Organization that owns a newly created session
             project_id: Optional Project used for a newly created session
             user_metadata: Metadata attached when a new session is created
             heartbeat_interval: Interval in seconds for session heartbeat
@@ -106,6 +108,7 @@ class AsyncServiceClient:
         self._config = WeaverConfig.from_env(base_url=base_url, api_key=api_key)
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
+        self._organization_id = organization_id
         self._project_id = project_id
         self._session_user_metadata = dict(user_metadata or {})
         self._heartbeat_interval = heartbeat_interval
@@ -198,6 +201,8 @@ class AsyncServiceClient:
             ),
             "sdk_version": __version__,
         }
+        if self._organization_id:
+            payload["organization_id"] = self._organization_id
         if self._project_id:
             payload["project_id"] = self._project_id
         session = await self.http.post("/api/v1/sessions", json=payload)
