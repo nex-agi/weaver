@@ -20,6 +20,8 @@ client implementations build identical payloads from a single source of truth.
 
 from __future__ import annotations
 
+import re
+import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence
 
 from .types import Datum
@@ -28,6 +30,94 @@ if TYPE_CHECKING:
     import torch
 
     from .types.router_replay import RouterReplayMetadata
+
+
+_NORMALIZED_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}$")
+_NCCL_V1_VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)$")
+
+
+def _normalized_nccl_v1_text(name: str, value: object) -> str:
+    if not isinstance(value, str) or value.strip() != value or not value:
+        raise ValueError(f"{name} must be non-empty normalized text")
+    if any(character.isspace() for character in value):
+        raise ValueError(f"{name} must not contain whitespace")
+    return value
+
+
+def nccl_v1_sampling_session_payload(
+    *, sampling_session_seq_id: int, base_model: str, model_id: str
+) -> Dict[str, Any]:
+    """Build the explicit model-bound session used by live NCCL-v1.
+
+    There is deliberately no ``model_path`` field: including one would enter
+    Weaver's durable checkpoint/DCP synchronization path.
+    """
+
+    if (
+        not isinstance(sampling_session_seq_id, int)
+        or isinstance(sampling_session_seq_id, bool)
+        or sampling_session_seq_id <= 0
+    ):
+        raise ValueError("sampling_session_seq_id must be a positive integer")
+    return {
+        "sampling_session_seq_id": sampling_session_seq_id,
+        "base_model": _normalized_nccl_v1_text("base_model", base_model),
+        "model_id": _normalized_nccl_v1_text("model_id", model_id),
+        "weight_sync_mode": "nccl_v1",
+    }
+
+
+def publish_live_weights_nccl_v1_payload(
+    *,
+    seq_id: int,
+    sampling_session_id: str,
+    expected_weight_version: str,
+    proposed_weight_version: str,
+    transaction_id: str | None = None,
+) -> Dict[str, Any]:
+    """Build the small control-only payload for one live NCCL transaction."""
+
+    if not isinstance(seq_id, int) or isinstance(seq_id, bool) or seq_id <= 0:
+        raise ValueError("seq_id must be a positive integer")
+    sampling_session_id = _normalized_nccl_v1_text("sampling_session_id", sampling_session_id)
+    expected = _normalized_nccl_v1_text("expected_weight_version", expected_weight_version)
+    proposed = _normalized_nccl_v1_text("proposed_weight_version", proposed_weight_version)
+    if not _NORMALIZED_VERSION_RE.fullmatch(expected) or not _NORMALIZED_VERSION_RE.fullmatch(
+        proposed
+    ):
+        raise ValueError("weight versions contain unsupported characters")
+    if expected == proposed:
+        raise ValueError("expected and proposed weight versions must differ")
+    expected_match = _NCCL_V1_VERSION_RE.fullmatch(expected)
+    proposed_match = _NCCL_V1_VERSION_RE.fullmatch(proposed)
+    if proposed_match is None:
+        raise ValueError("NCCL-v1 versions must use initial/v0/v1/... identities")
+    if expected != "initial" and expected_match is None:
+        raise ValueError("NCCL-v1 versions must use initial/v0/v1/... identities")
+    if expected == "initial":
+        if proposed != "v0":
+            raise ValueError("the first NCCL-v1 publication must be initial→v0")
+    else:
+        assert expected_match is not None
+        if int(proposed_match.group(1)) != int(expected_match.group(1)) + 1:
+            raise ValueError("NCCL-v1 versions must advance exactly once")
+
+    if transaction_id is None:
+        transaction_id = str(uuid.uuid4())
+    else:
+        transaction_id = _normalized_nccl_v1_text("transaction_id", transaction_id)
+        try:
+            transaction_id = str(uuid.UUID(transaction_id))
+        except ValueError as error:
+            raise ValueError("transaction_id must be a canonical UUID") from error
+
+    return {
+        "seq_id": seq_id,
+        "sampling_session_id": sampling_session_id,
+        "transaction_id": transaction_id,
+        "expected_weight_version": expected,
+        "proposed_weight_version": proposed,
+    }
 
 
 def build_request_metadata(
