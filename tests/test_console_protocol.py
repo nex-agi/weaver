@@ -44,6 +44,53 @@ def test_service_client_creates_session_in_project_with_constructor_metadata() -
     assert kwargs["json"]["user_metadata"] == {"recipe": "grpo"}
 
 
+def test_empty_scope_ids_are_omitted_so_server_fallback_applies(monkeypatch) -> None:
+    monkeypatch.setenv("WEAVER_ORGANIZATION_ID", "organization-from-env")
+    monkeypatch.setenv("WEAVER_PROJECT_ID", "project-from-env")
+    client = ServiceClient(organization_id="  ", project_id="")
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "session-default"}
+
+    client.ensure_session()
+
+    payload = client._http.post.call_args.kwargs["json"]
+    assert "organization_id" not in payload
+    assert "project_id" not in payload
+
+
+def test_scope_ids_use_environment_when_constructor_values_are_absent(monkeypatch) -> None:
+    monkeypatch.setenv("WEAVER_ORGANIZATION_ID", " organization-from-env ")
+    monkeypatch.setenv("WEAVER_PROJECT_ID", " project-from-env ")
+    client = ServiceClient()
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "session-env"}
+
+    client.ensure_session()
+
+    payload = client._http.post.call_args.kwargs["json"]
+    assert payload["organization_id"] == "organization-from-env"
+    assert payload["project_id"] == "project-from-env"
+
+
+def test_project_discovery_falls_back_to_first_organization(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
+    client = ServiceClient(organization_id="")
+    client._http = MagicMock()
+    client._http.get.side_effect = [
+        [{"id": "organization-default", "name": "Default"}],
+        [{"id": "project-default", "name": "Default Project", "is_default": True}],
+    ]
+
+    projects = client.list_projects("")
+
+    assert projects[0]["id"] == "project-default"
+    assert client._http.get.call_args_list[0].args[0] == "/api/v1/organizations"
+    assert (
+        client._http.get.call_args_list[1].args[0]
+        == "/api/v1/organizations/organization-default/projects"
+    )
+
+
 def test_training_client_logs_custom_metrics_and_exposes_training_run_id() -> None:
     service = ServiceClient()
     service._http = MagicMock()
@@ -115,5 +162,23 @@ def test_async_console_protocol_matches_sync_client() -> None:
         args, metric_kwargs = service._http.post.call_args
         assert args[0] == "/api/v1/sessions/session-2/metrics"
         assert metric_kwargs["json"]["metrics"][0]["step"] == 3
+
+    asyncio.run(run())
+
+
+def test_async_empty_scope_ids_are_omitted(monkeypatch) -> None:
+    monkeypatch.setenv("WEAVER_ORGANIZATION_ID", "organization-from-env")
+    monkeypatch.setenv("WEAVER_PROJECT_ID", "project-from-env")
+
+    async def run() -> None:
+        service = AsyncServiceClient(organization_id=" ", project_id="")
+        service._http = MagicMock()
+        service._http.post = AsyncMock(return_value={"id": "session-default"})
+
+        await service.ensure_session()
+
+        payload = service._http.post.call_args.kwargs["json"]
+        assert "organization_id" not in payload
+        assert "project_id" not in payload
 
     asyncio.run(run())

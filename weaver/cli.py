@@ -146,6 +146,40 @@ def create_models_table(items: List[Dict[str, Any]]) -> Table:
     return table
 
 
+def create_organizations_table(items: List[Dict[str, Any]]) -> Table:
+    """Create a copy-friendly organization table."""
+
+    table = Table(title="Organizations", box=box.ROUNDED)
+    table.add_column("Organization ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="green")
+    table.add_column("Slug", style="blue")
+    for item in items:
+        table.add_row(
+            str(item.get("id", "")),
+            str(item.get("name", "")),
+            str(item.get("slug", "")),
+        )
+    return table
+
+
+def create_projects_table(items: List[Dict[str, Any]]) -> Table:
+    """Create a copy-friendly project table."""
+
+    table = Table(title="Projects", box=box.ROUNDED)
+    table.add_column("Project ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="green")
+    table.add_column("Slug", style="blue")
+    table.add_column("Default", justify="center")
+    for item in items:
+        table.add_row(
+            str(item.get("id", "")),
+            str(item.get("name", "")),
+            str(item.get("slug", "")),
+            "yes" if item.get("is_default") else "",
+        )
+    return table
+
+
 def display_training_run_detail(data: Dict[str, Any]) -> None:
     """Display detailed training run information."""
     console.print("\n[bold cyan]Training Run Details[/bold cyan]\n")
@@ -243,6 +277,73 @@ def show():
 @cli.group()
 def checkpoint():
     """Manage checkpoints."""
+
+
+@list.command("organizations")
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def list_organizations_cmd(output_format: str, base_url: Optional[str], api_key: Optional[str]):
+    """List organizations available to the current user."""
+
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        items = client.list_organizations()
+        if output_format == "json":
+            format_json_output(items)
+        else:
+            console.print(create_organizations_table(items))
+            console.print(f"\n{len(items)} organizations")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+@list.command("projects")
+@click.option(
+    "--organization-id",
+    "--org-id",
+    "org_id",
+    envvar="WEAVER_ORGANIZATION_ID",
+    help="Organization ID; defaults to the first available organization",
+)
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def list_projects_cmd(
+    org_id: Optional[str], output_format: str, base_url: Optional[str], api_key: Optional[str]
+):
+    """List projects in an organization."""
+
+    client = ServiceClient(base_url=base_url, api_key=api_key, organization_id=org_id)
+    try:
+        client.connect(ensure_session=False)
+        items = client.list_projects(org_id)
+        if output_format == "json":
+            format_json_output(items)
+        else:
+            console.print(create_projects_table(items))
+            console.print(f"\n{len(items)} projects")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
 
 
 @list.command("training-runs")
