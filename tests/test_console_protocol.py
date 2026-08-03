@@ -27,7 +27,11 @@ from weaver.training_client import TrainingClient
 
 
 def test_service_client_creates_session_in_project_with_constructor_metadata() -> None:
-    client = ServiceClient(project_id="project-1", user_metadata={"recipe": "grpo"})
+    client = ServiceClient(
+        organization_id="organization-1",
+        project_id="project-1",
+        user_metadata={"recipe": "grpo"},
+    )
     client._http = MagicMock()
     client._http.post.return_value = {"id": "session-1"}
 
@@ -35,6 +39,7 @@ def test_service_client_creates_session_in_project_with_constructor_metadata() -
 
     args, kwargs = client._http.post.call_args
     assert args[0] == "/api/v1/sessions"
+    assert kwargs["json"]["organization_id"] == "organization-1"
     assert kwargs["json"]["project_id"] == "project-1"
     assert kwargs["json"]["user_metadata"] == {"recipe": "grpo"}
 
@@ -86,11 +91,16 @@ def test_training_client_rejects_non_finite_metrics() -> None:
 
 def test_async_console_protocol_matches_sync_client() -> None:
     async def run() -> None:
-        service = AsyncServiceClient(project_id="project-2", user_metadata={"recipe": "sft"})
+        service = AsyncServiceClient(
+            organization_id="organization-2",
+            project_id="project-2",
+            user_metadata={"recipe": "sft"},
+        )
         service._http = MagicMock()
         service._http.post = AsyncMock(return_value={"id": "session-2"})
         await service.ensure_session()
         _, session_kwargs = service._http.post.call_args
+        assert session_kwargs["json"]["organization_id"] == "organization-2"
         assert session_kwargs["json"]["project_id"] == "project-2"
         assert session_kwargs["json"]["user_metadata"] == {"recipe": "sft"}
 
