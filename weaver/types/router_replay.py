@@ -81,14 +81,8 @@ class RouterReplayMetadata:
 
     mode: RouterReplayMode
     source: RouterReplaySource
-    indices: RouterReplayIndices | Mapping[str, Any] | None = None
     fail_fast: bool = True
     action: str | None = None
-    sample_ref: str | None = None
-    sample_index: int | None = None
-    index_uri: str | None = None
-    index_set_uri: str | None = None
-    manifest_uri: str | None = None
     schema: str = ROUTER_REPLAY_DATUM_SCHEMA
 
     def to_payload(self) -> dict[str, object]:
@@ -98,26 +92,6 @@ class RouterReplayMetadata:
             "source": self.source,
             "fail_fast": self.fail_fast,
         }
-        if self.indices is not None:
-            raise ValueError(
-                "RouterReplayMetadata.indices is no longer SDK-visible. "
-                "Use opaque sample_ref/index_set_uri/manifest_uri refs."
-            )
-        if self.sample_index is not None:
-            raise ValueError(
-                "RouterReplayMetadata.sample_index is no longer SDK-visible; "
-                "use sample_ref instead."
-            )
-        if self.index_uri is not None:
-            raise ValueError(
-                "RouterReplayMetadata.index_uri is no longer supported; use sample_ref instead."
-            )
-        if self.sample_ref is not None:
-            payload["sample_ref"] = self.sample_ref
-        if self.index_set_uri is not None:
-            payload["index_set_uri"] = self.index_set_uri
-        if self.manifest_uri is not None:
-            payload["manifest_uri"] = self.manifest_uri
         if self.action is not None:
             payload["action"] = self.action
         return payload
@@ -133,49 +107,8 @@ class RouterReplayMetadata:
         return cls(
             mode=ROUTER_REPLAY_MODE_R2,
             source=ROUTER_REPLAY_SOURCE_RECOMPUTE,
-            indices=None,
             fail_fast=fail_fast,
             action="RECORD",
-        )
-
-    @classmethod
-    def r2_replay(
-        cls,
-        *,
-        sample_ref: str,
-        index_set_uri: str,
-        manifest_uri: str,
-        fail_fast: bool = True,
-    ) -> "RouterReplayMetadata":
-        return cls(
-            mode=ROUTER_REPLAY_MODE_R2,
-            source=ROUTER_REPLAY_SOURCE_RECOMPUTE,
-            indices=None,
-            fail_fast=fail_fast,
-            action="REPLAY",
-            sample_ref=sample_ref,
-            index_set_uri=index_set_uri,
-            manifest_uri=manifest_uri,
-        )
-
-    @classmethod
-    def r3_replay(
-        cls,
-        *,
-        sample_ref: str,
-        index_set_uri: str,
-        manifest_uri: str,
-        fail_fast: bool = True,
-    ) -> "RouterReplayMetadata":
-        return cls(
-            mode=ROUTER_REPLAY_MODE_R3,
-            source=ROUTER_REPLAY_SOURCE_ROLLOUT,
-            indices=None,
-            fail_fast=fail_fast,
-            action="REPLAY",
-            sample_ref=sample_ref,
-            index_set_uri=index_set_uri,
-            manifest_uri=manifest_uri,
         )
 
 

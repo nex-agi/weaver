@@ -250,46 +250,6 @@ class TestForwardBackwardMetadata:
 class TestRouterReplayMetadataType:
     """Test datum-level router replay serialization and request-level rejection."""
 
-    def test_typed_datum_metadata_serialization(self):
-        """RouterReplayMetadata.to_payload() can be attached to a Datum."""
-        from weaver.types.router_replay import (
-            RouterReplayMetadata,
-            router_replay_manifest_uri,
-            router_replay_sample_uri,
-            router_replay_set_uri,
-        )
-
-        replay = RouterReplayMetadata.r3_replay(
-            sample_ref=router_replay_sample_uri("model-a", "set-1", 7),
-            index_set_uri=router_replay_set_uri("model-a", "set-1"),
-            manifest_uri=router_replay_manifest_uri("model-a", "set-1"),
-        )
-
-        client = _make_training_client()
-        captured_payloads = []
-
-        def mock_enqueue(path, payload):
-            captured_payloads.append(payload)
-            handle = MagicMock()
-            handle.result.return_value = {}
-            return handle
-
-        client._service.enqueue_operation = mock_enqueue
-
-        datum = _make_datum()
-        datum.metadata["router_replay"] = replay.to_payload()
-
-        client.forward_backward([datum], "grpo")
-
-        inner_payload = captured_payloads[0]["payload"]
-        assert "metadata" not in inner_payload
-        rr = inner_payload["forward_backward_input"]["data"][0]["metadata"]["router_replay"]
-        assert rr["mode"] == "R3"
-        assert rr["source"] == "rollout"
-        assert rr["sample_ref"] == "weaver://model-a/router-replay/set-1/samples/7"
-        assert "indices" not in rr
-        assert rr["fail_fast"] is True
-
     def test_forward_rejects_router_replay_argument(self):
         """Request-level router_replay is no longer accepted."""
         from weaver.types.router_replay import RouterReplayMetadata
