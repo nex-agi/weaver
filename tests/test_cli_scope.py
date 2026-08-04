@@ -103,3 +103,73 @@ def test_scope_json_is_stable_and_does_not_leak_internal_fields(monkeypatch) -> 
 
     assert result.exit_code == 0
     assert json.loads(result.output) == [{"id": "org-1", "name": "Research", "role": "admin"}]
+
+
+def test_projects_list_accepts_organization_slug_or_name(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_BASE_URL", raising=False)
+    monkeypatch.delenv("WEAVER_API_KEY", raising=False)
+    client = MagicMock()
+    client.resolve_scope.return_value = {
+        "organization": {"id": "org-resolved", "slug": "research"},
+        "project": {"id": "default-project"},
+    }
+    client.list_projects.return_value = [
+        {"id": "project-1", "name": "RL", "current_user_role": "manager"}
+    ]
+    with patch("weaver.cli.ServiceClient", return_value=client):
+        result = CliRunner().invoke(
+            cli,
+            ["projects", "list", "--organization", "research", "--format", "json"],
+        )
+
+    assert result.exit_code == 0
+    client.resolve_scope.assert_called_once_with("research", None)
+    client.list_projects.assert_called_once_with("org-resolved")
+
+
+def test_scope_resolve_cli_returns_canonical_ids(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_BASE_URL", raising=False)
+    monkeypatch.delenv("WEAVER_API_KEY", raising=False)
+    client = MagicMock()
+    client.resolve_scope.return_value = {
+        "organization": {"id": "org-1", "slug": "research", "name": "Research"},
+        "project": {"id": "project-1", "slug": "training", "name": "Training"},
+    }
+    with patch("weaver.cli.ServiceClient", return_value=client):
+        result = CliRunner().invoke(
+            cli,
+            [
+                "scope",
+                "resolve",
+                "--organization",
+                "Research",
+                "--project",
+                "Training",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "org-1" in result.output
+    assert "project-1" in result.output
+    client.resolve_scope.assert_called_once_with("Research", "Training")
+
+
+def test_projects_list_rejects_conflicting_organization_options(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_BASE_URL", raising=False)
+    monkeypatch.delenv("WEAVER_API_KEY", raising=False)
+    with patch("weaver.cli.ServiceClient") as constructor:
+        result = CliRunner().invoke(
+            cli,
+            [
+                "projects",
+                "list",
+                "--organization-id",
+                "org-id",
+                "--organization",
+                "org-slug",
+            ],
+        )
+
+    assert result.exit_code == 2
+    assert "either --organization-id or --organization" in result.output
+    constructor.assert_not_called()

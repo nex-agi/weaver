@@ -100,6 +100,78 @@ def test_project_only_scope_is_sent_for_server_side_organization_resolution(monk
     assert "organization_id" not in payload
 
 
+def test_named_scope_is_resolved_to_canonical_ids_before_session_creation(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION", raising=False)
+    monkeypatch.delenv("WEAVER_PROJECT", raising=False)
+    client = ServiceClient(organization="research", project="Training")
+    client._http = MagicMock()
+    client._http.get.return_value = {
+        "organization": {"id": "organization-resolved", "slug": "research"},
+        "project": {"id": "project-resolved", "name": "Training"},
+    }
+    client._http.post.return_value = {"id": "session-named"}
+
+    client.ensure_session()
+
+    client._http.get.assert_called_once_with(
+        "/api/v1/scope/resolve",
+        params={"organization": "research", "project": "Training"},
+    )
+    payload = client._http.post.call_args.kwargs["json"]
+    assert payload["organization_id"] == "organization-resolved"
+    assert payload["project_id"] == "project-resolved"
+
+
+def test_named_scope_uses_environment_only_when_parameter_is_absent(monkeypatch) -> None:
+    monkeypatch.setenv("WEAVER_ORGANIZATION", "environment-org")
+    monkeypatch.setenv("WEAVER_PROJECT", "environment-project")
+    client = ServiceClient(organization="explicit-org", project="explicit-project")
+    client._http = MagicMock()
+    client._http.get.return_value = {
+        "organization": {"id": "organization-resolved"},
+        "project": {"id": "project-resolved"},
+    }
+    client._http.post.return_value = {"id": "session-named"}
+
+    client.ensure_session()
+
+    assert client._http.get.call_args.kwargs["params"] == {
+        "organization": "explicit-org",
+        "project": "explicit-project",
+    }
+
+
+def test_canonical_ids_take_precedence_without_scope_resolution(monkeypatch) -> None:
+    monkeypatch.setenv("WEAVER_ORGANIZATION", "ignored-org")
+    monkeypatch.setenv("WEAVER_PROJECT", "ignored-project")
+    client = ServiceClient(organization_id="org-id", project_id="project-id")
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "session-id"}
+
+    client.ensure_session()
+
+    client._http.get.assert_not_called()
+    payload = client._http.post.call_args.kwargs["json"]
+    assert payload["organization_id"] == "org-id"
+    assert payload["project_id"] == "project-id"
+
+
+def test_explicit_scope_resolution_does_not_inherit_unrelated_environment(monkeypatch) -> None:
+    monkeypatch.setenv("WEAVER_PROJECT", "environment-project")
+    client = ServiceClient()
+    client._http = MagicMock()
+    client._http.get.return_value = {
+        "organization": {"id": "org-id"},
+        "project": {"id": "default-project"},
+    }
+
+    client.resolve_scope("research", None)
+
+    client._http.get.assert_called_once_with(
+        "/api/v1/scope/resolve", params={"organization": "research"}
+    )
+
+
 def test_project_discovery_falls_back_to_first_organization(monkeypatch) -> None:
     monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
     client = ServiceClient(organization_id="")
@@ -226,5 +298,33 @@ def test_async_project_only_scope_is_sent(monkeypatch) -> None:
         payload = service._http.post.call_args.kwargs["json"]
         assert payload["project_id"] == "project-async"
         assert "organization_id" not in payload
+
+    asyncio.run(run())
+
+
+def test_async_named_scope_matches_sync_resolution(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION", raising=False)
+    monkeypatch.delenv("WEAVER_PROJECT", raising=False)
+
+    async def run() -> None:
+        service = AsyncServiceClient(organization="research", project="Training")
+        service._http = MagicMock()
+        service._http.get = AsyncMock(
+            return_value={
+                "organization": {"id": "organization-resolved"},
+                "project": {"id": "project-resolved"},
+            }
+        )
+        service._http.post = AsyncMock(return_value={"id": "session-project"})
+
+        await service.ensure_session()
+
+        service._http.get.assert_awaited_once_with(
+            "/api/v1/scope/resolve",
+            params={"organization": "research", "project": "Training"},
+        )
+        payload = service._http.post.call_args.kwargs["json"]
+        assert payload["organization_id"] == "organization-resolved"
+        assert payload["project_id"] == "project-resolved"
 
     asyncio.run(run())

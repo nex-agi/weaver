@@ -20,6 +20,11 @@ pip install nex-weaver
 
 Configuration can be provided via keyword arguments or environment variables:
 - `WEAVER_API_KEY`
+- `WEAVER_ORGANIZATION_ID` / `WEAVER_PROJECT_ID` for canonical IDs
+- `WEAVER_ORGANIZATION` / `WEAVER_PROJECT` for UUIDs, slugs, or display names
+
+Canonical IDs take precedence. When no organization or project is configured,
+the server keeps its stable personal-organization/default-project fallback.
 
 ## Quickstart
 
@@ -34,6 +39,22 @@ def main():
 if __name__ == "__main__":
     main()
 ```
+
+Select a scope by human-readable references, or discover and resolve available scopes:
+
+```python
+with ServiceClient(organization="research", project="alignment") as client:
+    client.ensure_session()
+```
+
+```bash
+weaver organizations list
+weaver projects list --organization research
+weaver scope resolve --organization research --project alignment
+```
+
+Organization slugs are globally unique. Project slugs and names are unique inside
+their organization; an ambiguous display name is rejected instead of guessed.
 
 ## Usage
 

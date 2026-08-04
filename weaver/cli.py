@@ -315,6 +315,11 @@ def projects_group():
     """Discover projects available to the current user."""
 
 
+@cli.group("scope")
+def scope_group():
+    """Resolve organization and project references."""
+
+
 def _run_list_organizations(
     output_format: str, base_url: Optional[str], api_key: Optional[str]
 ) -> None:
@@ -335,19 +340,45 @@ def _run_list_organizations(
 
 def _run_list_projects(
     org_id: Optional[str],
+    org_reference: Optional[str],
     output_format: str,
     base_url: Optional[str],
     api_key: Optional[str],
 ) -> None:
+    if org_id and org_reference:
+        raise click.UsageError("Use either --organization-id or --organization, not both")
     client = ServiceClient(base_url=base_url, api_key=api_key, organization_id=org_id)
     try:
         client.connect(ensure_session=False)
-        items = scope_selection_rows(client.list_projects(org_id))
+        resolved_org_id = org_id
+        if org_reference:
+            scope = client.resolve_scope(org_reference, None)
+            organization = scope.get("organization")
+            if not isinstance(organization, dict) or not organization.get("id"):
+                raise ValueError("Scope response missing organization id")
+            resolved_org_id = str(organization["id"])
+        items = scope_selection_rows(client.list_projects(resolved_org_id))
         if output_format == "json":
             format_json_output(items)
         else:
             console.print(create_projects_table(items))
             console.print(f"\n{len(items)} projects")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+def _run_resolve_scope(
+    organization: Optional[str],
+    project: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> None:
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        format_json_output(client.resolve_scope(organization, project))
     except Exception as e:
         handle_error(e)
     finally:
@@ -399,6 +430,12 @@ def organizations_list_cmd(
     help="Organization ID; defaults to the first available organization",
 )
 @click.option(
+    "--organization",
+    "org_reference",
+    envvar="WEAVER_ORGANIZATION",
+    help="Organization UUID, globally unique slug, or display name",
+)
+@click.option(
     "--format",
     "-f",
     "output_format",
@@ -409,11 +446,15 @@ def organizations_list_cmd(
 @click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
 @click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
 def list_projects_cmd(
-    org_id: Optional[str], output_format: str, base_url: Optional[str], api_key: Optional[str]
+    org_id: Optional[str],
+    org_reference: Optional[str],
+    output_format: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
 ):
     """List projects in an organization."""
 
-    _run_list_projects(org_id, output_format, base_url, api_key)
+    _run_list_projects(org_id, org_reference, output_format, base_url, api_key)
 
 
 @projects_group.command("list")
@@ -423,6 +464,12 @@ def list_projects_cmd(
     "org_id",
     envvar="WEAVER_ORGANIZATION_ID",
     help="Organization ID; defaults to the user's default organization",
+)
+@click.option(
+    "--organization",
+    "org_reference",
+    envvar="WEAVER_ORGANIZATION",
+    help="Organization UUID, globally unique slug, or display name",
 )
 @click.option(
     "--format",
@@ -435,11 +482,39 @@ def list_projects_cmd(
 @click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
 @click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
 def projects_list_cmd(
-    org_id: Optional[str], output_format: str, base_url: Optional[str], api_key: Optional[str]
+    org_id: Optional[str],
+    org_reference: Optional[str],
+    output_format: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
 ) -> None:
     """List projects in an organization."""
 
-    _run_list_projects(org_id, output_format, base_url, api_key)
+    _run_list_projects(org_id, org_reference, output_format, base_url, api_key)
+
+
+@scope_group.command("resolve")
+@click.option(
+    "--organization",
+    envvar="WEAVER_ORGANIZATION",
+    help="Organization UUID, globally unique slug, or display name",
+)
+@click.option(
+    "--project",
+    envvar="WEAVER_PROJECT",
+    help="Project UUID, organization-local slug, or display name",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def resolve_scope_cmd(
+    organization: Optional[str],
+    project: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> None:
+    """Resolve references to canonical organization and project IDs."""
+
+    _run_resolve_scope(organization, project, base_url, api_key)
 
 
 @list.command("training-runs")

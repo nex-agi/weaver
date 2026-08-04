@@ -103,6 +103,8 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         session_id: Optional[str] = None,
         organization_id: Optional[str] = None,
         project_id: Optional[str] = None,
+        organization: Optional[str] = None,
+        project: Optional[str] = None,
         user_metadata: Optional[Dict[str, Any]] = None,
         heartbeat_interval: float = 30.0,
     ) -> None:
@@ -115,6 +117,8 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             session_id: Optional existing session ID to reuse
             organization_id: Optional Organization that owns a newly created session
             project_id: Optional Project used for a newly created session
+            organization: Optional organization UUID, globally unique slug, or display name
+            project: Optional project UUID, organization-local slug, or display name
             user_metadata: Metadata attached when a new session is created
             heartbeat_interval: Interval in seconds for session heartbeat
         """
@@ -123,6 +127,8 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         self._session_id = session_id
         self._organization_id = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
         self._project_id = optional_scope_id(project_id, "WEAVER_PROJECT_ID")
+        self._organization_reference = optional_scope_id(organization, "WEAVER_ORGANIZATION")
+        self._project_reference = optional_scope_id(project, "WEAVER_PROJECT")
         self._session_user_metadata = dict(user_metadata or {})
         self._heartbeat_interval = heartbeat_interval
 
@@ -271,6 +277,26 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
     ) -> Dict[str, Any]:
         if self._session is not None:
             return self._session
+        organization_id = self._organization_id
+        project_id = self._project_id
+        if (organization_id is None and self._organization_reference) or (
+            project_id is None and self._project_reference
+        ):
+            resolved = await self.resolve_scope(
+                organization_id or self._organization_reference,
+                project_id or self._project_reference,
+            )
+            if organization_id is None:
+                organization = resolved.get("organization")
+                if not isinstance(organization, dict):
+                    raise ValueError("Scope response missing organization")
+                organization_id = extract_id(organization)
+            if project_id is None:
+                project = resolved.get("project")
+                if not isinstance(project, dict):
+                    raise ValueError("Scope response missing project")
+                project_id = extract_id(project)
+
         payload = {
             "tags": list(tags or self._default_tags),
             "user_metadata": (
@@ -278,10 +304,10 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             ),
             "sdk_version": __version__,
         }
-        if self._organization_id:
-            payload["organization_id"] = self._organization_id
-        if self._project_id:
-            payload["project_id"] = self._project_id
+        if organization_id:
+            payload["organization_id"] = organization_id
+        if project_id:
+            payload["project_id"] = project_id
         session = await self.http.post("/api/v1/sessions", json=payload)
         self._session_id = extract_id(session)
         self._session = session
@@ -533,6 +559,23 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         if not isinstance(payload, list):
             return []
         return [item for item in payload if isinstance(item, dict)]
+
+    async def resolve_scope(
+        self,
+        organization: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resolve UUID/slug/name references to canonical scope IDs."""
+
+        params: Dict[str, str] = {}
+        organization_ref = organization.strip() if organization else None
+        project_ref = project.strip() if project else None
+        if organization_ref:
+            params["organization"] = organization_ref
+        if project_ref:
+            params["project"] = project_ref
+        payload = await self.http.get("/api/v1/scope/resolve", params=params)
+        return payload if isinstance(payload, dict) else {}
 
     async def list_projects(self, organization_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """List projects, falling back to the user's first organization."""
