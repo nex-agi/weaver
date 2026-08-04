@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
 
 
-class ServiceClient:
+class ServiceClient:  # pylint: disable=too-many-public-methods
     def __init__(
         self,
         *,
@@ -505,6 +505,62 @@ class ServiceClient:
         if not isinstance(payload, list):
             return []
         return [item for item in payload if isinstance(item, dict)]
+
+    def _quota_scope_params(self, organization_id: Optional[str]) -> Dict[str, str]:
+        resolved = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
+        if resolved is None:
+            resolved = self._organization_id
+        return {"org_id": resolved} if resolved is not None else {}
+
+    def get_quota_balance(self, organization_id: Optional[str] = None) -> Dict[str, Any]:
+        """Return the caller's nano-USD quota balance.
+
+        When no organization is supplied by parameter, constructor, or
+        environment, the unscoped endpoint lets the server select the user's
+        default organization.
+        """
+
+        scope = self._quota_scope_params(organization_id)
+        if scope:
+            payload = self.http.get("/api/v1/quota/balance", params=scope)
+        else:
+            payload = self.http.get("/api/v1/quota/balance")
+        return payload if isinstance(payload, dict) else {}
+
+    def list_quota_requests(
+        self,
+        organization_id: Optional[str] = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """List quota requests submitted by the current user."""
+
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        params.update(self._quota_scope_params(organization_id))
+        payload = self.http.get("/api/v1/quota/requests", params=params)
+        return payload if isinstance(payload, dict) else {}
+
+    def request_quota(
+        self,
+        amount_usd: str,
+        *,
+        reason: str,
+        organization_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Request additional USD quota for the current user.
+
+        ``amount_usd`` is sent as a decimal string; callers should not convert
+        it to ``float`` because the server accepts up to nano-USD precision.
+        """
+
+        payload = self.http.post(
+            "/api/v1/quota/requests",
+            json={"amount_usd": str(amount_usd), "reason": reason},
+            params=self._quota_scope_params(organization_id) or None,
+            max_retries=1,
+        )
+        return payload if isinstance(payload, dict) else {}
 
     def get_supported_model_config(self, base_model: str) -> Optional[Dict[str, Any]]:
         """Get configuration for a specific supported model.

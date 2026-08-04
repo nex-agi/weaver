@@ -88,9 +88,24 @@ def format_training_mode(
 def handle_error(e: Exception) -> None:
     """Handle and display errors gracefully."""
     if isinstance(e, WeaverAPIError):
-        console.print(f"[red]API Error ({e.status_code}):[/red] {e.message}")
+        if e.status_code == 402:
+            console.print(f"[red]Quota exceeded:[/red] {e.message}")
+            if e.required_usd is not None or e.available_usd is not None:
+                required = f"${e.required_usd}" if e.required_usd is not None else "unknown"
+                available = f"${e.available_usd}" if e.available_usd is not None else "unknown"
+                console.print(f"Required: {required}; available: {available}")
+        elif e.status_code == 429:
+            console.print(f"[red]Rate limited:[/red] {e.message}")
+            if e.retry_after:
+                console.print(f"Retry after: {e.retry_after} seconds")
+        elif e.status_code == 503:
+            console.print(f"[red]Service temporarily unavailable:[/red] {e.message}")
+        else:
+            console.print(f"[red]API Error ({e.status_code}):[/red] {e.message}")
         if e.status_code == 401:
             console.print("[yellow]Tip:[/yellow] Check your API key configuration")
+        if e.request_id:
+            console.print(f"Request ID: {e.request_id}")
     else:
         console.print(f"[red]Error:[/red] {str(e)}")
     sys.exit(1)
@@ -152,12 +167,12 @@ def create_organizations_table(items: List[Dict[str, Any]]) -> Table:
     table = Table(title="Organizations", box=box.ROUNDED)
     table.add_column("Organization ID", style="cyan", no_wrap=True)
     table.add_column("Name", style="green")
-    table.add_column("Slug", style="blue")
+    table.add_column("Role", style="blue")
     for item in items:
         table.add_row(
             str(item.get("id", "")),
             str(item.get("name", "")),
-            str(item.get("slug", "")),
+            str(item.get("role") or item.get("current_user_role", "")),
         )
     return table
 
@@ -168,16 +183,27 @@ def create_projects_table(items: List[Dict[str, Any]]) -> Table:
     table = Table(title="Projects", box=box.ROUNDED)
     table.add_column("Project ID", style="cyan", no_wrap=True)
     table.add_column("Name", style="green")
-    table.add_column("Slug", style="blue")
-    table.add_column("Default", justify="center")
+    table.add_column("Role", style="blue")
     for item in items:
         table.add_row(
             str(item.get("id", "")),
             str(item.get("name", "")),
-            str(item.get("slug", "")),
-            "yes" if item.get("is_default") else "",
+            str(item.get("role") or item.get("current_user_role", "")),
         )
     return table
+
+
+def scope_selection_rows(items: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Return the stable, public fields needed to select an org/project."""
+
+    return [
+        {
+            "id": str(item.get("id", "")),
+            "name": str(item.get("name", "")),
+            "role": str(item.get("role") or item.get("current_user_role", "")),
+        }
+        for item in items
+    ]
 
 
 def display_training_run_detail(data: Dict[str, Any]) -> None:
@@ -279,6 +305,55 @@ def checkpoint():
     """Manage checkpoints."""
 
 
+@cli.group("organizations")
+def organizations_group():
+    """Discover organizations available to the current user."""
+
+
+@cli.group("projects")
+def projects_group():
+    """Discover projects available to the current user."""
+
+
+def _run_list_organizations(
+    output_format: str, base_url: Optional[str], api_key: Optional[str]
+) -> None:
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        items = scope_selection_rows(client.list_organizations())
+        if output_format == "json":
+            format_json_output(items)
+        else:
+            console.print(create_organizations_table(items))
+            console.print(f"\n{len(items)} organizations")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+def _run_list_projects(
+    org_id: Optional[str],
+    output_format: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> None:
+    client = ServiceClient(base_url=base_url, api_key=api_key, organization_id=org_id)
+    try:
+        client.connect(ensure_session=False)
+        items = scope_selection_rows(client.list_projects(org_id))
+        if output_format == "json":
+            format_json_output(items)
+        else:
+            console.print(create_projects_table(items))
+            console.print(f"\n{len(items)} projects")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
 @list.command("organizations")
 @click.option(
     "--format",
@@ -293,19 +368,26 @@ def checkpoint():
 def list_organizations_cmd(output_format: str, base_url: Optional[str], api_key: Optional[str]):
     """List organizations available to the current user."""
 
-    client = ServiceClient(base_url=base_url, api_key=api_key)
-    try:
-        client.connect(ensure_session=False)
-        items = client.list_organizations()
-        if output_format == "json":
-            format_json_output(items)
-        else:
-            console.print(create_organizations_table(items))
-            console.print(f"\n{len(items)} organizations")
-    except Exception as e:
-        handle_error(e)
-    finally:
-        client.close()
+    _run_list_organizations(output_format, base_url, api_key)
+
+
+@organizations_group.command("list")
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def organizations_list_cmd(
+    output_format: str, base_url: Optional[str], api_key: Optional[str]
+) -> None:
+    """List organizations available to the current user."""
+
+    _run_list_organizations(output_format, base_url, api_key)
 
 
 @list.command("projects")
@@ -331,19 +413,33 @@ def list_projects_cmd(
 ):
     """List projects in an organization."""
 
-    client = ServiceClient(base_url=base_url, api_key=api_key, organization_id=org_id)
-    try:
-        client.connect(ensure_session=False)
-        items = client.list_projects(org_id)
-        if output_format == "json":
-            format_json_output(items)
-        else:
-            console.print(create_projects_table(items))
-            console.print(f"\n{len(items)} projects")
-    except Exception as e:
-        handle_error(e)
-    finally:
-        client.close()
+    _run_list_projects(org_id, output_format, base_url, api_key)
+
+
+@projects_group.command("list")
+@click.option(
+    "--organization-id",
+    "--org-id",
+    "org_id",
+    envvar="WEAVER_ORGANIZATION_ID",
+    help="Organization ID; defaults to the user's default organization",
+)
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def projects_list_cmd(
+    org_id: Optional[str], output_format: str, base_url: Optional[str], api_key: Optional[str]
+) -> None:
+    """List projects in an organization."""
+
+    _run_list_projects(org_id, output_format, base_url, api_key)
 
 
 @list.command("training-runs")

@@ -74,12 +74,67 @@ def _is_connection_error(exc: BaseException) -> bool:
 
 
 class WeaverAPIError(RuntimeError):
-    def __init__(self, status_code: int, code: str, message: str, retryable: bool):
+    """Structured error returned by the Weaver API.
+
+    Optional capacity fields intentionally use integer nano-USD values and
+    decimal USD strings. This avoids losing very small charges to binary
+    floating-point rounding while still giving CLI users readable amounts.
+    """
+
+    def __init__(
+        self,
+        status_code: int,
+        code: str,
+        message: str,
+        retryable: bool,
+        *,
+        request_id: str | None = None,
+        retry_after: str | None = None,
+        required_nanos: int | None = None,
+        available_nanos: int | None = None,
+        required_usd: str | None = None,
+        available_usd: str | None = None,
+        details: Mapping[str, Any] | None = None,
+    ):
         super().__init__(f"[{status_code}] {code}: {message}")
         self.status_code = status_code
         self.code = code
         self.message = message
         self.retryable = retryable
+        self.request_id = request_id
+        self.retry_after = retry_after
+        self.required_nanos = required_nanos
+        self.available_nanos = available_nanos
+        self.required_usd = required_usd
+        self.available_usd = available_usd
+        self.details = dict(details or {})
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def _usd_from_nanos(value: int | None) -> str | None:
+    if value is None:
+        return None
+    sign = "-" if value < 0 else ""
+    absolute = abs(value)
+    whole, fractional = divmod(absolute, 1_000_000_000)
+    if fractional == 0:
+        return f"{sign}{whole}"
+    return f"{sign}{whole}.{fractional:09d}".rstrip("0")
 
 
 def extract_model_id_from_path(path: str) -> str | None:
@@ -104,11 +159,32 @@ def raise_for_response(response: httpx.Response) -> None:
         payload = response.json()
     except ValueError:
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    raw_details = payload.get("details")
+    details = raw_details if isinstance(raw_details, dict) else {}
+
+    def detail(name: str) -> Any:
+        # Accept the canonical nested contract and the early top-level shape so
+        # SDK upgrades do not have to be synchronized exactly with a server deploy.
+        return details.get(name, payload.get(name))
+
+    required_nanos = _optional_int(detail("required_nanos"))
+    available_nanos = _optional_int(detail("available_nanos"))
     raise WeaverAPIError(
         response.status_code,
         code=payload.get("error", "unknown_error"),
         message=payload.get("message", response.text),
         retryable=bool(payload.get("retryable", False)),
+        request_id=_optional_string(payload.get("request_id"))
+        or _optional_string(response.headers.get("X-Request-ID")),
+        retry_after=_optional_string(payload.get("retry_after"))
+        or _optional_string(response.headers.get("Retry-After")),
+        required_nanos=required_nanos,
+        available_nanos=available_nanos,
+        required_usd=_optional_string(detail("required_usd")) or _usd_from_nanos(required_nanos),
+        available_usd=_optional_string(detail("available_usd")) or _usd_from_nanos(available_nanos),
+        details=details,
     )
 
 
@@ -206,8 +282,15 @@ class APIClient:
     def get(self, path: str, *, params: Mapping[str, Any] | None = None) -> Any:
         return self._request("GET", path, params=params)
 
-    def post(self, path: str, *, json: Any = None, max_retries: int | None = None) -> Any:
-        return self._request("POST", path, json=json, max_retries=max_retries)
+    def post(
+        self,
+        path: str,
+        *,
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        max_retries: int | None = None,
+    ) -> Any:
+        return self._request("POST", path, params=params, json=json, max_retries=max_retries)
 
     def patch(self, path: str, *, json: Any) -> Any:
         return self._request("PATCH", path, json=json)

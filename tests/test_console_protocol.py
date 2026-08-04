@@ -72,6 +72,34 @@ def test_scope_ids_use_environment_when_constructor_values_are_absent(monkeypatc
     assert payload["project_id"] == "project-from-env"
 
 
+def test_scope_ids_are_omitted_when_parameter_and_environment_are_absent(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
+    monkeypatch.delenv("WEAVER_PROJECT_ID", raising=False)
+    client = ServiceClient()
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "session-default"}
+
+    client.ensure_session()
+
+    payload = client._http.post.call_args.kwargs["json"]
+    assert "organization_id" not in payload
+    assert "project_id" not in payload
+
+
+def test_project_only_scope_is_sent_for_server_side_organization_resolution(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
+    monkeypatch.delenv("WEAVER_PROJECT_ID", raising=False)
+    client = ServiceClient(project_id="project-1")
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "session-project"}
+
+    client.ensure_session()
+
+    payload = client._http.post.call_args.kwargs["json"]
+    assert payload["project_id"] == "project-1"
+    assert "organization_id" not in payload
+
+
 def test_project_discovery_falls_back_to_first_organization(monkeypatch) -> None:
     monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
     client = ServiceClient(organization_id="")
@@ -180,5 +208,23 @@ def test_async_empty_scope_ids_are_omitted(monkeypatch) -> None:
         payload = service._http.post.call_args.kwargs["json"]
         assert "organization_id" not in payload
         assert "project_id" not in payload
+
+    asyncio.run(run())
+
+
+def test_async_project_only_scope_is_sent(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
+    monkeypatch.delenv("WEAVER_PROJECT_ID", raising=False)
+
+    async def run() -> None:
+        service = AsyncServiceClient(project_id="project-async")
+        service._http = MagicMock()
+        service._http.post = AsyncMock(return_value={"id": "session-project"})
+
+        await service.ensure_session()
+
+        payload = service._http.post.call_args.kwargs["json"]
+        assert payload["project_id"] == "project-async"
+        assert "organization_id" not in payload
 
     asyncio.run(run())
