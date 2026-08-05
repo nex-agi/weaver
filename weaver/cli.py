@@ -427,7 +427,7 @@ def organizations_list_cmd(
     "--org-id",
     "org_id",
     envvar="WEAVER_ORGANIZATION_ID",
-    help="Organization ID; defaults to the first available organization",
+    help="Organization ID; defaults to the user's stable default organization",
 )
 @click.option(
     "--organization",

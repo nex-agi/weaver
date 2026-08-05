@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 
@@ -172,23 +172,86 @@ def test_explicit_scope_resolution_does_not_inherit_unrelated_environment(monkey
     )
 
 
-def test_project_discovery_falls_back_to_first_organization(monkeypatch) -> None:
+def test_project_discovery_falls_back_to_stable_default_organization(monkeypatch) -> None:
     monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
     client = ServiceClient(organization_id="")
     client._http = MagicMock()
     client._http.get.side_effect = [
-        [{"id": "organization-default", "name": "Default"}],
+        {
+            "organization": {"id": "organization-default", "name": "Default"},
+            "project": {"id": "project-default", "name": "Default Project"},
+        },
         [{"id": "project-default", "name": "Default Project", "is_default": True}],
     ]
 
     projects = client.list_projects("")
 
     assert projects[0]["id"] == "project-default"
-    assert client._http.get.call_args_list[0].args[0] == "/api/v1/organizations"
+    assert client._http.get.call_args_list[0] == call("/api/v1/scope/resolve", params={})
     assert (
         client._http.get.call_args_list[1].args[0]
         == "/api/v1/organizations/organization-default/projects"
     )
+
+
+def test_project_discovery_returns_empty_when_default_scope_is_unavailable(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
+    client = ServiceClient(organization_id="")
+    client._http = MagicMock()
+    client._http.get.return_value = {}
+
+    assert client.list_projects("") == []
+    client._http.get.assert_called_once_with("/api/v1/scope/resolve", params={})
+
+
+def test_supported_models_use_selected_organization_and_traverse_pages() -> None:
+    client = ServiceClient(organization_id="organization-selected")
+    client._http = MagicMock()
+    client._http.get.side_effect = [
+        {
+            "items": [
+                {"name": "Public/Available", "status": "available"},
+                {"name": "Public/Unavailable", "status": "unavailable"},
+            ],
+            "pagination": {"total_count": 3},
+        },
+        {
+            "items": [{"name": "Internal/Developer", "visibility": "internal"}],
+            "pagination": {"total_count": 3},
+        },
+    ]
+
+    assert client.list_supported_models() == ["Public/Available", "Internal/Developer"]
+    assert client._http.get.call_args_list == [
+        call(
+            "/api/v1/supported-models",
+            params={"limit": 100, "offset": 0, "organization_id": "organization-selected"},
+        ),
+        call(
+            "/api/v1/supported-models",
+            params={"limit": 100, "offset": 2, "organization_id": "organization-selected"},
+        ),
+    ]
+
+
+def test_supported_model_config_can_be_found_after_first_page() -> None:
+    client = ServiceClient()
+    client._http = MagicMock()
+    client._http.get.side_effect = [
+        {
+            "items": [{"name": "First/Model", "config": {}}],
+            "pagination": {"total_count": 2},
+        },
+        {
+            "items": [{"name": "Target/Model", "config": {"resource": {}}}],
+            "pagination": {"total_count": 2},
+        },
+    ]
+
+    assert client.get_supported_model_config("Target/Model") == {
+        "name": "Target/Model",
+        "config": {"resource": {}},
+    }
 
 
 def test_training_client_logs_custom_metrics_and_exposes_training_run_id() -> None:
@@ -326,5 +389,71 @@ def test_async_named_scope_matches_sync_resolution(monkeypatch) -> None:
         payload = service._http.post.call_args.kwargs["json"]
         assert payload["organization_id"] == "organization-resolved"
         assert payload["project_id"] == "project-resolved"
+
+    asyncio.run(run())
+
+
+def test_async_project_discovery_uses_stable_default_scope(monkeypatch) -> None:
+    monkeypatch.delenv("WEAVER_ORGANIZATION_ID", raising=False)
+
+    async def run() -> None:
+        service = AsyncServiceClient(organization_id="")
+        service._http = MagicMock()
+        service._http.get = AsyncMock(
+            side_effect=[
+                {
+                    "organization": {"id": "organization-default"},
+                    "project": {"id": "project-default"},
+                },
+                [{"id": "project-default", "is_default": True}],
+            ]
+        )
+
+        projects = await service.list_projects("")
+
+        assert projects == [{"id": "project-default", "is_default": True}]
+        assert service._http.get.await_args_list[0] == call("/api/v1/scope/resolve", params={})
+        assert service._http.get.await_args_list[1].args[0] == (
+            "/api/v1/organizations/organization-default/projects"
+        )
+
+    asyncio.run(run())
+
+
+def test_async_supported_models_match_current_catalog_status_and_pagination() -> None:
+    async def run() -> None:
+        service = AsyncServiceClient()
+        service._session = {"organization_id": "organization-session"}
+        service._http = MagicMock()
+        service._http.get = AsyncMock(
+            side_effect=[
+                {
+                    "items": [
+                        {"name": "Legacy/Healthy", "status": "healthy"},
+                        {"name": "Catalog/Unavailable", "status": "unavailable"},
+                    ],
+                    "pagination": {"total_count": 3},
+                },
+                {
+                    "items": [{"name": "Catalog/Available", "status": "available"}],
+                    "pagination": {"total_count": 3},
+                },
+            ]
+        )
+
+        assert await service.list_supported_models() == [
+            "Legacy/Healthy",
+            "Catalog/Available",
+        ]
+        assert service._http.get.await_args_list == [
+            call(
+                "/api/v1/supported-models",
+                params={"limit": 100, "offset": 0, "organization_id": "organization-session"},
+            ),
+            call(
+                "/api/v1/supported-models",
+                params={"limit": 100, "offset": 2, "organization_id": "organization-session"},
+            ),
+        ]
 
     asyncio.run(run())

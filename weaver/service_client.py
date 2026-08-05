@@ -487,23 +487,65 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         response = self.http.post(path, json=payload, max_retries=1)
         return build_operation_handle(self.http, response)
 
+    def _supported_model_scope_params(self) -> Dict[str, str]:
+        organization_id = self._organization_id
+        if organization_id is None and isinstance(self._session, dict):
+            raw_id = lookup_case_insensitive(self._session, "organization_id")
+            organization_id = str(raw_id).strip() if raw_id else None
+        if organization_id is None and (
+            self._organization_reference or self._project_id or self._project_reference
+        ):
+            scope = self.resolve_scope(
+                self._organization_reference,
+                self._project_id or self._project_reference,
+            )
+            organization = scope.get("organization")
+            if isinstance(organization, dict):
+                raw_id = lookup_case_insensitive(organization, "id")
+                organization_id = str(raw_id).strip() if raw_id else None
+        return {"organization_id": organization_id} if organization_id else {}
+
+    def _list_supported_model_records(self) -> List[Dict[str, Any]]:
+        """Traverse the role-filtered supported-model collection."""
+
+        records: List[Dict[str, Any]] = []
+        limit = 100
+        offset = 0
+        scope = self._supported_model_scope_params()
+        while True:
+            params: Dict[str, Any] = {"limit": limit, "offset": offset, **scope}
+            payload = self.http.get("/api/v1/supported-models", params=params)
+            if not isinstance(payload, dict):
+                break
+            items = payload.get("items")
+            if not isinstance(items, list):
+                break
+            page = [item for item in items if isinstance(item, dict)]
+            records.extend(page)
+            pagination = payload.get("pagination")
+            if not isinstance(pagination, dict):
+                break
+            total = pagination.get("total_count")
+            try:
+                total_count = int(str(total))
+            except (TypeError, ValueError):
+                break
+            offset += len(items)
+            if not items or offset >= total_count:
+                break
+        return records
+
     def list_supported_models(self) -> List[str]:
-        """Return supported model names exposed by the server."""
-        payload = self.http.get("/api/v1/supported-models")
-        if not isinstance(payload, dict):
-            return []
-        items = payload.get("items")
+        """Return usable model names exposed to the authenticated role."""
+
         names: List[str] = []
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                name = lookup_case_insensitive(item, "name")
-                status = lookup_case_insensitive(item, "status")
-                if status and str(status).lower() != "healthy":
-                    continue
-                if name:
-                    names.append(str(name))
+        for item in self._list_supported_model_records():
+            name = lookup_case_insensitive(item, "name")
+            status = lookup_case_insensitive(item, "status")
+            if status and str(status).lower() not in {"healthy", "available"}:
+                continue
+            if name:
+                names.append(str(name))
         return names
 
     def list_organizations(self) -> List[Dict[str, Any]]:
@@ -537,16 +579,17 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         return payload if isinstance(payload, dict) else {}
 
     def list_projects(self, organization_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List projects, falling back to the user's first organization."""
+        """List projects, falling back to the user's stable default organization."""
 
         resolved = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
         if resolved is None:
             resolved = self._organization_id
         if resolved is None:
-            organizations = self.list_organizations()
-            if not organizations:
+            scope = self.resolve_scope()
+            organization = scope.get("organization")
+            if not isinstance(organization, dict):
                 return []
-            resolved = str(organizations[0].get("id", "")).strip() or None
+            resolved = str(organization.get("id", "")).strip() or None
         if resolved is None:
             return []
         payload = self.http.get(f"/api/v1/organizations/{resolved}/projects")
@@ -619,16 +662,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         Returns:
             Model configuration dict if found, None otherwise
         """
-        payload = self.http.get("/api/v1/supported-models")
-        if not isinstance(payload, dict):
-            return None
-        items = payload.get("items")
-        if not isinstance(items, list):
-            return None
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
+        for item in self._list_supported_model_records():
             name = lookup_case_insensitive(item, "name")
             if name and str(name) == base_model:
                 return item
