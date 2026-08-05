@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
 
 from . import __version__
 from ._http import APIClient
-from ._utils import extract_id, lookup_case_insensitive
+from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
 from .types import LoraConfig
@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
 
 
-class ServiceClient:
+class ServiceClient:  # pylint: disable=too-many-public-methods
     def __init__(
         self,
         *,
@@ -49,6 +49,11 @@ class ServiceClient:
         api_key: Optional[str] = None,
         default_tags: Optional[Sequence[str]] = None,
         session_id: Optional[str] = None,
+        organization_id: Optional[str] = None,
+        project_id: Optional[str] = None,
+        organization: Optional[str] = None,
+        project: Optional[str] = None,
+        user_metadata: Optional[Dict[str, Any]] = None,
         heartbeat_interval: float = 30.0,
     ) -> None:
         """Initialize ServiceClient.
@@ -58,6 +63,11 @@ class ServiceClient:
             api_key: API key for authentication (starts with 'sk-'). Get from admin UI at /api-keys
             default_tags: Default tags for sessions
             session_id: Optional existing session ID to reuse
+            organization_id: Optional Organization that owns a newly created session
+            project_id: Optional Project used for a newly created session
+            organization: Optional organization UUID, globally unique slug, or display name
+            project: Optional project UUID, organization-local slug, or display name
+            user_metadata: Metadata attached when a new session is created
             heartbeat_interval: Interval in seconds for session heartbeat
         """
         self._config = WeaverConfig.from_env(
@@ -66,6 +76,11 @@ class ServiceClient:
         )
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
+        self._organization_id = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
+        self._project_id = optional_scope_id(project_id, "WEAVER_PROJECT_ID")
+        self._organization_reference = optional_scope_id(organization, "WEAVER_ORGANIZATION")
+        self._project_reference = optional_scope_id(project, "WEAVER_PROJECT")
+        self._session_user_metadata = dict(user_metadata or {})
         self._heartbeat_interval = heartbeat_interval
 
         self._http: APIClient | None = None
@@ -91,16 +106,19 @@ class ServiceClient:
             raise RuntimeError("ServiceClient is not connected")
         return self._http
 
-    def connect(self) -> None:
-        if self._http is not None:
+    def connect(self, *, ensure_session: bool = True) -> None:
+        """Connect, optionally without creating or fetching a Session."""
+
+        if self._http is None:
+            self._http = APIClient(self._config)
+            atexit.register(self.close)
+        if not ensure_session or self._session is not None:
             return
-        self._http = APIClient(self._config)
         if self._session_id:
             self._fetch_session(self._session_id)
         else:
             self.ensure_session()
         self._start_heartbeat()
-        atexit.register(self.close)
 
     def terminate_model(
         self,
@@ -154,11 +172,37 @@ class ServiceClient:
     ) -> Dict[str, Any]:
         if self._session is not None:
             return self._session
+        organization_id = self._organization_id
+        project_id = self._project_id
+        if (organization_id is None and self._organization_reference) or (
+            project_id is None and self._project_reference
+        ):
+            resolved = self.resolve_scope(
+                organization_id or self._organization_reference,
+                project_id or self._project_reference,
+            )
+            if organization_id is None:
+                organization = resolved.get("organization")
+                if not isinstance(organization, dict):
+                    raise ValueError("Scope response missing organization")
+                organization_id = extract_id(organization)
+            if project_id is None:
+                project = resolved.get("project")
+                if not isinstance(project, dict):
+                    raise ValueError("Scope response missing project")
+                project_id = extract_id(project)
+
         payload = {
             "tags": list(tags or self._default_tags),
-            "user_metadata": user_metadata or {},
+            "user_metadata": (
+                user_metadata if user_metadata is not None else self._session_user_metadata
+            ),
             "sdk_version": __version__,
         }
+        if organization_id:
+            payload["organization_id"] = organization_id
+        if project_id:
+            payload["project_id"] = project_id
         session = self.http.post("/api/v1/sessions", json=payload)
         self._session_id = extract_id(session)
         self._session = session
@@ -304,6 +348,15 @@ class ServiceClient:
             debug_info=debug_info,
         )
 
+    def create_training_client(self, **kwargs: Any) -> "TrainingClient":
+        """Create a Training Run client.
+
+        This is the canonical product name for :meth:`create_model`. The old
+        method remains supported for compatibility with existing recipes.
+        """
+
+        return self.create_model(**kwargs)
+
     def _next_model_seq(self) -> int:
         value = self._model_seq_counter
         self._model_seq_counter += 1
@@ -434,25 +487,171 @@ class ServiceClient:
         response = self.http.post(path, json=payload, max_retries=1)
         return build_operation_handle(self.http, response)
 
+    def _supported_model_scope_params(self) -> Dict[str, str]:
+        organization_id = self._organization_id
+        if organization_id is None and isinstance(self._session, dict):
+            raw_id = lookup_case_insensitive(self._session, "organization_id")
+            organization_id = str(raw_id).strip() if raw_id else None
+        if organization_id is None and (
+            self._organization_reference or self._project_id or self._project_reference
+        ):
+            scope = self.resolve_scope(
+                self._organization_reference,
+                self._project_id or self._project_reference,
+            )
+            organization = scope.get("organization")
+            if isinstance(organization, dict):
+                raw_id = lookup_case_insensitive(organization, "id")
+                organization_id = str(raw_id).strip() if raw_id else None
+        return {"organization_id": organization_id} if organization_id else {}
+
+    def _list_supported_model_records(self) -> List[Dict[str, Any]]:
+        """Traverse the role-filtered supported-model collection."""
+
+        records: List[Dict[str, Any]] = []
+        limit = 100
+        offset = 0
+        scope = self._supported_model_scope_params()
+        while True:
+            params: Dict[str, Any] = {"limit": limit, "offset": offset, **scope}
+            payload = self.http.get("/api/v1/supported-models", params=params)
+            if not isinstance(payload, dict):
+                break
+            items = payload.get("items")
+            if not isinstance(items, list):
+                break
+            page = [item for item in items if isinstance(item, dict)]
+            records.extend(page)
+            pagination = payload.get("pagination")
+            if not isinstance(pagination, dict):
+                break
+            total = pagination.get("total_count")
+            try:
+                total_count = int(str(total))
+            except (TypeError, ValueError):
+                break
+            offset += len(items)
+            if not items or offset >= total_count:
+                break
+        return records
+
     def list_supported_models(self) -> List[str]:
-        """Return supported model names exposed by the server."""
-        payload = self.http.get("/api/v1/supported-models")
-        print(f"payload: {payload}")
-        if not isinstance(payload, dict):
-            return []
-        items = payload.get("items")
+        """Return usable model names exposed to the authenticated role."""
+
         names: List[str] = []
-        if isinstance(items, list):
-            for item in items:
-                if not isinstance(item, dict):
-                    continue
-                name = lookup_case_insensitive(item, "name")
-                status = lookup_case_insensitive(item, "status")
-                if status and str(status).lower() != "healthy":
-                    continue
-                if name:
-                    names.append(str(name))
+        for item in self._list_supported_model_records():
+            name = lookup_case_insensitive(item, "name")
+            status = lookup_case_insensitive(item, "status")
+            if status and str(status).lower() not in {"healthy", "available"}:
+                continue
+            if name:
+                names.append(str(name))
         return names
+
+    def list_organizations(self) -> List[Dict[str, Any]]:
+        """List organizations available to the authenticated user."""
+
+        payload = self.http.get("/api/v1/organizations")
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def resolve_scope(
+        self,
+        organization: Optional[str] = None,
+        project: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Resolve UUID/slug/name references to canonical organization/project IDs.
+
+        Empty references are omitted, preserving the server's stable personal
+        organization and default-project fallback. Ambiguous display names are
+        surfaced as the server's 409 ``ambiguous_scope_reference`` error.
+        """
+
+        params: Dict[str, str] = {}
+        organization_ref = organization.strip() if organization else None
+        project_ref = project.strip() if project else None
+        if organization_ref:
+            params["organization"] = organization_ref
+        if project_ref:
+            params["project"] = project_ref
+        payload = self.http.get("/api/v1/scope/resolve", params=params)
+        return payload if isinstance(payload, dict) else {}
+
+    def list_projects(self, organization_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """List projects, falling back to the user's stable default organization."""
+
+        resolved = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
+        if resolved is None:
+            resolved = self._organization_id
+        if resolved is None:
+            scope = self.resolve_scope()
+            organization = scope.get("organization")
+            if not isinstance(organization, dict):
+                return []
+            resolved = str(organization.get("id", "")).strip() or None
+        if resolved is None:
+            return []
+        payload = self.http.get(f"/api/v1/organizations/{resolved}/projects")
+        if not isinstance(payload, list):
+            return []
+        return [item for item in payload if isinstance(item, dict)]
+
+    def _quota_scope_params(self, organization_id: Optional[str]) -> Dict[str, str]:
+        resolved = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
+        if resolved is None:
+            resolved = self._organization_id
+        return {"org_id": resolved} if resolved is not None else {}
+
+    def get_quota_balance(self, organization_id: Optional[str] = None) -> Dict[str, Any]:
+        """Return the caller's nano-USD quota balance.
+
+        When no organization is supplied by parameter, constructor, or
+        environment, the unscoped endpoint lets the server select the user's
+        default organization.
+        """
+
+        scope = self._quota_scope_params(organization_id)
+        if scope:
+            payload = self.http.get("/api/v1/quota/balance", params=scope)
+        else:
+            payload = self.http.get("/api/v1/quota/balance")
+        return payload if isinstance(payload, dict) else {}
+
+    def list_quota_requests(
+        self,
+        organization_id: Optional[str] = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        """List quota requests submitted by the current user."""
+
+        params: Dict[str, Any] = {"limit": limit, "offset": offset}
+        params.update(self._quota_scope_params(organization_id))
+        payload = self.http.get("/api/v1/quota/requests", params=params)
+        return payload if isinstance(payload, dict) else {}
+
+    def request_quota(
+        self,
+        amount_usd: str,
+        *,
+        reason: str,
+        organization_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Request additional USD quota for the current user.
+
+        ``amount_usd`` is sent as a decimal string; callers should not convert
+        it to ``float`` because the server accepts up to nano-USD precision.
+        """
+
+        payload = self.http.post(
+            "/api/v1/quota/requests",
+            json={"amount_usd": str(amount_usd), "reason": reason},
+            params=self._quota_scope_params(organization_id) or None,
+            max_retries=1,
+        )
+        return payload if isinstance(payload, dict) else {}
 
     def get_supported_model_config(self, base_model: str) -> Optional[Dict[str, Any]]:
         """Get configuration for a specific supported model.
@@ -463,16 +662,7 @@ class ServiceClient:
         Returns:
             Model configuration dict if found, None otherwise
         """
-        payload = self.http.get("/api/v1/supported-models")
-        if not isinstance(payload, dict):
-            return None
-        items = payload.get("items")
-        if not isinstance(items, list):
-            return None
-
-        for item in items:
-            if not isinstance(item, dict):
-                continue
+        for item in self._list_supported_model_records():
             name = lookup_case_insensitive(item, "name")
             if name and str(name) == base_model:
                 return item

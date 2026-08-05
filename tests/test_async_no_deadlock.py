@@ -91,8 +91,8 @@ class _Handler(BaseHTTPRequestHandler):
             if count >= _POLLS_TILL_DONE:
                 return self._send(200, {"id": op_id, "status": "done", "response": {"op": op_id}})
             return self._send(200, {"id": op_id, "status": "running"})
-        if self.path == "/api/v1/supported-models":
-            return self._send(200, {"items": []})
+        if self.path.partition("?")[0] == "/api/v1/supported-models":
+            return self._send(200, {"items": [], "pagination": {"total_count": 0}})
         return self._send(404, {})
 
     def log_message(self, *_args, **_kwargs) -> None:  # silence test noise

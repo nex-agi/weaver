@@ -110,8 +110,15 @@ class AsyncAPIClient:
     async def get(self, path: str, *, params: Mapping[str, Any] | None = None) -> Any:
         return await self._request("GET", path, params=params)
 
-    async def post(self, path: str, *, json: Any = None, max_retries: int | None = None) -> Any:
-        return await self._request("POST", path, json=json, max_retries=max_retries)
+    async def post(
+        self,
+        path: str,
+        *,
+        json: Any = None,
+        params: Mapping[str, Any] | None = None,
+        max_retries: int | None = None,
+    ) -> Any:
+        return await self._request("POST", path, params=params, json=json, max_retries=max_retries)
 
     async def patch(self, path: str, *, json: Any) -> Any:
         return await self._request("PATCH", path, json=json)

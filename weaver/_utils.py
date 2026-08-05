@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict
 
 
@@ -45,6 +46,21 @@ UNSET = _UnsetType()
 # shared storage. Callers can pass an explicit ``ttl_seconds`` (including
 # ``None`` for permanent retention) to override it.
 DEFAULT_SAMPLER_TTL_SECONDS = 3600  # 1 hour
+
+
+def optional_scope_id(value: str | None, env_var: str) -> str | None:
+    """Resolve and normalize an optional organization/project identifier.
+
+    ``None`` allows the environment variable to provide a default. An
+    explicitly empty value is normalized to ``None`` so session creation can
+    rely on the server's default-organization/default-project fallback.
+    """
+
+    candidate = os.getenv(env_var) if value is None else value
+    if candidate is None:
+        return None
+    normalized = candidate.strip()
+    return normalized or None
 
 
 def lookup_case_insensitive(payload: Dict[str, Any], name: str) -> Any:

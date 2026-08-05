@@ -18,6 +18,10 @@ pip install nex-weaver
 
 通过关键字参数或环境变量配置：
 - `WEAVER_API_KEY`
+- `WEAVER_ORGANIZATION_ID` / `WEAVER_PROJECT_ID`：规范 UUID
+- `WEAVER_ORGANIZATION` / `WEAVER_PROJECT`：UUID、slug 或展示名称
+
+规范 UUID 的优先级更高。组织和项目均为空时，服务端继续使用稳定的个人组织和默认项目回退逻辑。
 
 ## 快速开始
 
@@ -32,6 +36,21 @@ def main():
 if __name__ == "__main__":
     main()
 ```
+
+可以使用易读的引用选择范围，也可以通过 CLI 查询和解析：
+
+```python
+with ServiceClient(organization="research", project="alignment") as client:
+    client.ensure_session()
+```
+
+```bash
+weaver organizations list
+weaver projects list --organization research
+weaver scope resolve --organization research --project alignment
+```
+
+组织 slug 全局唯一；项目 slug 和名称在组织内唯一。展示名称存在歧义时会明确报错，不会猜测选择。
 
 ## 使用方法
 

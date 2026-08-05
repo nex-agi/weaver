@@ -24,6 +24,7 @@ except Exception:
     __version__ = "0.3.0"
 
 from . import types  # noqa: F401
+from ._http import WeaverAPIError  # noqa: F401
 from .async_sampling_client import AsyncSamplingClient  # noqa: F401
 from .async_service_client import AsyncServiceClient  # noqa: F401
 from .async_training_client import AsyncTrainingClient  # noqa: F401
@@ -37,6 +38,7 @@ __all__ = [
     "AsyncTrainingClient",
     "AsyncSamplingClient",
     "AsyncOperationHandle",
+    "WeaverAPIError",
     "types",
     "__version__",
 ]
