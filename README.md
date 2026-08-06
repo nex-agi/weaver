@@ -40,12 +40,21 @@ if __name__ == "__main__":
     main()
 ```
 
-Select a scope by human-readable references, or discover and resolve available scopes:
+Give a new Session an optional experiment name and searchable string labels while
+selecting its scope by human-readable references:
 
 ```python
-with ServiceClient(organization="research", project="alignment") as client:
+with ServiceClient(
+    organization="research",
+    project="alignment",
+    name="PPO baseline",
+    labels={"dataset": "math", "environment": "staging"},
+) as client:
     client.ensure_session()
 ```
+
+Empty `name`/`labels` are omitted from the create request, preserving compatibility
+with legacy servers and existing call sites.
 
 ```bash
 weaver organizations list

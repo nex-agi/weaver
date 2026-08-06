@@ -30,6 +30,8 @@ def test_service_client_creates_session_in_project_with_constructor_metadata() -
     client = ServiceClient(
         organization_id="organization-1",
         project_id="project-1",
+        name="  PPO baseline  ",
+        labels={"environment": "staging", "owner": "research"},
         user_metadata={"recipe": "grpo"},
     )
     client._http = MagicMock()
@@ -41,7 +43,33 @@ def test_service_client_creates_session_in_project_with_constructor_metadata() -
     assert args[0] == "/api/v1/sessions"
     assert kwargs["json"]["organization_id"] == "organization-1"
     assert kwargs["json"]["project_id"] == "project-1"
+    assert kwargs["json"]["name"] == "PPO baseline"
+    assert kwargs["json"]["labels"] == {"environment": "staging", "owner": "research"}
     assert kwargs["json"]["user_metadata"] == {"recipe": "grpo"}
+
+
+def test_empty_experiment_metadata_is_omitted_for_legacy_servers() -> None:
+    client = ServiceClient(name="  ", labels={})
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "session-legacy"}
+
+    client.ensure_session()
+
+    payload = client._http.post.call_args.kwargs["json"]
+    assert "name" not in payload
+    assert "labels" not in payload
+
+
+def test_constructor_copies_experiment_labels() -> None:
+    labels = {"environment": "staging"}
+    client = ServiceClient(labels=labels)
+    labels["environment"] = "mutated"
+    client._http = MagicMock()
+    client._http.post.return_value = {"id": "session-copied-labels"}
+
+    client.ensure_session()
+
+    assert client._http.post.call_args.kwargs["json"]["labels"] == {"environment": "staging"}
 
 
 def test_empty_scope_ids_are_omitted_so_server_fallback_applies(monkeypatch) -> None:
@@ -304,6 +332,8 @@ def test_async_console_protocol_matches_sync_client() -> None:
         service = AsyncServiceClient(
             organization_id="organization-2",
             project_id="project-2",
+            name="Async SFT",
+            labels={"dataset": "math"},
             user_metadata={"recipe": "sft"},
         )
         service._http = MagicMock()
@@ -312,6 +342,8 @@ def test_async_console_protocol_matches_sync_client() -> None:
         _, session_kwargs = service._http.post.call_args
         assert session_kwargs["json"]["organization_id"] == "organization-2"
         assert session_kwargs["json"]["project_id"] == "project-2"
+        assert session_kwargs["json"]["name"] == "Async SFT"
+        assert session_kwargs["json"]["labels"] == {"dataset": "math"}
         assert session_kwargs["json"]["user_metadata"] == {"recipe": "sft"}
 
         training = AsyncTrainingClient(

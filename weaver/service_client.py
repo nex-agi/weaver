@@ -20,7 +20,7 @@ import atexit
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
 
 from . import __version__
 from ._http import APIClient
@@ -49,6 +49,8 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         api_key: Optional[str] = None,
         default_tags: Optional[Sequence[str]] = None,
         session_id: Optional[str] = None,
+        name: Optional[str] = None,
+        labels: Optional[Mapping[str, str]] = None,
         organization_id: Optional[str] = None,
         project_id: Optional[str] = None,
         organization: Optional[str] = None,
@@ -63,6 +65,8 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             api_key: API key for authentication (starts with 'sk-'). Get from admin UI at /api-keys
             default_tags: Default tags for sessions
             session_id: Optional existing session ID to reuse
+            name: Optional experiment display name for a newly created Session
+            labels: Optional searchable string metadata for a newly created Session
             organization_id: Optional Organization that owns a newly created session
             project_id: Optional Project used for a newly created session
             organization: Optional organization UUID, globally unique slug, or display name
@@ -76,6 +80,8 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         )
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
+        self._session_name = name.strip() if name and name.strip() else None
+        self._session_labels = dict(labels or {})
         self._organization_id = optional_scope_id(organization_id, "WEAVER_ORGANIZATION_ID")
         self._project_id = optional_scope_id(project_id, "WEAVER_PROJECT_ID")
         self._organization_reference = optional_scope_id(organization, "WEAVER_ORGANIZATION")
@@ -167,6 +173,8 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
     def ensure_session(
         self,
         *,
+        name: Optional[str] = None,
+        labels: Optional[Mapping[str, str]] = None,
         tags: Optional[Sequence[str]] = None,
         user_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -199,6 +207,12 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             ),
             "sdk_version": __version__,
         }
+        session_name = self._session_name if name is None else name.strip()
+        session_labels = self._session_labels if labels is None else dict(labels)
+        if session_name:
+            payload["name"] = session_name
+        if session_labels:
+            payload["labels"] = dict(session_labels)
         if organization_id:
             payload["organization_id"] = organization_id
         if project_id:
