@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, List, overload
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, overload
 
 from transformers.tokenization_utils import PreTrainedTokenizer
 
@@ -48,6 +49,9 @@ class AsyncSamplingClient:
         self.model_id = model_id
         self.tokenizer_path = tokenizer_path
         self._tokenizer: PreTrainedTokenizer | None = None
+        # Cached result of the generation-control eligibility check; a model's
+        # training mode is fixed at creation, so one confirmation is enough.
+        self._is_full_ft = False
 
     @overload
     async def sample(
@@ -140,12 +144,35 @@ class AsyncSamplingClient:
             "return_rollout_token_expert_data": result.get("return_rollout_token_expert_data"),
         }
 
-    async def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Dict[str, Any]:
-        """Pause in-flight generation on the engines behind this session.
+    async def _ensure_full_ft(self) -> None:
+        """Verify this client's model is full fine-tuning, once, then cache it.
 
-        See :meth:`weaver.sampling_client.SamplingClient.pause_generation`.
+        See :meth:`weaver.sampling_client.SamplingClient._ensure_full_ft`.
+        """
+        if self._is_full_ft:
+            return
+        model_id = self.model_id or _su.parse_model_id_from_weaver_path(self.model_path)
+        if not model_id:
+            raise ValueError(
+                "generation control requires a full fine-tuning model, but this sampling "
+                "client is not bound to one (no model_id, and model_path carries no model "
+                "id). Sampling against a bare base model or a LoRA adapter on the shared "
+                "base-model pool cannot be paused: the engine is shared with other tenants."
+            )
+        model = await self._service.get_model(model_id)
+        _su.ensure_full_ft_for_control(
+            lookup_case_insensitive(model, "training_mode"), model_id=model_id
+        )
+        self._is_full_ft = True
+
+    async def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Dict[str, Any]:
+        """Pause in-flight generation on the engine serving this model.
+
+        Engine-wide and full-fine-tuning-only. See
+        :meth:`weaver.sampling_client.SamplingClient.pause_generation`.
         """
         body = _su.build_pause_generation_body(mode)
+        await self._ensure_full_ft()
         return await self._service.http.post(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation",
             json=body,
@@ -156,9 +183,28 @@ class AsyncSamplingClient:
 
         See :meth:`weaver.sampling_client.SamplingClient.continue_generation`.
         """
+        await self._ensure_full_ft()
         return await self._service.http.post(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation",
         )
+
+    @asynccontextmanager
+    async def paused(
+        self, *, mode: PauseMode | str = PauseMode.ABORT
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Pause the engine for the duration of the block, then always resume.
+
+        See :meth:`weaver.sampling_client.SamplingClient.paused`.
+
+        Example:
+            >>> async with sampling_client.paused(mode=PauseMode.ABORT):
+            ...     path = await training_client.save_weights_for_sampler(name="step-42")
+        """
+        result = await self.pause_generation(mode=mode)
+        try:
+            yield result
+        finally:
+            await self.continue_generation()
 
     async def _ensure_tokenizer_source(self) -> None:
         """Make sure a tokenizer path or base_model is known (may fetch the session)."""

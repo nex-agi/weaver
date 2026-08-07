@@ -21,6 +21,7 @@ owning one. The callable is invoked lazily, only when decoding is required.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Dict, List, Optional
 
 from transformers.tokenization_utils import PreTrainedTokenizer
@@ -70,6 +71,61 @@ def build_logprobs_body(
 def build_pause_generation_body(mode: "PauseMode | str") -> Dict[str, Any]:
     """Build the ``pause-generation`` request body, validating ``mode``."""
     return {"mode": coerce_pause_mode(mode)}
+
+
+# Checkpoint URIs are ``weaver://<model-id>/checkpoints/<name>``; the model id is
+# always the first path segment.
+_WEAVER_PATH_RE = re.compile(r"^weaver://([^/]+)/")
+
+
+def parse_model_id_from_weaver_path(path: str | None) -> str | None:
+    """Extract the model id embedded in a ``weaver://`` checkpoint URI.
+
+    A sampling client created from a checkpoint path alone still knows which
+    model produced it, because the id is part of the URI. This recovers it so
+    the client does not have to round-trip to the server for something it is
+    already holding.
+
+    Note this is *not* :func:`weaver._http.extract_model_id_from_path`, which
+    parses API request paths (``/api/v1/models/<id>/...``), not storage URIs.
+
+    Args:
+        path: A ``weaver://<model-id>/checkpoints/<name>`` URI, or None.
+
+    Returns:
+        The model id, or None if ``path`` is absent or not a weaver URI.
+    """
+    if not path:
+        return None
+    match = _WEAVER_PATH_RE.match(path.strip())
+    if not match:
+        return None
+    return match.group(1) or None
+
+
+def ensure_full_ft_for_control(training_mode: Any, *, model_id: str | None) -> None:
+    """Reject generation control against anything but a full fine-tuning model.
+
+    pause/continue act on a whole inference engine, not on one sampling session.
+    Full fine-tuning is the only mode with a dedicated engine; LoRA adapters are
+    served from a single shared engine per base model, so pausing there would
+    abort in-flight generation for every other tenant on that base model.
+
+    Args:
+        training_mode: The model's ``training_mode`` as reported by the server.
+        model_id: The model the control primitive resolved to, for the message.
+
+    Raises:
+        ValueError: If ``training_mode`` is not ``"full_ft"``.
+    """
+    if training_mode == "full_ft":
+        return
+    raise ValueError(
+        f"generation control is only supported for full fine-tuning models, but model "
+        f"{model_id} has training_mode={training_mode!r}. LoRA adapters share one "
+        f"inference engine per base model, so pausing it would abort in-flight "
+        f"generation for unrelated tenants."
+    )
 
 
 def sanitize_tokens(value: Any) -> List[int]:

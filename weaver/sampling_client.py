@@ -16,7 +16,8 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List
 
 from transformers.tokenization_utils import PreTrainedTokenizer
 
@@ -45,6 +46,9 @@ class SamplingClient:
         self.model_id = model_id
         self.tokenizer_path = tokenizer_path
         self._tokenizer: PreTrainedTokenizer | None = None
+        # Cached result of the generation-control eligibility check; a model's
+        # training mode is fixed at creation, so one confirmation is enough.
+        self._is_full_ft = False
 
     def sample(
         self,
@@ -119,8 +123,34 @@ class SamplingClient:
             "return_rollout_token_expert_data": result.get("return_rollout_token_expert_data"),
         }
 
+    def _ensure_full_ft(self) -> None:
+        """Verify this client's model is full fine-tuning, once, then cache it.
+
+        The check runs client-side so an unsupported call fails immediately and
+        with a precise message, instead of travelling to the server to be
+        rejected there. The server enforces the same rule independently.
+
+        Raises:
+            ValueError: If the client is not bound to a full fine-tuning model.
+        """
+        if self._is_full_ft:
+            return
+        model_id = self.model_id or _su.parse_model_id_from_weaver_path(self.model_path)
+        if not model_id:
+            raise ValueError(
+                "generation control requires a full fine-tuning model, but this sampling "
+                "client is not bound to one (no model_id, and model_path carries no model "
+                "id). Sampling against a bare base model or a LoRA adapter on the shared "
+                "base-model pool cannot be paused: the engine is shared with other tenants."
+            )
+        model = self._service.get_model(model_id)
+        _su.ensure_full_ft_for_control(
+            lookup_case_insensitive(model, "training_mode"), model_id=model_id
+        )
+        self._is_full_ft = True
+
     def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Dict[str, Any]:
-        """Pause in-flight generation on the engines behind this session.
+        """Pause in-flight generation on the engine serving this model.
 
         This is a stateless control primitive: it freezes the engine until
         :meth:`continue_generation` is called. With the default
@@ -130,17 +160,35 @@ class SamplingClient:
         partial/async rollout weight swaps
         (abort -> drain -> sync_weights -> continue).
 
+        **Scope**: the pause is engine-wide, not scoped to this sampling
+        session. It freezes every in-flight request on the engine, including
+        ones issued through an earlier sampling session of the same model —
+        which is exactly what a weight swap needs, since the requests to abort
+        are the ones belonging to the previous weight epoch.
+
+        **Full fine-tuning only.** A LoRA adapter is served from one shared
+        engine per base model, so pausing it would abort generation for
+        unrelated tenants; such a call is rejected before any request is sent.
+
+        Prefer :meth:`paused` over calling this directly: a pause that is never
+        continued leaves the engine frozen indefinitely, and there is no
+        server-side auto-resume.
+
         Args:
             mode: How to treat in-flight requests. One of :class:`PauseMode`
                 (``abort`` / ``retract`` / ``in_place``) or its string value.
 
         Returns:
-            The server response payload.
+            An acknowledgement, ``{"ok": True, "status": "paused", "mode": ...}``.
+            The engine's own reply is deliberately not surfaced: it carries
+            replica topology and backend details, and varies by engine version.
 
         Raises:
-            ValueError: If ``mode`` is not a supported pause mode.
+            ValueError: If ``mode`` is not a supported pause mode, or this
+                client is not bound to a full fine-tuning model.
         """
         body = _su.build_pause_generation_body(mode)
+        self._ensure_full_ft()
         return self._service.http.post(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation",
             json=body,
@@ -149,12 +197,53 @@ class SamplingClient:
     def continue_generation(self) -> Dict[str, Any]:
         """Resume generation after a :meth:`pause_generation` call.
 
+        Engine-wide and full-fine-tuning-only, like :meth:`pause_generation`.
+
         Returns:
-            The server response payload.
+            An acknowledgement, ``{"ok": True, "status": "running"}``.
+
+        Raises:
+            ValueError: If this client is not bound to a full fine-tuning model.
         """
+        self._ensure_full_ft()
         return self._service.http.post(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation",
         )
+
+    @contextmanager
+    def paused(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Iterator[Dict[str, Any]]:
+        """Pause the engine for the duration of the block, then always resume.
+
+        A bare :meth:`pause_generation` that never reaches its
+        :meth:`continue_generation` — because the block raised, or the caller
+        returned early — leaves the engine frozen for good: nothing on the
+        server auto-resumes it. This pairs the two so the resume survives errors.
+
+        The resume is issued on *this* client even if the block replaced it with
+        a new one, which is correct: both address the same engine.
+
+        Example:
+            >>> with sampling_client.paused(mode=PauseMode.ABORT):
+            ...     path = training_client.save_weights_for_sampler(name="step-42")
+            ...     new_client = service.create_sampling_client(
+            ...         model_path=path, model_id=model_id, base_model=base_model
+            ...     )
+
+        Args:
+            mode: How to treat in-flight requests, as in :meth:`pause_generation`.
+
+        Yields:
+            The :meth:`pause_generation` response.
+
+        Raises:
+            ValueError: If ``mode`` is invalid or this client is not bound to a
+                full fine-tuning model. Nothing is paused in that case.
+        """
+        result = self.pause_generation(mode=mode)
+        try:
+            yield result
+        finally:
+            self.continue_generation()
 
     def _normalize_sample_result(self, payload: Any) -> Any:
         return _su.normalize_sample_result(payload, self._ensure_tokenizer)
