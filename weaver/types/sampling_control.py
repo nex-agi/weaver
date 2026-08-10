@@ -33,6 +33,17 @@ class PauseMode(str, Enum):
       resume from scratch after ``continue``.
     - ``IN_PLACE``: freeze requests where they are and resume them in place
       after ``continue``.
+
+    Scope, in all modes: the pause acts on a whole **inference engine**, not on
+    one sampling session. Every in-flight request on that engine is affected,
+    including requests issued through an earlier sampling session of the same
+    model — which is what makes it usable for weight swaps, where the requests
+    to abort belong to the previous weight epoch.
+
+    That scope is also why generation control is restricted to **full
+    fine-tuning** models: those get a dedicated engine, while LoRA adapters are
+    served from one shared engine per base model, where a pause would abort
+    generation for unrelated tenants.
     """
 
     ABORT = "abort"

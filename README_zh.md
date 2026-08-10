@@ -58,6 +58,25 @@ weaver scope resolve --organization research --project alignment
 
 完整可运行脚本参见 [`examples/pig_latin.py`](examples/pig_latin.py)。
 
+### 生成控制（仅限全量微调）
+
+RL 权重热切需要在新权重落地前让正在进行的生成停下来。采样客户端可以冻结所在的推理引擎，并在之后恢复：
+
+```python
+with sampling_client.paused(mode=PauseMode.ABORT):
+    path = training_client.save_weights_for_sampler(name="step-42")
+    new_client = service.create_sampling_client(
+        model_path=path, model_id=model_id, base_model=base_model
+    )
+```
+
+使用前需要知道两件事：
+
+- **暂停作用于整个引擎，而不是单个 sampling session。** 它会冻结该模型引擎上*所有*正在进行的请求，包括通过更早的 sampling session 发出的那些。这正是它能用于权重热切的原因——需要打断的恰恰是上一个权重版本的请求——但也意味着暂停永远不可能只影响"我自己的请求"。
+- **仅支持全量微调。** 全量微调模型拥有独占的引擎；LoRA adapter 则共用同一个底模引擎，在那里暂停会打断其他租户的生成，因此这类调用在发出请求之前就会被拒绝。
+
+建议使用 `paused()` 而不是直接调用 `pause_generation()` / `continue_generation()`：暂停之后如果没有走到恢复那一步，引擎会一直冻结下去，服务端不会自动恢复。异步客户端对应的形式是 `async with`。
+
 ## 生态
 
 [NexRL](https://github.com/nex-agi/NexRL) 是配套的 RL 训练框架。在其 **training-service** 模式下，NexRL 负责编排完整的 RL 流程（rollout、轨迹收集、策略更新），Weaver 提供底层的训练和推理服务。

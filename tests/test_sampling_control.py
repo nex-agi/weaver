@@ -29,26 +29,36 @@ from weaver.async_sampling_client import AsyncSamplingClient
 from weaver.sampling_client import SamplingClient
 from weaver.types import ModelInput, PauseMode
 
+MODEL_ID = "11111111-2222-3333-4444-555555555555"
 
-def _make_sync_client() -> tuple[SamplingClient, MagicMock]:
+
+def _make_sync_client(
+    training_mode: str = "full_ft", **overrides
+) -> tuple[SamplingClient, MagicMock]:
     mock_service = MagicMock()
-    client = SamplingClient(
-        service=mock_service,
-        sampling_session_id="sess-001",
-        base_model="Qwen/Qwen3-8B",
-    )
-    return client, mock_service
+    mock_service.get_model.return_value = {"training_mode": training_mode}
+    kwargs = {
+        "sampling_session_id": "sess-001",
+        "base_model": "Qwen/Qwen3-8B",
+        "model_id": MODEL_ID,
+    }
+    kwargs.update(overrides)
+    return SamplingClient(service=mock_service, **kwargs), mock_service
 
 
-def _make_async_client() -> tuple[AsyncSamplingClient, MagicMock]:
+def _make_async_client(
+    training_mode: str = "full_ft", **overrides
+) -> tuple[AsyncSamplingClient, MagicMock]:
     mock_service = MagicMock()
     mock_service.http.post = AsyncMock()
-    client = AsyncSamplingClient(
-        service=mock_service,
-        sampling_session_id="sess-001",
-        base_model="Qwen/Qwen3-8B",
-    )
-    return client, mock_service
+    mock_service.get_model = AsyncMock(return_value={"training_mode": training_mode})
+    kwargs = {
+        "sampling_session_id": "sess-001",
+        "base_model": "Qwen/Qwen3-8B",
+        "model_id": MODEL_ID,
+    }
+    kwargs.update(overrides)
+    return AsyncSamplingClient(service=mock_service, **kwargs), mock_service
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +125,79 @@ class TestSyncClient:
         )
         assert result == {"ok": True}
 
+    def test_paused_resumes_on_success(self):
+        client, mock_service = _make_sync_client()
+        mock_service.http.post.return_value = {"ok": True}
+
+        with client.paused() as result:
+            assert result == {"ok": True}
+
+        paths = [call[0][0] for call in mock_service.http.post.call_args_list]
+        assert paths == [
+            "/api/v1/sampling-sessions/sess-001/pause-generation",
+            "/api/v1/sampling-sessions/sess-001/continue-generation",
+        ]
+
+    def test_paused_resumes_on_exception(self):
+        """The whole point of the context manager: a frozen engine must not
+        survive an error inside the block, since nothing auto-resumes it."""
+        client, mock_service = _make_sync_client()
+        mock_service.http.post.return_value = {}
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with client.paused():
+                raise RuntimeError("boom")
+
+        paths = [call[0][0] for call in mock_service.http.post.call_args_list]
+        assert paths[-1] == "/api/v1/sampling-sessions/sess-001/continue-generation"
+
+
+class TestSyncFullFTRestriction:
+    def test_lora_model_is_rejected_without_calling_the_server(self):
+        client, mock_service = _make_sync_client(training_mode="lora")
+
+        with pytest.raises(ValueError, match="full fine-tuning"):
+            client.pause_generation()
+
+        mock_service.http.post.assert_not_called()
+
+    def test_continue_is_restricted_too(self):
+        client, mock_service = _make_sync_client(training_mode="lora")
+        with pytest.raises(ValueError, match="full fine-tuning"):
+            client.continue_generation()
+        mock_service.http.post.assert_not_called()
+
+    def test_unbound_client_is_rejected_without_any_request(self):
+        """No model_id and a model_path that carries none: a bare base-model or
+        shared-pool client, which has no engine of its own to freeze."""
+        client, mock_service = _make_sync_client(model_id=None, model_path=None)
+
+        with pytest.raises(ValueError, match="not bound"):
+            client.pause_generation()
+
+        mock_service.get_model.assert_not_called()
+        mock_service.http.post.assert_not_called()
+
+    def test_model_id_recovered_from_checkpoint_path(self):
+        client, mock_service = _make_sync_client(
+            model_id=None, model_path=f"weaver://{MODEL_ID}/checkpoints/step-42"
+        )
+        mock_service.http.post.return_value = {}
+
+        client.pause_generation()
+
+        mock_service.get_model.assert_called_once_with(MODEL_ID)
+
+    def test_eligibility_is_checked_once(self):
+        client, mock_service = _make_sync_client()
+        mock_service.http.post.return_value = {}
+
+        client.pause_generation()
+        client.continue_generation()
+        client.pause_generation()
+
+        assert mock_service.get_model.call_count == 1
+
 
 # --------------------------------------------------------------------------- #
 # Async client                                                                 #
@@ -148,6 +231,91 @@ class TestAsyncClient:
         client, _ = _make_async_client()
         with pytest.raises(ValueError):
             asyncio.run(client.pause_generation(mode="freeze"))
+
+    def test_paused_resumes_on_success(self):
+        client, mock_service = _make_async_client()
+        mock_service.http.post.return_value = {"ok": True}
+
+        async def _run():
+            async with client.paused() as result:
+                assert result == {"ok": True}
+
+        asyncio.run(_run())
+
+        paths = [call[0][0] for call in mock_service.http.post.call_args_list]
+        assert paths == [
+            "/api/v1/sampling-sessions/sess-001/pause-generation",
+            "/api/v1/sampling-sessions/sess-001/continue-generation",
+        ]
+
+    def test_paused_resumes_on_exception(self):
+        client, mock_service = _make_async_client()
+        mock_service.http.post.return_value = {}
+
+        async def _run():
+            async with client.paused():
+                raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            asyncio.run(_run())
+
+        paths = [call[0][0] for call in mock_service.http.post.call_args_list]
+        assert paths[-1] == "/api/v1/sampling-sessions/sess-001/continue-generation"
+
+
+class TestAsyncFullFTRestriction:
+    def test_lora_model_is_rejected_without_calling_the_server(self):
+        client, mock_service = _make_async_client(training_mode="lora")
+
+        with pytest.raises(ValueError, match="full fine-tuning"):
+            asyncio.run(client.pause_generation())
+
+        mock_service.http.post.assert_not_called()
+
+    def test_unbound_client_is_rejected_without_any_request(self):
+        client, mock_service = _make_async_client(model_id=None, model_path=None)
+
+        with pytest.raises(ValueError, match="not bound"):
+            asyncio.run(client.continue_generation())
+
+        mock_service.get_model.assert_not_called()
+        mock_service.http.post.assert_not_called()
+
+    def test_eligibility_is_checked_once(self):
+        client, mock_service = _make_async_client()
+        mock_service.http.post.return_value = {}
+
+        async def _run():
+            await client.pause_generation()
+            await client.continue_generation()
+
+        asyncio.run(_run())
+        assert mock_service.get_model.call_count == 1
+
+
+# --------------------------------------------------------------------------- #
+# Shared helpers                                                               #
+# --------------------------------------------------------------------------- #
+
+
+class TestWeaverPathParsing:
+    def test_extracts_model_id(self):
+        assert (
+            _su.parse_model_id_from_weaver_path(f"weaver://{MODEL_ID}/checkpoints/step-42")
+            == MODEL_ID
+        )
+
+    def test_returns_none_for_non_weaver_paths(self):
+        assert _su.parse_model_id_from_weaver_path(None) is None
+        assert _su.parse_model_id_from_weaver_path("") is None
+        assert _su.parse_model_id_from_weaver_path("/gpfs/checkpoints/step-42") is None
+        assert _su.parse_model_id_from_weaver_path("weaver://") is None
+
+    def test_ensure_full_ft_rejects_other_modes(self):
+        _su.ensure_full_ft_for_control("full_ft", model_id=MODEL_ID)
+        for mode in ("lora", "", None):
+            with pytest.raises(ValueError, match="full fine-tuning"):
+                _su.ensure_full_ft_for_control(mode, model_id=MODEL_ID)
 
 
 # --------------------------------------------------------------------------- #

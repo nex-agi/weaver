@@ -75,6 +75,34 @@ For a complete runnable script, see [`examples/pig_latin.py`](examples/pig_latin
 For large packed datasets, [`examples/streaming_sft.py`](examples/streaming_sft.py)
 shows bounded token-budget batching and submit-ahead.
 
+### Generation control (full fine-tuning only)
+
+RL weight swaps need in-flight generation to stop before new weights land. A sampling
+client can freeze its inference engine and resume it afterwards:
+
+```python
+with sampling_client.paused(mode=PauseMode.ABORT):
+    path = training_client.save_weights_for_sampler(name="step-42")
+    new_client = service.create_sampling_client(
+        model_path=path, model_id=model_id, base_model=base_model
+    )
+```
+
+Two things to know before using it:
+
+- **The pause is engine-wide, not per sampling session.** It freezes *every* in-flight
+  request on the engine serving that model, including ones issued through an earlier
+  sampling session. That is what makes it usable for weight swaps — the requests you
+  want to abort belong to the previous weight epoch — but it also means a pause is never
+  scoped to "just my requests".
+- **Full fine-tuning only.** Those models get a dedicated engine. LoRA adapters are
+  served from one shared engine per base model, where a pause would abort generation for
+  unrelated tenants, so the call is rejected before any request is sent.
+
+Prefer `paused()` over calling `pause_generation()` / `continue_generation()` directly:
+a pause that never reaches its resume leaves the engine frozen indefinitely, and there is
+no server-side auto-resume. The async client mirrors this as `async with`.
+
 ## Ecosystem
 
 [NexRL](https://github.com/nex-agi/NexRL) is the companion RL training framework.
