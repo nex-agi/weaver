@@ -15,16 +15,19 @@
 """Streaming, packed SFT with bounded preparation and submission lookahead.
 
 Input is JSONL with ``{"prompt": "...", "response": "..."}`` records. The
-source is read and tokenized only until one full trainer request is known; the
+source is read and tokenized only until one token-budgeted request is known; the
 corpus is never preprocessed in memory. While the trainer runs that request, a
 worker thread prepares the next one.
 
-The batcher's DP size and token budget must match the registered trainer.
+The batcher only estimates request size. The trainer performs the actual packing.
+It may submit more than ``global_batch_size`` source records to target that many
+packed sequences. To submit exactly ``global_batch_size`` source records instead,
+skip ``TokenBudgetBatcher`` and batch the source iterator by count.
 
 Example:
     python examples/streaming_sft.py data.jsonl \
         --base-model Qwen/Qwen3-8B --global-batch-size 128 \
-        --dp-size 8 --max-tokens-per-gpu 262144
+        --max-sequence-length 262144
 """
 
 from __future__ import annotations
@@ -75,7 +78,6 @@ class PreparedRequest:
     data: list[types.Datum]
     samples: int
     tokens: int
-    packed_microbatches: int
     prepare_seconds: float
 
 
@@ -119,9 +121,8 @@ def prepare_next(
         return None
     return PreparedRequest(
         data=[example.to_datum() for example in batch.items],
-        samples=batch.shape.samples,
-        tokens=batch.shape.tokens,
-        packed_microbatches=batch.shape.global_microbatches,
+        samples=len(batch.items),
+        tokens=batch.tokens,
         prepare_seconds=time.perf_counter() - started,
     )
 
@@ -171,13 +172,10 @@ async def run(args: argparse.Namespace) -> None:
         tokenizer = await asyncio.to_thread(training.get_tokenizer)
         batches = iter(
             TokenBudgetBatcher(
-                # Requires Megatron Bridge balanced packing: TRAINER_MICRO_BATCH_SIZE=0,
-                # matching DP/token budget, and router replay disabled.
                 iter_tokenized_examples(args.data, tokenizer),
                 length_fn=lambda example: len(example.input_tokens),
                 global_batch_size=args.global_batch_size,
-                dp_size=args.dp_size,
-                max_tokens_per_gpu=args.max_tokens_per_gpu,
+                max_sequence_length=args.max_sequence_length,
             )
         )
         prepared = asyncio.create_task(asyncio.to_thread(prepare_next, batches))
@@ -193,8 +191,7 @@ async def run(args: argparse.Namespace) -> None:
                 await queue.submit(step, request.data, optimizer)
                 print(
                     f"submitted step={step} samples={request.samples} "
-                    f"tokens={request.tokens} packed={request.packed_microbatches} "
-                    f"prepare_s={request.prepare_seconds:.3f}",
+                    f"tokens={request.tokens} prepare_s={request.prepare_seconds:.3f}",
                     flush=True,
                 )
 
@@ -223,8 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", default="Qwen/Qwen3-8B")
     parser.add_argument("--training-mode", choices=("full_ft", "lora"), default="full_ft")
     parser.add_argument("--global-batch-size", type=int, required=True)
-    parser.add_argument("--dp-size", type=int, required=True)
-    parser.add_argument("--max-tokens-per-gpu", type=int, required=True)
+    parser.add_argument("--max-sequence-length", type=int, required=True)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--submit-ahead", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)

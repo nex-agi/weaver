@@ -17,8 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import heapq
-import math
 from collections import deque
 from dataclasses import dataclass
 from typing import (
@@ -39,8 +37,6 @@ if TYPE_CHECKING:
     from .types import AdamParams, Datum
 
 T = TypeVar("T")
-_MAX_BOUNDARY_PROBES = 32
-_MIN_SAFE_FILL_PERCENT = 98
 
 
 class _AsyncTrainingClient(Protocol):
@@ -54,175 +50,26 @@ class _AsyncTrainingClient(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class PackedBatchShape:
-    """Predicted shape after Weaver's balanced DP partition.
-
-    Attributes:
-        samples: Number of source samples in the request.
-        tokens: Total source tokens in the request.
-        microbatches_per_dp: Synchronized microbatch count on each DP rank.
-        samples_per_dp: Source-sample counts assigned to each DP rank.
-        tokens_per_dp: Token counts assigned to each DP rank.
-        max_microbatch_tokens: Largest predicted packed microbatch.
-    """
-
-    samples: int
-    tokens: int
-    microbatches_per_dp: int
-    samples_per_dp: tuple[int, ...]
-    tokens_per_dp: tuple[int, ...]
-    max_microbatch_tokens: int = 0
-
-    @property
-    def global_microbatches(self) -> int:
-        """Return the predicted global packed microbatch count."""
-
-        return self.microbatches_per_dp * len(self.tokens_per_dp)
-
-    @property
-    def dp_safe(self) -> bool:
-        """Return whether every DP rank has enough samples to form the shape."""
-
-        return bool(self.microbatches_per_dp) and self.microbatches_per_dp <= min(
-            self.samples_per_dp, default=0
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class TokenBudgetBatch(Generic[T]):
-    """One source request selected from a streaming iterator."""
+    """One token-budgeted request selected from a streaming iterator."""
 
     items: tuple[T, ...]
-    shape: PackedBatchShape
-
-
-class _Partition:
-    __slots__ = ("items", "total")
-
-    def __init__(self) -> None:
-        self.items: list[tuple[int, int]] = []
-        self.total = 0
-
-    def add(self, index: int, value: int) -> None:
-        self.items.append((index, value))
-        self.total += value
-
-    def merge(self, other: "_Partition") -> None:
-        self.items.extend(other.items)
-        self.total += other.total
-
-    def __lt__(self, other: "_Partition") -> bool:
-        return (self.total, len(self.items), self.items) < (
-            other.total,
-            len(other.items),
-            other.items,
-        )
-
-
-class _PartitionState:
-    __slots__ = ("partitions", "width")
-
-    def __init__(self, items: Sequence[tuple[int, int]], width: int) -> None:
-        self.width = width
-        self.partitions = [_Partition() for _ in range(width)]
-        for partition, (index, value) in zip(self.partitions, items, strict=False):
-            partition.add(index, value)
-        self.partitions.sort(reverse=True)
-
-    @property
-    def spread(self) -> int:
-        return self.partitions[0].total - self.partitions[-1].total
-
-    def merge(self, other: "_PartitionState") -> None:
-        for index in range(self.width):
-            self.partitions[index].merge(other.partitions[self.width - 1 - index])
-        self.partitions.sort(reverse=True)
-
-    def __lt__(self, other: "_PartitionState") -> bool:
-        if self.spread != other.spread:
-            return self.spread > other.spread
-        return self.partitions[0] > other.partitions[0]
-
-
-def _balanced_partitions(lengths: Sequence[int], count: int) -> list[list[int]]:
-    """Match Weaver trainer's balanced DP partition for length-only planning."""
-
-    if len(lengths) < count:
-        return [list(range(rank, len(lengths), count)) for rank in range(count)]
-
-    states: list[_PartitionState] = []
-    for length, index in sorted((length, index) for index, length in enumerate(lengths)):
-        heapq.heappush(states, _PartitionState([(index, length)], count))
-    while len(states) > 1:
-        first = heapq.heappop(states)
-        second = heapq.heappop(states)
-        first.merge(second)
-        heapq.heappush(states, first)
-    return [sorted(index for index, _ in part.items) for part in states[0].partitions]
-
-
-def predict_packed_batch_shape(
-    lengths: Sequence[int], *, dp_size: int, max_tokens_per_gpu: int
-) -> PackedBatchShape:
-    """Predict the current balanced trainer's request shape from token lengths.
-
-    Args:
-        lengths: Valid-token length of each source sample.
-        dp_size: Data-parallel world size.
-        max_tokens_per_gpu: Trainer token budget for one packed microbatch.
-
-    Returns:
-        The predicted DP assignment and synchronized microbatch count.
-
-    Raises:
-        ValueError: If a size is invalid or a source sample exceeds the budget.
-    """
-
-    if dp_size <= 0:
-        raise ValueError("dp_size must be positive")
-    if max_tokens_per_gpu <= 0:
-        raise ValueError("max_tokens_per_gpu must be positive")
-    if any(length <= 0 for length in lengths):
-        raise ValueError("sample token lengths must be positive")
-    if lengths and max(lengths) > max_tokens_per_gpu:
-        raise ValueError(
-            f"sample length {max(lengths)} exceeds max_tokens_per_gpu=" f"{max_tokens_per_gpu}"
-        )
-    if not lengths:
-        return PackedBatchShape(0, 0, 0, (0,) * dp_size, (0,) * dp_size)
-
-    partitions = _balanced_partitions(lengths, dp_size)
-    tokens_per_dp = tuple(sum(lengths[index] for index in part) for part in partitions)
-    samples_per_dp = tuple(len(part) for part in partitions)
-    microbatches = max(math.ceil(tokens / max_tokens_per_gpu) for tokens in tokens_per_dp)
-    microbatch_tokens: list[int] = []
-    for part in partitions:
-        rank_lengths = [lengths[index] for index in part]
-        for microbatch in _balanced_partitions(rank_lengths, microbatches):
-            microbatch_tokens.append(sum(rank_lengths[index] for index in microbatch))
-    return PackedBatchShape(
-        samples=len(lengths),
-        tokens=sum(lengths),
-        microbatches_per_dp=microbatches,
-        samples_per_dp=samples_per_dp,
-        tokens_per_dp=tokens_per_dp,
-        max_microbatch_tokens=max(microbatch_tokens, default=0),
-    )
+    tokens: int
 
 
 class TokenBudgetBatcher(Generic[T]):
-    """Build full packed requests from a source stream with bounded memory.
+    """Build best-effort token-budgeted requests with bounded memory.
 
-    The batcher reads only until one DP-safe full request boundary is known.
-    Any item read past that boundary is carried into the next request; the
-    corpus is never planned or tokenized up front.
+    The target request size is ``global_batch_size * max_sequence_length``.
+    The trainer remains responsible for actual packing. An item that would
+    cross the target starts the next request, so the corpus is never planned or
+    tokenized up front.
 
     Args:
         source: Stream of already rendered or tokenized source samples.
         length_fn: Returns the valid-token length of one sample.
-        global_batch_size: Desired global number of packed microbatches.
-        dp_size: Data-parallel world size used by the registered model.
-        max_tokens_per_gpu: Trainer token budget for one packed microbatch.
+        global_batch_size: Desired number of packed sequences per request.
+        max_sequence_length: Target packed length and maximum source-sample length.
         drop_last: Drop an incomplete final request when the source ends.
     """
 
@@ -232,146 +79,48 @@ class TokenBudgetBatcher(Generic[T]):
         *,
         length_fn: Callable[[T], int],
         global_batch_size: int,
-        dp_size: int,
-        max_tokens_per_gpu: int,
+        max_sequence_length: int,
         drop_last: bool = True,
     ) -> None:
         if global_batch_size <= 0:
             raise ValueError("global_batch_size must be positive")
-        if dp_size <= 0 or global_batch_size % dp_size:
-            raise ValueError("global_batch_size must be divisible by dp_size")
-        if max_tokens_per_gpu <= 0:
-            raise ValueError("max_tokens_per_gpu must be positive")
+        if max_sequence_length <= 0:
+            raise ValueError("max_sequence_length must be positive")
         self._source = source
         self._length_fn = length_fn
         self._global_batch_size = global_batch_size
-        self._dp_size = dp_size
-        self._max_tokens_per_gpu = max_tokens_per_gpu
+        self._max_sequence_length = max_sequence_length
         self._drop_last = drop_last
 
     def __iter__(self) -> Iterator[TokenBudgetBatch[T]]:
-        target = self._global_batch_size // self._dp_size
+        target_tokens = self._global_batch_size * self._max_sequence_length
         items: list[T] = []
-        lengths: list[int] = []
-        shape: PackedBatchShape | None = None
         total_tokens = 0
-        max_length = 0
-        probing_boundary = False
-        boundary_probes = 0
 
         for item in self._source:
             length = int(self._length_fn(item))
             if length <= 0:
                 raise ValueError("sample token lengths must be positive")
-            if length > self._max_tokens_per_gpu:
+            if length > self._max_sequence_length:
                 raise ValueError(
-                    f"sample length {length} exceeds max_tokens_per_gpu="
-                    f"{self._max_tokens_per_gpu}"
+                    f"sample length {length} exceeds max_sequence_length="
+                    f"{self._max_sequence_length}"
                 )
+
+            if items and total_tokens + length > target_tokens:
+                yield TokenBudgetBatch(tuple(items), total_tokens)
+                items = []
+                total_tokens = 0
+
             items.append(item)
-            lengths.append(length)
             total_tokens += length
-            max_length = max(max_length, length)
+            if total_tokens == target_tokens:
+                yield TokenBudgetBatch(tuple(items), total_tokens)
+                items = []
+                total_tokens = 0
 
-            if not probing_boundary:
-                # Karmarkar-Karp's final partition spread is no larger than the
-                # longest sample. Until this bound crosses the per-DP capacity,
-                # the exact O(n log n) partition cannot overflow the target.
-                average_ceiling = math.ceil(total_tokens / self._dp_size)
-                partition_upper_bound = average_ceiling + max_length
-                if partition_upper_bound <= target * self._max_tokens_per_gpu:
-                    continue
-                probing_boundary = True
-                if len(items) > 1:
-                    previous = predict_packed_batch_shape(
-                        lengths[:-1],
-                        dp_size=self._dp_size,
-                        max_tokens_per_gpu=self._max_tokens_per_gpu,
-                    )
-                    if (
-                        previous.microbatches_per_dp == target
-                        and previous.dp_safe
-                        and previous.max_microbatch_tokens <= self._max_tokens_per_gpu
-                    ):
-                        global_capacity = self._global_batch_size * self._max_tokens_per_gpu
-                        if previous.tokens * 100 >= global_capacity * _MIN_SAFE_FILL_PERCENT:
-                            yield TokenBudgetBatch(tuple(items[:-1]), previous)
-                            items = [item]
-                            lengths = [length]
-                            shape = None
-                            total_tokens = length
-                            max_length = length
-                            probing_boundary = False
-                            boundary_probes = 0
-                            continue
-                        shape = previous
-
-            candidate = predict_packed_batch_shape(
-                lengths,
-                dp_size=self._dp_size,
-                max_tokens_per_gpu=self._max_tokens_per_gpu,
-            )
-            boundary_probes += 1
-            if candidate.microbatches_per_dp <= target:
-                if (
-                    candidate.microbatches_per_dp == target
-                    and candidate.dp_safe
-                    and candidate.max_microbatch_tokens <= self._max_tokens_per_gpu
-                ):
-                    shape = candidate
-                    if boundary_probes >= _MAX_BOUNDARY_PROBES:
-                        yield TokenBudgetBatch(tuple(items), shape)
-                        items = []
-                        lengths = []
-                        shape = None
-                        total_tokens = 0
-                        max_length = 0
-                        probing_boundary = False
-                        boundary_probes = 0
-                    continue
-                if shape is None:
-                    continue
-
-            overflow_item = items.pop()
-            overflow_length = lengths.pop()
-            if shape is None:
-                raise ValueError(
-                    "source stream crossed the packed batch boundary before a "
-                    "DP-safe full request was formed"
-                )
-            yield TokenBudgetBatch(tuple(items), shape)
-            items = [overflow_item]
-            lengths = [overflow_length]
-            shape = None
-            total_tokens = overflow_length
-            max_length = overflow_length
-            probing_boundary = False
-            boundary_probes = 0
-
-        final_shape = (
-            predict_packed_batch_shape(
-                lengths,
-                dp_size=self._dp_size,
-                max_tokens_per_gpu=self._max_tokens_per_gpu,
-            )
-            if items
-            else None
-        )
-        if (
-            items
-            and final_shape is not None
-            and final_shape.microbatches_per_dp == target
-            and final_shape.dp_safe
-            and final_shape.max_microbatch_tokens <= self._max_tokens_per_gpu
-        ):
-            yield TokenBudgetBatch(tuple(items), final_shape)
-        elif items and not self._drop_last:
-            assert final_shape is not None
-            if not final_shape.dp_safe:
-                raise ValueError("incomplete final request is not DP-safe")
-            if final_shape.max_microbatch_tokens > self._max_tokens_per_gpu:
-                raise ValueError("incomplete final request exceeds max_tokens_per_gpu")
-            yield TokenBudgetBatch(tuple(items), final_shape)
+        if items and not self._drop_last:
+            yield TokenBudgetBatch(tuple(items), total_tokens)
 
 
 @dataclass(frozen=True, slots=True)

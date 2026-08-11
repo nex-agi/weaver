@@ -18,56 +18,23 @@ import asyncio
 
 import pytest
 
-import weaver.training_pipeline as training_pipeline
 from weaver import types
-from weaver.training_pipeline import (
-    SubmitAheadQueue,
-    TokenBudgetBatcher,
-    predict_packed_batch_shape,
-)
+from weaver.training_pipeline import SubmitAheadQueue, TokenBudgetBatcher
 
 
-def test_predict_packed_batch_shape_balances_dp_and_microbatches():
-    shape = predict_packed_batch_shape(
-        [8, 7, 6, 5],
-        dp_size=2,
-        max_tokens_per_gpu=10,
-    )
-
-    assert shape.samples == 4
-    assert shape.tokens == 26
-    assert shape.tokens_per_dp == (13, 13)
-    assert shape.samples_per_dp == (2, 2)
-    assert shape.microbatches_per_dp == 2
-    assert shape.max_microbatch_tokens == 8
-    assert shape.global_microbatches == 4
-    assert shape.dp_safe
-
-
-def test_predict_packed_batch_shape_detects_second_stage_overflow():
-    shape = predict_packed_batch_shape(
-        [6, 6, 6],
-        dp_size=1,
-        max_tokens_per_gpu=10,
-    )
-
-    assert shape.microbatches_per_dp == 2
-    assert shape.max_microbatch_tokens == 12
-
-
-def test_token_budget_batcher_carries_second_stage_overflow():
+def test_token_budget_batcher_fills_without_crossing_target():
     batches = list(
         TokenBudgetBatcher(
-            range(4),
+            range(13),
             length_fn=lambda _: 6,
-            global_batch_size=2,
-            dp_size=1,
-            max_tokens_per_gpu=10,
+            global_batch_size=4,
+            max_sequence_length=10,
         )
     )
 
-    assert [batch.items for batch in batches] == [(0, 1), (2, 3)]
-    assert all(batch.shape.max_microbatch_tokens <= 10 for batch in batches)
+    assert [batch.items for batch in batches] == [tuple(range(6)), tuple(range(6, 12))]
+    assert [batch.tokens for batch in batches] == [36, 36]
+    assert all(30 < batch.tokens <= 40 for batch in batches)
 
 
 def test_token_budget_batcher_reads_only_through_next_boundary():
@@ -83,62 +50,58 @@ def test_token_budget_batcher_reads_only_through_next_boundary():
     batches = iter(
         TokenBudgetBatcher(
             source(),
-            length_fn=lambda _: 5,
+            length_fn=lambda _: 6,
             global_batch_size=4,
-            dp_size=2,
-            max_tokens_per_gpu=10,
+            max_sequence_length=10,
         )
     )
 
     first = next(batches)
 
-    assert first.items == tuple(range(8))
-    assert first.shape.global_microbatches == 4
-    assert reads == list(range(9))
+    assert first.items == tuple(range(6))
+    assert first.tokens == 36
+    assert reads == list(range(7))
 
 
-def test_token_budget_batcher_carries_overflow_into_next_request():
-    batches = iter(
-        TokenBudgetBatcher(
-            range(17),
-            length_fn=lambda _: 5,
-            global_batch_size=4,
-            dp_size=2,
-            max_tokens_per_gpu=10,
-        )
-    )
+def test_token_budget_batcher_emits_exact_target_without_lookahead():
+    reads: list[int] = []
 
-    assert next(batches).items == tuple(range(8))
-    assert next(batches).items == tuple(range(8, 16))
-    with pytest.raises(StopIteration):
-        next(batches)
+    def source():
+        index = 0
+        while True:
+            reads.append(index)
+            yield index
+            index += 1
 
-
-def test_token_budget_batcher_avoids_repartitioning_every_short_sample(monkeypatch):
-    calls = 0
-    original = training_pipeline.predict_packed_batch_shape
-
-    def counted(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(training_pipeline, "predict_packed_batch_shape", counted)
     batch = next(
         iter(
             TokenBudgetBatcher(
-                range(1281),
-                length_fn=lambda _: 1,
-                global_batch_size=128,
-                dp_size=8,
-                max_tokens_per_gpu=10,
+                source(),
+                length_fn=lambda _: 5,
+                global_batch_size=4,
+                max_sequence_length=10,
             )
         )
     )
 
-    assert batch.shape.global_microbatches == 128
-    assert batch.shape.tokens >= 1280 * 0.98
-    assert calls <= 2
+    assert batch.items == tuple(range(8))
+    assert batch.tokens == 40
+    assert reads == list(range(8))
+
+
+def test_token_budget_batcher_can_emit_incomplete_final_request():
+    batches = list(
+        TokenBudgetBatcher(
+            range(4),
+            length_fn=lambda _: 6,
+            global_batch_size=2,
+            max_sequence_length=10,
+            drop_last=False,
+        )
+    )
+
+    assert [batch.items for batch in batches] == [(0, 1, 2), (3,)]
+    assert [batch.tokens for batch in batches] == [18, 6]
 
 
 def test_token_budget_batcher_rejects_sample_over_budget():
@@ -147,12 +110,11 @@ def test_token_budget_batcher_rejects_sample_over_budget():
             [11],
             length_fn=lambda value: value,
             global_batch_size=2,
-            dp_size=1,
-            max_tokens_per_gpu=10,
+            max_sequence_length=10,
         )
     )
 
-    with pytest.raises(ValueError, match="exceeds max_tokens_per_gpu"):
+    with pytest.raises(ValueError, match="exceeds max_sequence_length"):
         next(batches)
 
 
