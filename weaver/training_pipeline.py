@@ -60,7 +60,7 @@ class TokenBudgetBatch(Generic[T]):
 class TokenBudgetBatcher(Generic[T]):
     """Build best-effort token-budgeted requests with bounded memory.
 
-    The target request size is ``global_batch_size * max_tokens_per_gpu``.
+    The target request size is ``global_batch_size * max_sequence_length``.
     The trainer remains responsible for actual packing. An item that would
     cross the target starts the next request, so the corpus is never planned or
     tokenized up front.
@@ -68,8 +68,8 @@ class TokenBudgetBatcher(Generic[T]):
     Args:
         source: Stream of already rendered or tokenized source samples.
         length_fn: Returns the valid-token length of one sample.
-        global_batch_size: Multiplier for the target request token budget.
-        max_tokens_per_gpu: Token-budget unit and maximum source-sample length.
+        global_batch_size: Desired number of packed sequences per request.
+        max_sequence_length: Target packed length and maximum source-sample length.
         drop_last: Drop an incomplete final request when the source ends.
     """
 
@@ -79,21 +79,21 @@ class TokenBudgetBatcher(Generic[T]):
         *,
         length_fn: Callable[[T], int],
         global_batch_size: int,
-        max_tokens_per_gpu: int,
+        max_sequence_length: int,
         drop_last: bool = True,
     ) -> None:
         if global_batch_size <= 0:
             raise ValueError("global_batch_size must be positive")
-        if max_tokens_per_gpu <= 0:
-            raise ValueError("max_tokens_per_gpu must be positive")
+        if max_sequence_length <= 0:
+            raise ValueError("max_sequence_length must be positive")
         self._source = source
         self._length_fn = length_fn
         self._global_batch_size = global_batch_size
-        self._max_tokens_per_gpu = max_tokens_per_gpu
+        self._max_sequence_length = max_sequence_length
         self._drop_last = drop_last
 
     def __iter__(self) -> Iterator[TokenBudgetBatch[T]]:
-        target_tokens = self._global_batch_size * self._max_tokens_per_gpu
+        target_tokens = self._global_batch_size * self._max_sequence_length
         items: list[T] = []
         total_tokens = 0
 
@@ -101,10 +101,10 @@ class TokenBudgetBatcher(Generic[T]):
             length = int(self._length_fn(item))
             if length <= 0:
                 raise ValueError("sample token lengths must be positive")
-            if length > self._max_tokens_per_gpu:
+            if length > self._max_sequence_length:
                 raise ValueError(
-                    f"sample length {length} exceeds max_tokens_per_gpu="
-                    f"{self._max_tokens_per_gpu}"
+                    f"sample length {length} exceeds max_sequence_length="
+                    f"{self._max_sequence_length}"
                 )
 
             if items and total_tokens + length > target_tokens:

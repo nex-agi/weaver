@@ -20,11 +20,14 @@ corpus is never preprocessed in memory. While the trainer runs that request, a
 worker thread prepares the next one.
 
 The batcher only estimates request size. The trainer performs the actual packing.
+It may submit more than ``global_batch_size`` source records to target that many
+packed sequences. To submit exactly ``global_batch_size`` source records instead,
+skip ``TokenBudgetBatcher`` and batch the source iterator by count.
 
 Example:
     python examples/streaming_sft.py data.jsonl \
         --base-model Qwen/Qwen3-8B --global-batch-size 128 \
-        --max-tokens-per-gpu 262144
+        --max-sequence-length 262144
 """
 
 from __future__ import annotations
@@ -172,7 +175,7 @@ async def run(args: argparse.Namespace) -> None:
                 iter_tokenized_examples(args.data, tokenizer),
                 length_fn=lambda example: len(example.input_tokens),
                 global_batch_size=args.global_batch_size,
-                max_tokens_per_gpu=args.max_tokens_per_gpu,
+                max_sequence_length=args.max_sequence_length,
             )
         )
         prepared = asyncio.create_task(asyncio.to_thread(prepare_next, batches))
@@ -217,7 +220,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-model", default="Qwen/Qwen3-8B")
     parser.add_argument("--training-mode", choices=("full_ft", "lora"), default="full_ft")
     parser.add_argument("--global-batch-size", type=int, required=True)
-    parser.add_argument("--max-tokens-per-gpu", type=int, required=True)
+    parser.add_argument("--max-sequence-length", type=int, required=True)
     parser.add_argument("--steps", type=int, default=10)
     parser.add_argument("--submit-ahead", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=1e-4)

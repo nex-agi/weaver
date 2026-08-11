@@ -28,7 +28,7 @@ def test_token_budget_batcher_fills_without_crossing_target():
             range(13),
             length_fn=lambda _: 6,
             global_batch_size=4,
-            max_tokens_per_gpu=10,
+            max_sequence_length=10,
         )
     )
 
@@ -52,7 +52,7 @@ def test_token_budget_batcher_reads_only_through_next_boundary():
             source(),
             length_fn=lambda _: 6,
             global_batch_size=4,
-            max_tokens_per_gpu=10,
+            max_sequence_length=10,
         )
     )
 
@@ -79,7 +79,7 @@ def test_token_budget_batcher_emits_exact_target_without_lookahead():
                 source(),
                 length_fn=lambda _: 5,
                 global_batch_size=4,
-                max_tokens_per_gpu=10,
+                max_sequence_length=10,
             )
         )
     )
@@ -95,7 +95,7 @@ def test_token_budget_batcher_can_emit_incomplete_final_request():
             range(4),
             length_fn=lambda _: 6,
             global_batch_size=2,
-            max_tokens_per_gpu=10,
+            max_sequence_length=10,
             drop_last=False,
         )
     )
@@ -110,11 +110,11 @@ def test_token_budget_batcher_rejects_sample_over_budget():
             [11],
             length_fn=lambda value: value,
             global_batch_size=2,
-            max_tokens_per_gpu=10,
+            max_sequence_length=10,
         )
     )
 
-    with pytest.raises(ValueError, match="exceeds max_tokens_per_gpu"):
+    with pytest.raises(ValueError, match="exceeds max_sequence_length"):
         next(batches)
 
 
