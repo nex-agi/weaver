@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
+from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload
 from ._payloads import (
     build_request_metadata,
     build_surrogate_data,
@@ -30,11 +31,13 @@ from ._payloads import (
     parse_logprob_tensors,
     serialize_data,
 )
+from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
-from .operations import OperationHandle
+from .operations import OperationHandle, build_operation_handle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
+from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -686,6 +689,128 @@ class TrainingClient:
         return self._service.http.patch(
             f"/api/v1/models/{self.model_id}/checkpoints/ttl",
             json=body,
+        )
+
+    # ------------------------------------------------------------------
+    # HF weights export
+    # ------------------------------------------------------------------
+
+    @overload
+    def export_weights(
+        self,
+        *,
+        checkpoint: str | Checkpoint | None = None,
+        merge_adapter: bool = False,
+        ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
+        force: bool = False,
+        wait: Literal[True] = True,
+    ) -> WeightsArtifact: ...
+
+    @overload
+    def export_weights(
+        self,
+        *,
+        checkpoint: str | Checkpoint | None = None,
+        merge_adapter: bool = False,
+        ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
+        force: bool = False,
+        wait: Literal[False],
+    ) -> WeightsArtifact | OperationHandle: ...
+
+    def export_weights(
+        self,
+        *,
+        checkpoint: str | Checkpoint | None = None,
+        merge_adapter: bool = False,
+        ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
+        force: bool = False,
+        wait: bool = True,
+    ) -> WeightsArtifact | OperationHandle:
+        """Export model weights in HuggingFace format.
+
+        The server converts the checkpoint's native DCP weights into a
+        HuggingFace directory (full model for full fine-tuning, PEFT adapter
+        for LoRA) and stores it as a downloadable artifact. Download it with
+        :meth:`~weaver.service_client.ServiceClient.download_weights`.
+
+        Args:
+            checkpoint: Which checkpoint to export. ``None`` (default) saves
+                the current weights and exports them in one step. Accepts a
+                :class:`~weaver.types.Checkpoint`, a ``weaver://`` checkpoint
+                path (resolved via :meth:`list_checkpoints`), or a raw
+                checkpoint id.
+            merge_adapter: For LoRA models, merge the adapter into the base
+                model and export a full HF model instead of a PEFT adapter.
+                The server rejects it for full fine-tuning models.
+            ttl_seconds: Artifact time-to-live in seconds. Defaults to 7 days;
+                pass ``None`` to follow the source checkpoint's retention.
+            force: Re-export even when a completed artifact of the same kind
+                already exists (the old artifact is soft-deleted). Only
+                meaningful with an explicit *checkpoint*; ignored for the
+                one-step export, which always creates a fresh checkpoint.
+            wait: If True (default), blocks until the export completes and
+                returns a :class:`~weaver.types.WeightsArtifact`.
+
+        Returns:
+            A :class:`~weaver.types.WeightsArtifact` when *wait* is True.
+            When *wait* is False, an :class:`OperationHandle` — unless the
+            server answers an idempotent completed hit, in which case the
+            finished :class:`~weaver.types.WeightsArtifact` is returned
+            immediately.
+
+        Raises:
+            ValueError: If a ``weaver://`` *checkpoint* path cannot be
+                resolved to a checkpoint of this model.
+        """
+        body: Dict[str, Any] = {
+            "format": "huggingface",
+            "merge_adapter": merge_adapter,
+            "ttl_seconds": ttl_seconds,
+        }
+        if checkpoint is None:
+            path = f"/api/v1/models/{self.model_id}/export-hf"
+        else:
+            checkpoint_id = self._resolve_checkpoint_id(checkpoint)
+            body["force"] = force
+            path = f"/api/v1/checkpoints/{checkpoint_id}/export"
+        # max_retries=1: exports are non-idempotent POSTs (see enqueue_operation).
+        response = self._service.http.post(path, json=body, max_retries=1)
+        # A completed idempotent hit answers with the artifact itself instead
+        # of an operation envelope; return it directly even when wait=False.
+        if is_artifact_payload(response):
+            return WeightsArtifact.from_payload(response)
+        handle = build_operation_handle(
+            self._service.http, response if isinstance(response, dict) else {}
+        )
+        if not wait:
+            return handle
+        result = handle.result()
+        return WeightsArtifact.from_payload(result if isinstance(result, dict) else {})
+
+    def _resolve_checkpoint_id(self, checkpoint: str | Checkpoint) -> str:
+        """Resolve a checkpoint reference to its server-side id."""
+        if isinstance(checkpoint, Checkpoint):
+            if not checkpoint.id:
+                raise ValueError("Checkpoint object has no id")
+            return checkpoint.id
+        reference = checkpoint.strip()
+        if not reference:
+            raise ValueError("checkpoint reference must not be empty")
+        if not reference.startswith("weaver://"):
+            return reference  # already a checkpoint id
+        owner = parse_model_id_from_weaver_path(reference)
+        if owner and owner != self.model_id:
+            raise ValueError(
+                f"Checkpoint path {reference!r} belongs to model {owner}, "
+                f"but this client trains model {self.model_id}"
+            )
+        for existing in self.list_checkpoints():
+            if existing.path == reference:
+                return existing.id
+        raise ValueError(
+            f"No checkpoint with path {reference!r} found for model "
+            f"{self.model_id}; pass a Checkpoint from save_state() or "
+            "list_checkpoints()"
         )
 
     def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:

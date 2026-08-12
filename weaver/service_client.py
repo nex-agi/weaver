@@ -20,14 +20,37 @@ import atexit
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
+
+import httpx
 
 from . import __version__
-from ._http import APIClient
+from ._artifacts import (
+    ARTIFACT_KINDS,
+    DOWNLOAD_MAX_TRANSPORT_RETRIES,
+    DOWNLOAD_MAX_URL_REFRESHES,
+    ArtifactFile,
+    check_downloaded_file,
+    descriptor_files,
+    is_file_already_complete,
+    parse_download_target,
+    resolve_checkpoint_id_from_listing,
+    select_artifact_payload,
+)
+from ._http import (
+    APIClient,
+    DownloadURLExpiredError,
+    build_download_client,
+    compute_retry_delay,
+    stream_download_to_file,
+)
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
 from .types import LoraConfig
+from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
     from .sampling_client import SamplingClient
@@ -739,3 +762,162 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             Dictionary with model details
         """
         return self.http.get(f"/api/v1/models/{model_id}")  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # HF weights download
+    # ------------------------------------------------------------------
+
+    def download_weights(
+        self,
+        target: str | WeightsArtifact,
+        dest: str | Path,
+        *,
+        kind: str | None = None,
+        verify: bool = True,
+        max_concurrency: int = 4,
+    ) -> Path:
+        """Download an exported HF weights artifact to a local directory.
+
+        Fetches the artifact's download descriptor and streams every file to
+        *dest* in parallel. Each file is written atomically (``.part`` then
+        rename), resumed with HTTP Range requests on transport errors, and
+        re-fetched with fresh presigned URLs when one expires. Downloads never
+        trigger a conversion implicitly: if no completed artifact exists, run
+        :meth:`~weaver.training_client.TrainingClient.export_weights` first.
+
+        Args:
+            target: What to download — a
+                :class:`~weaver.types.WeightsArtifact`, an artifact
+                ``weaver://.../artifacts/{kind}`` URI, a checkpoint
+                ``weaver://`` URI (its single completed artifact is chosen),
+                or a raw artifact id.
+            dest: Directory the files are written into (created if missing).
+            kind: Artifact kind (``"hf_model"`` or ``"hf_adapter"``) to select
+                when *target* is a checkpoint URI with several artifacts.
+            verify: If True (default), verify each file's sha256 against the
+                download manifest.
+            max_concurrency: Maximum number of files downloaded in parallel.
+
+        Returns:
+            The destination directory as a :class:`~pathlib.Path`.
+
+        Raises:
+            ValueError: On an unresolvable target, kind conflict, or
+                ambiguous artifact selection.
+            RuntimeError: When no completed artifact exists, or on a
+                size/sha256 mismatch.
+        """
+        if kind is not None and kind not in ARTIFACT_KINDS:
+            raise ValueError(f"kind must be one of {ARTIFACT_KINDS}, got {kind!r}")
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be >= 1")
+        artifact_id = self._resolve_weights_artifact_id(target, kind)
+        dest_dir = Path(dest).expanduser()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        descriptor_path = f"/api/v1/artifacts/{artifact_id}/download"
+        files = descriptor_files(self.http.get(descriptor_path))
+        urls = {entry.name: entry.url for entry in files}
+        urls_lock = threading.Lock()
+
+        def current_url(name: str) -> str:
+            with urls_lock:
+                return urls[name]
+
+        def refresh_url(name: str) -> str:
+            # Presigned URLs live ~15 minutes; re-fetching the descriptor is
+            # idempotent and cheap, and refreshes every pending file at once.
+            with urls_lock:
+                for entry in descriptor_files(self.http.get(descriptor_path)):
+                    urls[entry.name] = entry.url
+                return urls[name]
+
+        workers = max(1, min(max_concurrency, len(files)))
+        with build_download_client() as download_client:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(
+                        self._download_weights_file,
+                        download_client,
+                        entry,
+                        dest_dir=dest_dir,
+                        verify=verify,
+                        current_url=current_url,
+                        refresh_url=refresh_url,
+                    )
+                    for entry in files
+                ]
+                for future in futures:
+                    future.result()
+        return dest_dir
+
+    def _resolve_weights_artifact_id(self, target: str | WeightsArtifact, kind: str | None) -> str:
+        """Resolve a download target to a concrete artifact id."""
+        if isinstance(target, WeightsArtifact):
+            if not target.id:
+                raise ValueError("WeightsArtifact has no id")
+            return target.id
+        parsed = parse_download_target(target)
+        if parsed.artifact_id:
+            return parsed.artifact_id
+        if parsed.kind and kind and parsed.kind != kind:
+            raise ValueError(f"kind={kind!r} conflicts with the artifact URI kind {parsed.kind!r}")
+        effective_kind = parsed.kind or kind
+        listing = self.http.get(f"/api/v1/models/{parsed.model_id}/checkpoints")
+        items = (listing or {}).get("items", []) if isinstance(listing, dict) else []
+        checkpoint_id = resolve_checkpoint_id_from_listing(items, parsed.checkpoint_path or "")
+        if checkpoint_id is None:
+            raise ValueError(
+                f"No checkpoint with path {parsed.checkpoint_path!r} found for "
+                f"model {parsed.model_id}"
+            )
+        artifacts = self.http.get(f"/api/v1/checkpoints/{checkpoint_id}/artifacts")
+        artifact_items = (artifacts or {}).get("items", []) if isinstance(artifacts, dict) else []
+        selected = select_artifact_payload(artifact_items, effective_kind, context=str(target))
+        return extract_id(selected)
+
+    def _download_weights_file(
+        self,
+        download_client: httpx.Client,
+        entry: ArtifactFile,
+        *,
+        dest_dir: Path,
+        verify: bool,
+        current_url: Callable[[str], str],
+        refresh_url: Callable[[str], str],
+    ) -> None:
+        """Download one manifest file with resume, URL refresh, and verification."""
+        final_path = dest_dir / entry.name
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        if is_file_already_complete(final_path, entry, verify=verify):
+            return
+        part_path = final_path.with_name(final_path.name + ".part")
+        url = current_url(entry.name)
+        url_refreshes = 0
+        transport_retries = 0
+        while True:
+            resume_from = part_path.stat().st_size if part_path.exists() else 0
+            if entry.size is not None and resume_from > entry.size:
+                # Longer than the manifest says it should be: poisoned partial.
+                part_path.unlink()
+                resume_from = 0
+            try:
+                stream_download_to_file(
+                    url, part_path, client=download_client, resume_from=resume_from
+                )
+                break
+            except DownloadURLExpiredError:
+                url_refreshes += 1
+                if url_refreshes > DOWNLOAD_MAX_URL_REFRESHES:
+                    raise
+                url = refresh_url(entry.name)
+            except (httpx.TransportError, OSError):
+                # GETs are idempotent and the .part keeps its bytes, so retry
+                # with a Range resume instead of restarting the shard.
+                transport_retries += 1
+                if transport_retries > DOWNLOAD_MAX_TRANSPORT_RETRIES:
+                    raise
+                time.sleep(compute_retry_delay(transport_retries))
+        check_downloaded_file(part_path, entry, verify=verify)
+        # Atomic publish: readers never observe a half-written file.
+        part_path.replace(final_path)

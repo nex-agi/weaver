@@ -73,14 +73,46 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Union
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
+
+import httpx
 
 from . import __version__
-from ._async_http import AsyncAPIClient
+from ._artifacts import (
+    ARTIFACT_KINDS,
+    DOWNLOAD_MAX_TRANSPORT_RETRIES,
+    DOWNLOAD_MAX_URL_REFRESHES,
+    ArtifactFile,
+    check_downloaded_file,
+    descriptor_files,
+    is_file_already_complete,
+    parse_download_target,
+    resolve_checkpoint_id_from_listing,
+    select_artifact_payload,
+)
+from ._async_http import (
+    AsyncAPIClient,
+    async_stream_download_to_file,
+    build_async_download_client,
+)
+from ._http import DownloadURLExpiredError, compute_retry_delay
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import AsyncOperationHandle, build_async_operation_handle
 from .types import LoraConfig
+from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
     from .async_sampling_client import AsyncSamplingClient
@@ -708,3 +740,148 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
     async def get_model(self, model_id: str) -> Dict[str, Any]:
         """Get detailed information about a specific model."""
         return await self.http.get(f"/api/v1/models/{model_id}")
+
+    # ------------------------------------------------------------------
+    # HF weights download
+    # ------------------------------------------------------------------
+
+    async def download_weights(
+        self,
+        target: str | WeightsArtifact,
+        dest: str | Path,
+        *,
+        kind: str | None = None,
+        verify: bool = True,
+        max_concurrency: int = 4,
+    ) -> Path:
+        """Download an exported HF weights artifact to a local directory.
+
+        See :meth:`weaver.service_client.ServiceClient.download_weights`.
+        Files are streamed concurrently on the event loop (bounded by
+        *max_concurrency*); hash verification runs in worker threads so the
+        loop stays responsive.
+        """
+        if kind is not None and kind not in ARTIFACT_KINDS:
+            raise ValueError(f"kind must be one of {ARTIFACT_KINDS}, got {kind!r}")
+        if max_concurrency < 1:
+            raise ValueError("max_concurrency must be >= 1")
+        artifact_id = await self._resolve_weights_artifact_id(target, kind)
+        dest_dir = Path(dest).expanduser()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        descriptor_path = f"/api/v1/artifacts/{artifact_id}/download"
+        files = descriptor_files(await self.http.get(descriptor_path))
+        urls = {entry.name: entry.url for entry in files}
+        urls_lock = asyncio.Lock()
+
+        async def current_url(name: str) -> str:
+            async with urls_lock:
+                return urls[name]
+
+        async def refresh_url(name: str) -> str:
+            # Presigned URLs live ~15 minutes; re-fetching the descriptor is
+            # idempotent and cheap, and refreshes every pending file at once.
+            async with urls_lock:
+                for entry in descriptor_files(await self.http.get(descriptor_path)):
+                    urls[entry.name] = entry.url
+                return urls[name]
+
+        semaphore = asyncio.Semaphore(max(1, min(max_concurrency, len(files))))
+        async with build_async_download_client() as download_client:
+
+            async def bounded_download(entry: ArtifactFile) -> None:
+                async with semaphore:
+                    await self._download_weights_file(
+                        download_client,
+                        entry,
+                        dest_dir=dest_dir,
+                        verify=verify,
+                        current_url=current_url,
+                        refresh_url=refresh_url,
+                    )
+
+            # return_exceptions=True drains every task before the client is
+            # closed (no orphan writers), then the first failure is re-raised.
+            results = await asyncio.gather(
+                *(bounded_download(entry) for entry in files), return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+        return dest_dir
+
+    async def _resolve_weights_artifact_id(
+        self, target: str | WeightsArtifact, kind: str | None
+    ) -> str:
+        """Resolve a download target to a concrete artifact id."""
+        if isinstance(target, WeightsArtifact):
+            if not target.id:
+                raise ValueError("WeightsArtifact has no id")
+            return target.id
+        parsed = parse_download_target(target)
+        if parsed.artifact_id:
+            return parsed.artifact_id
+        if parsed.kind and kind and parsed.kind != kind:
+            raise ValueError(f"kind={kind!r} conflicts with the artifact URI kind {parsed.kind!r}")
+        effective_kind = parsed.kind or kind
+        listing = await self.http.get(f"/api/v1/models/{parsed.model_id}/checkpoints")
+        items = (listing or {}).get("items", []) if isinstance(listing, dict) else []
+        checkpoint_id = resolve_checkpoint_id_from_listing(items, parsed.checkpoint_path or "")
+        if checkpoint_id is None:
+            raise ValueError(
+                f"No checkpoint with path {parsed.checkpoint_path!r} found for "
+                f"model {parsed.model_id}"
+            )
+        artifacts = await self.http.get(f"/api/v1/checkpoints/{checkpoint_id}/artifacts")
+        artifact_items = (artifacts or {}).get("items", []) if isinstance(artifacts, dict) else []
+        selected = select_artifact_payload(artifact_items, effective_kind, context=str(target))
+        return extract_id(selected)
+
+    async def _download_weights_file(
+        self,
+        download_client: httpx.AsyncClient,
+        entry: ArtifactFile,
+        *,
+        dest_dir: Path,
+        verify: bool,
+        current_url: Callable[[str], Awaitable[str]],
+        refresh_url: Callable[[str], Awaitable[str]],
+    ) -> None:
+        """Download one manifest file with resume, URL refresh, and verification."""
+        final_path = dest_dir / entry.name
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        # Hashing an existing multi-GB file is blocking CPU+disk work; keep it
+        # off the event loop.
+        if await asyncio.to_thread(is_file_already_complete, final_path, entry, verify=verify):
+            return
+        part_path = final_path.with_name(final_path.name + ".part")
+        url = await current_url(entry.name)
+        url_refreshes = 0
+        transport_retries = 0
+        while True:
+            resume_from = part_path.stat().st_size if part_path.exists() else 0
+            if entry.size is not None and resume_from > entry.size:
+                # Longer than the manifest says it should be: poisoned partial.
+                part_path.unlink()
+                resume_from = 0
+            try:
+                await async_stream_download_to_file(
+                    url, part_path, client=download_client, resume_from=resume_from
+                )
+                break
+            except DownloadURLExpiredError:
+                url_refreshes += 1
+                if url_refreshes > DOWNLOAD_MAX_URL_REFRESHES:
+                    raise
+                url = await refresh_url(entry.name)
+            except (httpx.TransportError, OSError):
+                # GETs are idempotent and the .part keeps its bytes, so retry
+                # with a Range resume instead of restarting the shard.
+                transport_retries += 1
+                if transport_retries > DOWNLOAD_MAX_TRANSPORT_RETRIES:
+                    raise
+                await asyncio.sleep(compute_retry_delay(transport_retries))
+        # sha256 of a multi-GB shard is blocking work; run it off-loop.
+        await asyncio.to_thread(check_downloaded_file, part_path, entry, verify=verify)
+        # Atomic publish: readers never observe a half-written file.
+        part_path.replace(final_path)

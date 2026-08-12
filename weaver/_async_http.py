@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
 import httpx
@@ -37,7 +38,10 @@ from ._http import (
     DEFAULT_CONNECTION_RETRIES,
     DEFAULT_MAX_RETRIES,
     DEFAULT_TIMEOUT,
+    DOWNLOAD_CHUNK_SIZE,
+    DOWNLOAD_TIMEOUT,
     USER_AGENT,
+    DownloadURLExpiredError,
     WeaverAPIError,
     _is_connection_error,
     apply_request_span_attributes,
@@ -49,6 +53,72 @@ from ._telemetry import get_tracer
 from .config import WeaverConfig
 
 logger = logging.getLogger(__name__)
+
+
+def build_async_download_client(timeout: httpx.Timeout | float | None = None) -> httpx.AsyncClient:
+    """Asyncio twin of :func:`weaver._http.build_download_client`.
+
+    Presigned URLs are self-authorizing plain object-storage URLs; the Weaver
+    API key must never be sent to an external host, so this client carries no
+    auth headers and no Weaver base URL — only a User-Agent.
+    """
+    return httpx.AsyncClient(
+        timeout=timeout or DOWNLOAD_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+        limits=DEFAULT_CONNECTION_LIMITS,
+        follow_redirects=True,
+    )
+
+
+async def async_stream_download_to_file(
+    url: str,
+    dest: Path,
+    *,
+    client: httpx.AsyncClient,
+    resume_from: int = 0,
+    chunk_size: int = DOWNLOAD_CHUNK_SIZE,
+) -> int:
+    """Asyncio twin of :func:`weaver._http.stream_download_to_file`.
+
+    Network reads are awaited so the event loop stays free; the per-chunk
+    ``fh.write`` is a buffered local-disk write that is fast relative to the
+    awaited network reads, which keeps the loop responsive without a thread
+    hop per chunk.
+
+    Returns:
+        Total bytes now present in *dest*.
+
+    Raises:
+        DownloadURLExpiredError: The URL was rejected with 401/403 — refresh
+            the download descriptor and retry with a fresh URL.
+        WeaverAPIError: Any other non-success response.
+    """
+    headers: dict[str, str] = {}
+    if resume_from > 0:
+        headers["Range"] = f"bytes={resume_from}-"
+    async with client.stream("GET", url, headers=headers) as response:
+        if response.status_code in (401, 403):
+            await response.aread()
+            raise DownloadURLExpiredError(
+                f"presigned URL rejected with HTTP {response.status_code}; "
+                "the download descriptor must be re-fetched for a fresh URL"
+            )
+        if response.status_code == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE:
+            # The requested offset is at/past EOF: the bytes on disk already
+            # cover the file. The caller verifies size/sha before trusting it.
+            await response.aread()
+            return resume_from
+        if not response.is_success:
+            await response.aread()
+            raise_for_response(response)
+        partial = response.status_code == httpx.codes.PARTIAL_CONTENT
+        mode = "ab" if partial else "wb"
+        written = resume_from if partial else 0
+        with open(dest, mode) as fh:
+            async for chunk in response.aiter_bytes(chunk_size):
+                fh.write(chunk)
+                written += len(chunk)
+    return written
 
 
 class AsyncAPIClient:

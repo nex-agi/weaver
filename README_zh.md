@@ -77,6 +77,30 @@ with sampling_client.paused(mode=PauseMode.ABORT):
 
 建议使用 `paused()` 而不是直接调用 `pause_generation()` / `continue_generation()`：暂停之后如果没有走到恢复那一步，引擎会一直冻结下去，服务端不会自动恢复。异步客户端对应的形式是 `async with`。
 
+### HuggingFace 权重导出
+
+checkpoint 以 trainer 原生的分布式格式保存。`export_weights()` 会把它转换成 HuggingFace 目录——全量微调得到完整模型，LoRA 得到 PEFT adapter——再用 `download_weights()` 下载到本地：
+
+```python
+artifact = training_client.export_weights()          # 保存当前权重并导出
+artifact = training_client.export_weights(checkpoint=ckpt)  # 导出已有的 checkpoint
+
+service.download_weights(artifact, "./hf-weights")
+```
+
+```bash
+weaver checkpoint export weaver://<model>/checkpoints/step-42
+weaver checkpoint download weaver://<model>/checkpoints/step-42 -o ./hf-weights
+```
+
+需要知道三件事：
+
+- **导出必须显式发起，下载不会隐式触发导出。** 转换一个完整模型是分钟级的算力开销和几十 GB 的存储，因此在没有已完成产物时 `download_weights()` 会直接报错提示先执行 `export_weights`，而不是悄悄启动一次转换。
+- **产物的过期时间独立于源 checkpoint**（默认 7 天，可用 `ttl_seconds` 调整）。删除源 checkpoint 不会连带删除产物，反之亦然。
+- **LoRA 默认导出 adapter。** 传 `merge_adapter=True` 可以把它合并进底模、导出完整的 HF 模型；全量微调模型传这个参数会被拒绝。
+
+下载是并行的，支持断点续传、过期 URL 自动刷新，并在落盘前校验每个文件的 sha256。两个方法都有对应的 `Async*` 版本。
+
 ## 生态
 
 [NexRL](https://github.com/nex-agi/NexRL) 是配套的 RL 训练框架。在其 **training-service** 模式下，NexRL 负责编排完整的 RL 流程（rollout、轨迹收集、策略更新），Weaver 提供底层的训练和推理服务。
