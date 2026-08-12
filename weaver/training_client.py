@@ -35,8 +35,8 @@ from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_
 from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
-from .types.nccl_weight_sync import NCCLWeightSyncV1Result
 from .types.checkpoint import Checkpoint
+from .types.nccl_weight_sync import NCCLWeightSyncV1Result
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -336,6 +336,7 @@ class TrainingClient:
         expected_weight_version: str,
         proposed_weight_version: str,
         transaction_id: str | None = None,
+        checksum_mode: str = "off",
         wait: Literal[True] = True,
     ) -> NCCLWeightSyncV1Result: ...
 
@@ -347,6 +348,7 @@ class TrainingClient:
         expected_weight_version: str,
         proposed_weight_version: str,
         transaction_id: str | None = None,
+        checksum_mode: str = "off",
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -357,6 +359,7 @@ class TrainingClient:
         expected_weight_version: str,
         proposed_weight_version: str,
         transaction_id: str | None = None,
+        checksum_mode: str = "off",
         wait: bool = True,
     ) -> NCCLWeightSyncV1Result | OperationHandle:
         """Experimentally publish live CUDA weights through NCCL-v1.
@@ -378,6 +381,7 @@ class TrainingClient:
             expected_weight_version=expected_weight_version,
             proposed_weight_version=proposed_weight_version,
             transaction_id=transaction_id,
+            checksum_mode=checksum_mode,
         )
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/publish-live-weights-nccl-v1",
@@ -389,6 +393,7 @@ class TrainingClient:
             transaction_id=payload["transaction_id"],
             expected_weight_version=payload["expected_weight_version"],
             proposed_weight_version=payload["proposed_weight_version"],
+            checksum_mode=payload["checksum_mode"],
         )
 
     @overload

@@ -30,7 +30,10 @@ from .async_service_client import AsyncServiceClient  # noqa: F401
 from .async_training_client import AsyncTrainingClient  # noqa: F401
 from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
-from .types.nccl_weight_sync import NCCLWeightSyncV1Result  # noqa: F401
+from .types.nccl_weight_sync import (  # noqa: F401
+    NCCL_V1_CHECKSUM_MODES,
+    NCCLWeightSyncV1Result,
+)
 
 __all__ = [
     "ServiceClient",
@@ -40,6 +43,7 @@ __all__ = [
     "AsyncSamplingClient",
     "AsyncOperationHandle",
     "WeaverAPIError",
+    "NCCL_V1_CHECKSUM_MODES",
     "NCCLWeightSyncV1Result",
     "types",
     "__version__",

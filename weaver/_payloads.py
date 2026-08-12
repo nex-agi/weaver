@@ -25,6 +25,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence
 
 from .types import Datum
+from .types.nccl_weight_sync import normalize_nccl_v1_checksum_mode
 
 if TYPE_CHECKING:
     import torch
@@ -74,6 +75,7 @@ def publish_live_weights_nccl_v1_payload(
     expected_weight_version: str,
     proposed_weight_version: str,
     transaction_id: str | None = None,
+    checksum_mode: str = "off",
 ) -> Dict[str, Any]:
     """Build the small control-only payload for one live NCCL transaction."""
 
@@ -111,12 +113,17 @@ def publish_live_weights_nccl_v1_payload(
         except ValueError as error:
             raise ValueError("transaction_id must be a canonical UUID") from error
 
+    # Validated here so an unsupported mode fails in the caller's process,
+    # before any operation is enqueued, provisioned, or transferred.
+    checksum_mode = normalize_nccl_v1_checksum_mode(checksum_mode)
+
     return {
         "seq_id": seq_id,
         "sampling_session_id": sampling_session_id,
         "transaction_id": transaction_id,
         "expected_weight_version": expected,
         "proposed_weight_version": proposed,
+        "checksum_mode": checksum_mode,
     }
 
 

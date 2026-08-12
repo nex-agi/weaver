@@ -22,9 +22,26 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping
 
-
 _FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _VERSION_RE = re.compile(r"^v(0|[1-9][0-9]*)$")
+
+#: Debug-only payload-integrity modes for one NCCL-v1 publication.
+#:
+#: ``off`` is the production default and performs no hashing, no device-to-host
+#: byte copy, and no per-tensor digest exchange. ``sha256`` proves that every
+#: target worker received exactly the canonical bytes the source produced; it
+#: does not prove native-loader shard placement or model semantics, and it
+#: necessarily copies and hashes the whole model on the source and on every
+#: target rank, so it must never be mixed into a performance measurement.
+NCCL_V1_CHECKSUM_MODES = ("off", "sha256")
+
+
+def normalize_nccl_v1_checksum_mode(value: object) -> str:
+    """Reject an unsupported mode before any provisioning or transfer happens."""
+
+    if not isinstance(value, str) or value not in NCCL_V1_CHECKSUM_MODES:
+        raise ValueError("checksum_mode must be one of " + ", ".join(NCCL_V1_CHECKSUM_MODES))
+    return value
 
 
 def _text(payload: Mapping[str, Any], name: str) -> str:
@@ -90,6 +107,9 @@ class NCCLWeightSyncV1Result:
     plan_reused: bool
     communicator_reused: bool
     no_fallback_counters: Mapping[str, int]
+    checksum_algorithm: str
+    checksum_verified_tensor_count: int
+    checksum_aggregate_digest: str | None
 
     @classmethod
     def from_payload(cls, value: object) -> "NCCLWeightSyncV1Result":
@@ -138,6 +158,26 @@ class NCCLWeightSyncV1Result:
             raise RuntimeError("NCCL-v1 response has invalid reuse markers")
         if not timings or "total_publish" not in timings:
             raise RuntimeError("NCCL-v1 response omits total publish timing")
+        # Checksum evidence is conditional but never ambiguous: an absent
+        # algorithm means the publication ran in the default off mode, and the
+        # count/digest must agree with that. A receipt claiming verification
+        # without a count, or a count without an aggregate digest, is rejected
+        # rather than read as a partial success.
+        checksum_algorithm = payload.get("checksum_algorithm", "off")
+        if checksum_algorithm is None:
+            checksum_algorithm = "off"
+        if checksum_algorithm not in NCCL_V1_CHECKSUM_MODES:
+            raise RuntimeError("NCCL-v1 response has invalid checksum_algorithm")
+        checksum_verified_tensor_count = _integer(
+            {"checksum_verified_tensor_count": payload.get("checksum_verified_tensor_count", 0)},
+            "checksum_verified_tensor_count",
+        )
+        checksum_aggregate_digest = payload.get("checksum_aggregate_digest")
+        if checksum_aggregate_digest is not None and (
+            not isinstance(checksum_aggregate_digest, str)
+            or _FINGERPRINT_RE.fullmatch(checksum_aggregate_digest) is None
+        ):
+            raise RuntimeError("NCCL-v1 response has invalid checksum_aggregate_digest")
         result = cls(
             transaction_id=_text(payload, "transaction_id"),
             expected_weight_version=_text(payload, "expected_weight_version"),
@@ -172,6 +212,9 @@ class NCCLWeightSyncV1Result:
             plan_reused=payload["plan_reused"],
             communicator_reused=payload["communicator_reused"],
             no_fallback_counters={str(name): int(count) for name, count in counters.items()},
+            checksum_algorithm=checksum_algorithm,
+            checksum_verified_tensor_count=checksum_verified_tensor_count,
+            checksum_aggregate_digest=checksum_aggregate_digest,
         )
         try:
             if str(uuid.UUID(result.transaction_id)) != result.transaction_id:
@@ -198,6 +241,22 @@ class NCCLWeightSyncV1Result:
             or result.target_advertised_safe_scratch_bytes < result.target_workspace_bound_bytes
         ):
             raise RuntimeError("NCCL-v1 response workspace accounting is inconsistent")
+        if result.checksum_algorithm == "off":
+            if (
+                result.checksum_verified_tensor_count != 0
+                or result.checksum_aggregate_digest is not None
+            ):
+                raise RuntimeError("NCCL-v1 off-mode response must not carry checksum evidence")
+        elif (
+            result.checksum_verified_tensor_count != result.canonical_tensor_count
+            or result.checksum_aggregate_digest is None
+        ):
+            # Partial verification is not a success: every canonical tensor must
+            # have been verified on every target worker, or the receipt is a lie.
+            raise RuntimeError(
+                "NCCL-v1 checksum response must verify every canonical tensor "
+                "and carry an aggregate digest"
+            )
         return result
 
     def validate_request(
@@ -206,11 +265,17 @@ class NCCLWeightSyncV1Result:
         transaction_id: str,
         expected_weight_version: str,
         proposed_weight_version: str,
+        checksum_mode: str = "off",
     ) -> "NCCLWeightSyncV1Result":
         """Reject a successful-looking receipt for any other transaction."""
 
         if self.transaction_id != transaction_id:
             raise RuntimeError("NCCL-v1 response transaction differs from request")
+        if self.checksum_algorithm != checksum_mode:
+            # The mode is transaction-scoped, so a receipt reporting a different
+            # algorithm than the caller asked for is answering a different
+            # request -- including a target that silently ignored the request.
+            raise RuntimeError("NCCL-v1 response checksum mode differs from request")
         if self.expected_weight_version != expected_weight_version:
             raise RuntimeError("NCCL-v1 response expected version differs from request")
         if self.committed_weight_version != proposed_weight_version:

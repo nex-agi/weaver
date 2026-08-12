@@ -30,7 +30,6 @@ from weaver.async_training_client import AsyncTrainingClient
 from weaver.training_client import TrainingClient
 from weaver.types.nccl_weight_sync import NCCLWeightSyncV1Result
 
-
 TRANSACTION = "11111111-1111-4111-8111-111111111111"
 GENERATION = "target-generation-1"
 
@@ -220,3 +219,182 @@ def test_receipt_requires_finite_timings_and_exact_target_generations() -> None:
 def test_receipt_rejects_failed_or_ambiguous_operation_envelope() -> None:
     with pytest.raises(RuntimeError, match="successful result envelope"):
         NCCLWeightSyncV1Result.from_payload({"status": "failed", "result": _receipt()})
+
+
+# ---------------------------------------------------------------------------
+# debug-only checksum mode: request option and conditional result evidence
+# ---------------------------------------------------------------------------
+
+
+SHA256_DIGEST = "sha256:" + "a" * 64
+
+
+def _publish_payload(**updates):
+    kwargs = {
+        "seq_id": 1,
+        "sampling_session_id": "22222222-2222-4222-8222-222222222222",
+        "expected_weight_version": "initial",
+        "proposed_weight_version": "v0",
+        "transaction_id": TRANSACTION,
+    }
+    kwargs.update(updates)
+    return publish_live_weights_nccl_v1_payload(**kwargs)
+
+
+def test_checksum_mode_defaults_to_off() -> None:
+    assert _publish_payload()["checksum_mode"] == "off"
+
+
+def test_checksum_mode_accepts_sha256() -> None:
+    assert _publish_payload(checksum_mode="sha256")["checksum_mode"] == "sha256"
+
+
+@pytest.mark.parametrize("mode", ["sha1", "SHA256", "md5", "", " off", None, 1, True, ["sha256"]])
+def test_invalid_checksum_mode_fails_before_any_operation(mode) -> None:
+    """Rejected in the caller's process -- nothing is enqueued or provisioned."""
+
+    with pytest.raises(ValueError):
+        _publish_payload(checksum_mode=mode)
+
+
+def test_off_receipt_must_not_carry_checksum_evidence() -> None:
+    NCCLWeightSyncV1Result.from_payload(_receipt())  # absent fields mean off
+    assert NCCLWeightSyncV1Result.from_payload(_receipt()).checksum_algorithm == "off"
+    for bad in (
+        {"checksum_verified_tensor_count": 7},
+        {"checksum_aggregate_digest": SHA256_DIGEST},
+    ):
+        with pytest.raises(RuntimeError, match="off-mode"):
+            NCCLWeightSyncV1Result.from_payload(_receipt(**bad))
+
+
+def test_sha256_receipt_requires_every_tensor_and_an_aggregate_digest() -> None:
+    good = NCCLWeightSyncV1Result.from_payload(
+        _receipt(
+            checksum_algorithm="sha256",
+            checksum_verified_tensor_count=7,  # == canonical_tensor_count
+            checksum_aggregate_digest=SHA256_DIGEST,
+        )
+    )
+    assert good.checksum_verified_tensor_count == good.canonical_tensor_count
+    assert good.checksum_aggregate_digest == SHA256_DIGEST
+
+    # partial verification is not success
+    for bad in (
+        {"checksum_verified_tensor_count": 6, "checksum_aggregate_digest": SHA256_DIGEST},
+        {"checksum_verified_tensor_count": 0, "checksum_aggregate_digest": SHA256_DIGEST},
+        {"checksum_verified_tensor_count": 7},  # no aggregate digest
+    ):
+        with pytest.raises(RuntimeError, match="checksum"):
+            NCCLWeightSyncV1Result.from_payload(_receipt(checksum_algorithm="sha256", **bad))
+
+
+def test_receipt_rejects_unknown_algorithm_or_malformed_digest() -> None:
+    with pytest.raises(RuntimeError, match="checksum_algorithm"):
+        NCCLWeightSyncV1Result.from_payload(_receipt(checksum_algorithm="crc32"))
+    for digest in ("sha256:zz", "a" * 64, "sha1:" + "a" * 40, 5):
+        with pytest.raises(RuntimeError, match="checksum"):
+            NCCLWeightSyncV1Result.from_payload(
+                _receipt(
+                    checksum_algorithm="sha256",
+                    checksum_verified_tensor_count=7,
+                    checksum_aggregate_digest=digest,
+                )
+            )
+
+
+def test_receipt_mode_must_match_the_requested_mode() -> None:
+    """A target that silently ignored the request must not look successful."""
+
+    off_receipt = NCCLWeightSyncV1Result.from_payload(_receipt())
+    with pytest.raises(RuntimeError, match="checksum mode"):
+        off_receipt.validate_request(
+            transaction_id=TRANSACTION,
+            expected_weight_version="initial",
+            proposed_weight_version="v0",
+            checksum_mode="sha256",
+        )
+    on_receipt = NCCLWeightSyncV1Result.from_payload(
+        _receipt(
+            checksum_algorithm="sha256",
+            checksum_verified_tensor_count=7,
+            checksum_aggregate_digest=SHA256_DIGEST,
+        )
+    )
+    with pytest.raises(RuntimeError, match="checksum mode"):
+        on_receipt.validate_request(
+            transaction_id=TRANSACTION,
+            expected_weight_version="initial",
+            proposed_weight_version="v0",
+            checksum_mode="off",
+        )
+    assert (
+        on_receipt.validate_request(
+            transaction_id=TRANSACTION,
+            expected_weight_version="initial",
+            proposed_weight_version="v0",
+            checksum_mode="sha256",
+        )
+        is on_receipt
+    )
+
+
+def test_sync_and_async_publish_send_and_verify_the_requested_mode() -> None:
+    receipt = _operation_response(
+        checksum_algorithm="sha256",
+        checksum_verified_tensor_count=7,
+        checksum_aggregate_digest=SHA256_DIGEST,
+    )
+
+    service = MagicMock()
+    service.next_operation_seq.return_value = 3
+    handle = MagicMock()
+    handle.result.return_value = receipt
+    service.enqueue_operation.return_value = handle
+    client = TrainingClient(
+        service=service, model_id="model-1", base_model="supported/model", session_id="s"
+    )
+    sampler = SimpleNamespace(
+        _service=service,
+        model_id="model-1",
+        model_path=None,
+        sampling_session_id="22222222-2222-4222-8222-222222222222",
+    )
+    result = client.publish_live_weights_to_sampler_nccl_v1(
+        sampler,
+        expected_weight_version="initial",
+        proposed_weight_version="v0",
+        transaction_id=TRANSACTION,
+        checksum_mode="sha256",
+    )
+    assert service.enqueue_operation.call_args[0][1]["checksum_mode"] == "sha256"
+    assert result.checksum_verified_tensor_count == 7
+
+    async_service = MagicMock()
+    async_service.next_operation_seq.return_value = 3
+    async_handle = MagicMock()
+    async_handle.result = AsyncMock(return_value=receipt)
+    async_service.enqueue_operation = AsyncMock(return_value=async_handle)
+    async_client = AsyncTrainingClient(
+        service=async_service,
+        model_id="model-1",
+        base_model="supported/model",
+        session_id="s",
+    )
+    async_sampler = SimpleNamespace(
+        _service=async_service,
+        model_id="model-1",
+        model_path=None,
+        sampling_session_id="22222222-2222-4222-8222-222222222222",
+    )
+    async_result = asyncio.run(
+        async_client.publish_live_weights_to_sampler_nccl_v1(
+            async_sampler,
+            expected_weight_version="initial",
+            proposed_weight_version="v0",
+            transaction_id=TRANSACTION,
+            checksum_mode="sha256",
+        )
+    )
+    assert async_service.enqueue_operation.call_args[0][1]["checksum_mode"] == "sha256"
+    assert async_result.checksum_aggregate_digest == SHA256_DIGEST

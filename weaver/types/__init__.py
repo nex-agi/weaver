@@ -19,7 +19,11 @@ from .datum import Datum
 from .logprobs import LogprobsParams
 from .lora_config import LoraConfig
 from .model_input import ModelInput, ModelInputChunk
-from .nccl_weight_sync import NCCLWeightSyncV1Result
+from .nccl_weight_sync import (
+    NCCL_V1_CHECKSUM_MODES,
+    NCCLWeightSyncV1Result,
+    normalize_nccl_v1_checksum_mode,
+)
 from .optim import AdamParams
 
 # Router-replay / payload-ref types are an internal protocol shared by NexRL and
@@ -63,7 +67,9 @@ __all__ = [
     "LogprobsParams",
     "ModelInput",
     "ModelInputChunk",
+    "NCCL_V1_CHECKSUM_MODES",
     "NCCLWeightSyncV1Result",
+    "normalize_nccl_v1_checksum_mode",
     "PauseMode",
     "SamplingParams",
     "TensorData",
