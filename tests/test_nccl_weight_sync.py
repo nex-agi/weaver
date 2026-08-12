@@ -51,11 +51,15 @@ def _receipt(**updates):
         ],
         "operation_count": 7,
         "canonical_tensor_count": 7,
-        "nccl_call_count": 7,
+        "transfer_batch_count": 3,
+        "nccl_call_count": 3,
         "transferred_bytes": 4096,
+        "wire_transferred_bytes": 4224,
+        "transfer_padding_bytes": 128,
         "largest_operation_bytes": 512,
+        "largest_transfer_batch_bytes": 1536,
         "source_workspace_bound_bytes": 2048,
-        "target_workspace_bound_bytes": 1536,
+        "target_workspace_bound_bytes": 2560,
         "target_advertised_safe_scratch_bytes": 4096,
         "target_loader_workspace_bound_bytes": 1024,
         "device_completion_token": "complete-1",
@@ -199,10 +203,39 @@ def test_receipt_requires_zero_fallback_counters() -> None:
 
 
 def test_receipt_requires_exact_call_counts_and_workspace_accounting() -> None:
-    with pytest.raises(RuntimeError, match="counts disagree"):
-        NCCLWeightSyncV1Result.from_payload(_receipt(nccl_call_count=6))
+    with pytest.raises(RuntimeError, match="canonical tensor/operation counts disagree"):
+        NCCLWeightSyncV1Result.from_payload(_receipt(canonical_tensor_count=6))
     with pytest.raises(RuntimeError, match="workspace accounting"):
-        NCCLWeightSyncV1Result.from_payload(_receipt(target_workspace_bound_bytes=1535))
+        NCCLWeightSyncV1Result.from_payload(_receipt(target_workspace_bound_bytes=2559))
+
+
+def test_receipt_separates_logical_tensors_from_batches_and_nccl_calls() -> None:
+    """Batching must not be hidden behind the old one-call-per-tensor equality."""
+
+    result = NCCLWeightSyncV1Result.from_payload(_receipt())
+    assert result.operation_count == result.canonical_tensor_count == 7
+    assert result.transfer_batch_count == result.nccl_call_count == 3
+    # A receipt claiming one NCCL call per canonical tensor while reporting
+    # fewer batches is now a lie, not the expected shape.
+    with pytest.raises(RuntimeError, match="one call per batch"):
+        NCCLWeightSyncV1Result.from_payload(_receipt(nccl_call_count=7))
+    with pytest.raises(RuntimeError, match="transfer-batch count"):
+        NCCLWeightSyncV1Result.from_payload(_receipt(transfer_batch_count=8, nccl_call_count=8))
+    with pytest.raises(RuntimeError, match="transfer-batch count"):
+        NCCLWeightSyncV1Result.from_payload(_receipt(transfer_batch_count=0, nccl_call_count=0))
+
+
+def test_receipt_keeps_canonical_padding_and_wire_bytes_distinct() -> None:
+    with pytest.raises(RuntimeError, match="byte accounting"):
+        NCCLWeightSyncV1Result.from_payload(_receipt(transfer_padding_bytes=0))
+    with pytest.raises(RuntimeError, match="byte accounting"):
+        NCCLWeightSyncV1Result.from_payload(
+            _receipt(wire_transferred_bytes=4095, transfer_padding_bytes=0)
+        )
+    # The NCCL buffer is a batch, so the workspace bound must cover the batch
+    # rather than the largest logical tensor.
+    with pytest.raises(RuntimeError, match="workspace accounting"):
+        NCCLWeightSyncV1Result.from_payload(_receipt(largest_transfer_batch_bytes=511))
 
 
 def test_receipt_requires_finite_timings_and_exact_target_generations() -> None:

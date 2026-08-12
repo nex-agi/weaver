@@ -93,9 +93,13 @@ class NCCLWeightSyncV1Result:
     target_worker_process_generations: tuple[str, ...]
     operation_count: int
     canonical_tensor_count: int
+    transfer_batch_count: int
     nccl_call_count: int
     transferred_bytes: int
+    wire_transferred_bytes: int
+    transfer_padding_bytes: int
     largest_operation_bytes: int
+    largest_transfer_batch_bytes: int
     source_workspace_bound_bytes: int
     target_workspace_bound_bytes: int
     target_advertised_safe_scratch_bytes: int
@@ -194,9 +198,13 @@ class NCCLWeightSyncV1Result:
             ),
             operation_count=_integer(payload, "operation_count"),
             canonical_tensor_count=_integer(payload, "canonical_tensor_count"),
+            transfer_batch_count=_integer(payload, "transfer_batch_count"),
             nccl_call_count=_integer(payload, "nccl_call_count"),
             transferred_bytes=_integer(payload, "transferred_bytes"),
+            wire_transferred_bytes=_integer(payload, "wire_transferred_bytes"),
+            transfer_padding_bytes=_integer(payload, "transfer_padding_bytes"),
             largest_operation_bytes=_integer(payload, "largest_operation_bytes"),
+            largest_transfer_batch_bytes=_integer(payload, "largest_transfer_batch_bytes"),
             source_workspace_bound_bytes=_integer(payload, "source_workspace_bound_bytes"),
             target_workspace_bound_bytes=_integer(payload, "target_workspace_bound_bytes"),
             target_advertised_safe_scratch_bytes=_integer(
@@ -230,14 +238,33 @@ class NCCLWeightSyncV1Result:
                 raise RuntimeError(f"NCCL-v1 response has invalid {name}")
         if result.operation_count <= 0 or result.transferred_bytes <= 0:
             raise RuntimeError("NCCL-v1 response must prove positive tensor/byte counts")
-        if not result.canonical_tensor_count == result.nccl_call_count == result.operation_count:
-            raise RuntimeError("NCCL-v1 response tensor/NCCL counts disagree")
+        # Logical canonical tensors, executed transfer batches, and actual NCCL
+        # collectives are three different quantities. The transport packs whole
+        # batches, so it issues one collective per batch and never more calls
+        # than there are canonical tensors.
+        if result.canonical_tensor_count != result.operation_count:
+            raise RuntimeError("NCCL-v1 response canonical tensor/operation counts disagree")
+        if not 0 < result.transfer_batch_count <= result.operation_count:
+            raise RuntimeError("NCCL-v1 response transfer-batch count is inconsistent")
+        if result.nccl_call_count != result.transfer_batch_count:
+            raise RuntimeError("NCCL-v1 response NCCL-call count is not one call per batch")
+        # Canonical bytes exclude the plan's alignment padding; wire bytes
+        # include it. Neither may absorb the other.
+        if (
+            result.wire_transferred_bytes < result.transferred_bytes
+            or result.transfer_padding_bytes < 0
+            or result.wire_transferred_bytes
+            != result.transferred_bytes + result.transfer_padding_bytes
+        ):
+            raise RuntimeError("NCCL-v1 response byte accounting is inconsistent")
         if (
             result.largest_operation_bytes <= 0
             or result.largest_operation_bytes > result.transferred_bytes
-            or result.source_workspace_bound_bytes < result.largest_operation_bytes
+            or result.largest_transfer_batch_bytes < result.largest_operation_bytes
+            or result.largest_transfer_batch_bytes > result.wire_transferred_bytes
+            or result.source_workspace_bound_bytes < result.largest_transfer_batch_bytes
             or result.target_workspace_bound_bytes
-            < result.largest_operation_bytes + result.target_loader_workspace_bound_bytes
+            < result.largest_transfer_batch_bytes + result.target_loader_workspace_bound_bytes
             or result.target_advertised_safe_scratch_bytes < result.target_workspace_bound_bytes
         ):
             raise RuntimeError("NCCL-v1 response workspace accounting is inconsistent")
