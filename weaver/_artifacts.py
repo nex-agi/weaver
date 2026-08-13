@@ -410,11 +410,22 @@ def is_file_already_complete(final_path: Path, entry: ArtifactFile, *, verify: b
 def resume_offset_at(parent_fd: int, part_name: str, entry: ArtifactFile) -> int:
     """Bytes of *part_name* a Range request may safely resume from.
 
-    The ``.part`` is inspected with ``lstat`` through the anchored descriptor,
-    so a symlink planted at that name is rejected here rather than quietly
-    redirecting the resumed write to its target. A partial longer than the
-    manifest says the whole file is cannot be a prefix of it, so it is
-    discarded and the download restarts.
+    Resume policy (option (a) from the review thread): stable-name resume is
+    kept, but only from a ``.part`` that is a plain single-linked regular file
+    the caller can safely append to. Anything else is not resumed:
+
+    - a symlink or non-regular file is refused outright (a planted redirect);
+    - a partial longer than the manifest whole-file size cannot be a prefix of
+      it, so it is discarded and the download restarts;
+    - an empty partial carries nothing to resume, so it too is dropped.
+
+    Whenever this returns 0 the ``.part`` name is guaranteed free, so the
+    caller's fresh :func:`weaver._safeio.open_for_write` can create a brand-new
+    inode with ``O_CREAT | O_EXCL`` rather than truncating whatever sits at the
+    name. When it returns a positive offset the caller resumes in append mode,
+    where the hard-link check on the opened descriptor runs before any bytes
+    are written — so a hard link planted at a resumable partial is caught there
+    even though ``lstat`` here cannot tell it apart from an ordinary file.
 
     Raises:
         ValueError: The ``.part`` name is held by a symlink or another
@@ -429,6 +440,11 @@ def resume_offset_at(parent_fd: int, part_name: str, entry: ArtifactFile) -> int
         raise ValueError(f"refusing to write through a non-regular file: {part_name}")
     if entry.size is not None and info.st_size > entry.size:
         # Longer than the manifest says it should be: poisoned partial.
+        unlink_within(parent_fd, part_name)
+        return 0
+    if info.st_size == 0:
+        # Nothing to resume; drop the empty leftover so the fresh, O_EXCL
+        # create below owns a new inode instead of hitting EEXIST.
         unlink_within(parent_fd, part_name)
         return 0
     return info.st_size

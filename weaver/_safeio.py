@@ -156,29 +156,79 @@ def _reject_symlink_leaf(name: str, exc: OSError, *, verb: str) -> None:
         raise ValueError(f"refusing to {verb} through a symlink: {name}") from exc
 
 
+def _reject_hard_link(name: str, fd: int) -> None:
+    """Refuse a descriptor that resolves to a multiply-linked inode.
+
+    ``O_NOFOLLOW`` stops a *symlink* at the final component but says nothing
+    about a *hard* link: a second directory entry pointing at the very same
+    inode, which can sit outside the download tree. A pre-planted
+    ``os.link(outside, dest/x.part)`` would otherwise let a write land on
+    ``outside``.
+
+    The check is on the already-open descriptor, which is what makes it
+    race-safe: ``st_nlink`` is read from the exact inode the write will hit,
+    so a link that existed before the open, or one added between validation
+    and the open, both surface here as ``st_nlink > 1``. A partial we created
+    ourselves has exactly one link; anything else is refused. That is
+    deliberately conservative — an attacker adding a second link to *our* own
+    fresh inode also trips it — but a refused download is always safe.
+    """
+    info = os.fstat(fd)
+    if info.st_nlink != 1:
+        raise ValueError(
+            f"refusing to write through a hard link: {name} has st_nlink="
+            f"{info.st_nlink}; the destination name resolves to an inode with "
+            "another directory entry, which could redirect the write outside "
+            "the download directory"
+        )
+
+
 def open_for_write(parent_fd: int, name: str, *, append: bool) -> BinaryIO:
-    """Open *name* under *parent_fd* for writing, never following a symlink.
+    """Open *name* under *parent_fd* for writing, on a single-linked inode.
+
+    Two escapes are closed at the final component here. ``O_NOFOLLOW`` refuses
+    a symlink; an ``fstat`` on the open descriptor refuses a hard link
+    (:func:`_reject_hard_link`).
+
+    Fresh writes never open an existing name. ``O_CREAT | O_EXCL`` means a
+    truncating open cannot fall on a pre-planted hard link — which matters
+    because ``O_TRUNC`` destroys the target's bytes at *open* time, before any
+    ``fstat`` could reject it. The caller (:func:`resume_offset_at`) guarantees
+    the name is free before a fresh open, so ``O_EXCL`` succeeds in the normal
+    case and ``EEXIST`` means something raced in and is refused.
+
+    Resuming (``append``) opens the existing ``.part`` without ``O_CREAT`` and
+    without ``O_TRUNC``; ``O_APPEND`` adds no bytes until after the hard-link
+    check has run, so a resumed inode is verified before it is touched.
 
     Args:
         parent_fd: Directory descriptor from :func:`open_parent_fd`.
         name: Single path component; never contains a separator.
-        append: Keep the existing bytes and append to them (a resumed
-            download); otherwise truncate what is there.
+        append: Resume into the existing ``.part``; otherwise create it fresh.
 
     Raises:
-        ValueError: *name* is a symlink.
+        ValueError: *name* is a symlink, a hard link, or (fresh open) was
+            occupied by a racing writer.
     """
-    flags = os.O_WRONLY | os.O_CREAT | _O_NOFOLLOW
-    flags |= os.O_APPEND if append else os.O_TRUNC
+    if append:
+        flags = os.O_WRONLY | os.O_APPEND | _O_NOFOLLOW
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW
     try:
         fd = os.open(name, flags, 0o666, dir_fd=parent_fd)
+    except FileExistsError as exc:
+        # Fresh open only: O_EXCL found the name occupied after
+        # resume_offset_at cleared it. Treat the race as unsafe.
+        raise ValueError(
+            f"refusing to write {name}: a file appeared at the destination "
+            "name between validation and creation"
+        ) from exc
     except OSError as exc:
         _reject_symlink_leaf(name, exc, verb="write")
         raise
     try:
-        if append:
-            return os.fdopen(fd, "ab")
-        return os.fdopen(fd, "wb")
+        _reject_hard_link(name, fd)
+        return os.fdopen(fd, "ab" if append else "wb")
     except BaseException:
         os.close(fd)
         raise

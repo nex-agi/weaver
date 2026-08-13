@@ -1168,3 +1168,159 @@ class TestPartSymlinkGuard:
         assert not (dest / "owned.bin").is_symlink()
         assert (dest / "owned.bin").read_bytes() == b"real-content"
         assert outside.read_bytes() == b"untouched"
+
+
+@requires_dir_fd
+class TestHardLinkGuard:
+    """A ``.part`` name that resolves to a multiply-linked inode is refused.
+
+    ``O_NOFOLLOW`` guards symlinks only; a pre-planted hard link
+    (``os.link(outside, dest/x.part)``) points a stable name at an inode that
+    can live outside the tree. The fstat-on-the-open-descriptor check
+    (:func:`weaver._safeio._reject_hard_link`) rejects it, and the fresh
+    ``O_CREAT | O_EXCL`` open never truncates a pre-existing name.
+    """
+
+    HARDLINK_FILES = {"owned.bin": b"real-downloaded-content"}
+
+    def _patch_sync(self, monkeypatch):
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(_presigned_handler(self.HARDLINK_FILES))
+            ),
+        )
+
+    def _patch_async(self, monkeypatch):
+        monkeypatch.setattr(
+            async_service_client,
+            "build_async_download_client",
+            lambda timeout=None: httpx.AsyncClient(
+                transport=httpx.MockTransport(_presigned_handler(self.HARDLINK_FILES))
+            ),
+        )
+
+    def test_open_for_write_refuses_a_preplanted_hard_link(self, tmp_path):
+        # The primitive, exercised directly in both modes. Append opens the
+        # inode and rejects it on the fstat; a fresh O_EXCL open never opens
+        # the occupied name at all and refuses the race — both safe, and
+        # neither writes a byte, so the outside inode is untouched.
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"SECRET")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        os.link(outside, dest / "x.part")
+        parent_fd = _safeio.open_parent_fd(dest, PurePosixPath("x"), create=False)
+        try:
+            with pytest.raises(ValueError, match="hard link"):
+                _safeio.open_for_write(parent_fd, "x.part", append=True)
+            with pytest.raises(ValueError, match="between validation and creation"):
+                _safeio.open_for_write(parent_fd, "x.part", append=False)
+        finally:
+            os.close(parent_fd)
+        assert outside.read_bytes() == b"SECRET"
+        assert os.stat(outside).st_nlink == 2
+
+    def test_sync_preplanted_hard_linked_part_is_refused(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"AAA")  # shorter than the manifest -> a "resumable" partial
+        dest = tmp_path / "out"
+        dest.mkdir()
+        os.link(outside, dest / "owned.bin.part")
+        self._patch_sync(monkeypatch)
+        client = _make_sync_client(_api_routes(_descriptor(self.HARDLINK_FILES)))
+
+        with pytest.raises(ValueError, match="hard link"):
+            client.download_weights(ARTIFACT_UUID, dest)
+
+        assert outside.read_bytes() == b"AAA"  # byte-for-byte unchanged
+        assert os.stat(outside).st_nlink == 2
+
+    def test_async_preplanted_hard_linked_part_is_refused(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"AAA")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        os.link(outside, dest / "owned.bin.part")
+        self._patch_async(monkeypatch)
+        client = _make_async_client(_api_routes(_descriptor(self.HARDLINK_FILES)))
+
+        with pytest.raises(ValueError, match="hard link"):
+            asyncio.run(client.download_weights(ARTIFACT_UUID, dest))
+
+        assert outside.read_bytes() == b"AAA"
+        assert os.stat(outside).st_nlink == 2
+
+    @staticmethod
+    def _racing_resume(module, dest, outside):
+        """Wrap ``resume_offset_at`` to swap the ``.part`` for a hard link.
+
+        Fires AFTER validation returns and BEFORE the write is opened — the
+        exact window an attacker races — so only the fstat on the opened
+        descriptor can catch it. Deterministic: no real race needed.
+        """
+        real = module.resume_offset_at
+
+        def racing(parent_fd, part_name, entry):
+            offset = real(parent_fd, part_name, entry)
+            # Repoint the validated name at an outside inode.
+            os.unlink(dest / part_name)
+            os.link(outside, dest / part_name)
+            return offset
+
+        return racing
+
+    def test_sync_hard_link_added_after_validation_is_caught_on_fstat(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"SECRET")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        # A legitimate single-linked partial exists at validation time.
+        (dest / "owned.bin.part").write_bytes(b"AA")
+        self._patch_sync(monkeypatch)
+        monkeypatch.setattr(
+            service_client, "resume_offset_at", self._racing_resume(service_client, dest, outside)
+        )
+        client = _make_sync_client(_api_routes(_descriptor(self.HARDLINK_FILES)))
+
+        with pytest.raises(ValueError, match="hard link"):
+            client.download_weights(ARTIFACT_UUID, dest)
+
+        assert outside.read_bytes() == b"SECRET"
+        assert os.stat(outside).st_nlink == 2
+
+    def test_async_hard_link_added_after_validation_is_caught_on_fstat(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"SECRET")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "owned.bin.part").write_bytes(b"AA")
+        self._patch_async(monkeypatch)
+        monkeypatch.setattr(
+            async_service_client,
+            "resume_offset_at",
+            self._racing_resume(async_service_client, dest, outside),
+        )
+        client = _make_async_client(_api_routes(_descriptor(self.HARDLINK_FILES)))
+
+        with pytest.raises(ValueError, match="hard link"):
+            asyncio.run(client.download_weights(ARTIFACT_UUID, dest))
+
+        assert outside.read_bytes() == b"SECRET"
+        assert os.stat(outside).st_nlink == 2
+
+    def test_normal_download_still_succeeds_over_a_single_linked_partial(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression guard: the fstat check must not reject an ordinary resume.
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "owned.bin.part").write_bytes(self.HARDLINK_FILES["owned.bin"][:5])
+        self._patch_sync(monkeypatch)
+        client = _make_sync_client(_api_routes(_descriptor(self.HARDLINK_FILES)))
+
+        dest_ret = client.download_weights(ARTIFACT_UUID, dest, max_concurrency=1)
+
+        assert (dest_ret / "owned.bin").read_bytes() == self.HARDLINK_FILES["owned.bin"]
+        assert not list(dest_ret.rglob("*.part"))
