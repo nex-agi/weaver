@@ -14,20 +14,25 @@
 
 """HF weights export/download helpers shared by the sync and async clients.
 
-Everything in this module is pure (no IO) so both client stacks build
-identical requests and interpret identical responses; see
-``.claude/rules/async-compatibility.md``.
+Request building and response parsing here are pure (no IO) so both client
+stacks build identical requests and interpret identical responses; see
+``.claude/rules/async-compatibility.md``. The download-side helpers at the end
+of the module are the deliberate exception: they touch the local filesystem,
+and both stacks share them verbatim so resume, verification and publish
+semantics cannot drift apart.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import Any, Dict, List, Optional
+from typing import Any, BinaryIO, Dict, List, Optional
 
+from ._safeio import open_for_read, stat_no_follow, unlink_within
 from ._utils import lookup_case_insensitive
 
 # Artifact kinds the server can produce. The server derives the kind
@@ -318,17 +323,36 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
     return files
 
 
+def hash_stream(fh: BinaryIO) -> str:
+    """Compute the sha256 hex digest of an already-open binary stream.
+
+    Taking a file object rather than a path is what lets the anchored download
+    path hash exactly the bytes it wrote, through the descriptor it wrote them
+    with, instead of re-resolving a name that may since have been replaced.
+    """
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def file_sha256(path: Path) -> str:
     """Compute the sha256 hex digest of *path* by streaming it from disk.
 
     Hashing what actually landed on disk (rather than the bytes seen on the
     wire) is deliberate: it also catches short writes and torn resumes.
     """
-    digest = hashlib.sha256()
     with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hash_stream(fh)
+
+
+def sha256_at(parent_fd: int, name: str) -> str:
+    """sha256 of *name* read through *parent_fd*, never through its path."""
+    handle = open_for_read(parent_fd, name)
+    if handle is None:
+        raise FileNotFoundError(name)
+    with handle:
+        return hash_stream(handle)
 
 
 def check_downloaded_file(part_path: Path, entry: ArtifactFile, *, verify: bool) -> None:
@@ -372,14 +396,109 @@ def is_file_already_complete(final_path: Path, entry: ArtifactFile, *, verify: b
     return True
 
 
+# ---------------------------------------------------------------------------
+# Descriptor-anchored twins of the helpers above
+#
+# Same semantics, but every syscall is resolved against a directory descriptor
+# obtained by a no-follow walk (:mod:`weaver._safeio`) instead of against a
+# path that has to be re-traversed — and can therefore be re-pointed — on each
+# call. Both client stacks use these; the path-based versions above survive
+# only for the platform fallback.
+# ---------------------------------------------------------------------------
+
+
+def resume_offset_at(parent_fd: int, part_name: str, entry: ArtifactFile) -> int:
+    """Bytes of *part_name* a Range request may safely resume from.
+
+    The ``.part`` is inspected with ``lstat`` through the anchored descriptor,
+    so a symlink planted at that name is rejected here rather than quietly
+    redirecting the resumed write to its target. A partial longer than the
+    manifest says the whole file is cannot be a prefix of it, so it is
+    discarded and the download restarts.
+
+    Raises:
+        ValueError: The ``.part`` name is held by a symlink or another
+            non-regular file.
+    """
+    info = stat_no_follow(parent_fd, part_name)
+    if info is None:
+        return 0
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"refusing to write through a symlink: {part_name}")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"refusing to write through a non-regular file: {part_name}")
+    if entry.size is not None and info.st_size > entry.size:
+        # Longer than the manifest says it should be: poisoned partial.
+        unlink_within(parent_fd, part_name)
+        return 0
+    return info.st_size
+
+
+def check_downloaded_file_at(
+    parent_fd: int, part_name: str, entry: ArtifactFile, *, verify: bool
+) -> None:
+    """Anchored twin of :func:`check_downloaded_file`.
+
+    Deletes the corrupt file through the same descriptor before raising, so a
+    later retry cannot resume from poisoned bytes.
+
+    Raises:
+        RuntimeError: On a missing file, or a size or sha256 mismatch.
+    """
+    info = stat_no_follow(parent_fd, part_name)
+    if info is None:
+        raise RuntimeError(f"downloaded file disappeared before verification: {entry.name!r}")
+    if entry.size is not None and info.st_size != entry.size:
+        unlink_within(parent_fd, part_name)
+        raise RuntimeError(
+            f"Downloaded size mismatch for {entry.name!r}: "
+            f"expected {entry.size} bytes, got {info.st_size}"
+        )
+    if verify and entry.sha256:
+        actual = sha256_at(parent_fd, part_name)
+        if actual != entry.sha256:
+            unlink_within(parent_fd, part_name)
+            raise RuntimeError(
+                f"sha256 mismatch for {entry.name!r}: " f"expected {entry.sha256}, got {actual}"
+            )
+
+
+def is_file_already_complete_at(
+    parent_fd: int, name: str, entry: ArtifactFile, *, verify: bool
+) -> bool:
+    """Anchored twin of :func:`is_file_already_complete`.
+
+    Only a regular file counts as complete: unlike ``Path.is_file()`` this
+    does not follow a symlink standing at *name*, so a planted link is
+    re-downloaded over (via the ``.part`` and an anchored rename) instead of
+    being trusted as finished work.
+    """
+    if entry.size is None:
+        return False
+    info = stat_no_follow(parent_fd, name)
+    if info is None or not stat.S_ISREG(info.st_mode):
+        return False
+    if info.st_size != entry.size:
+        return False
+    if verify and entry.sha256:
+        return sha256_at(parent_fd, name) == entry.sha256
+    return True
+
+
 def ensure_within_directory(dest_dir: Path, candidate_parent: Path) -> None:
     """Require *candidate_parent* (resolved) to stay under *dest_dir* (resolved).
 
-    Lexical name validation cannot see the filesystem: a pre-existing symlink
-    inside the destination (``dest/link -> /tmp/outside``) turns the validated
-    name ``link/owned.bin`` into a write outside the tree. Resolving both
-    sides closes that hole; combined with O_NOFOLLOW on the final open this
-    leaves only a narrow, accepted check-to-use window.
+    Defense in depth, and no longer the guarantee. This is a cheap early
+    sanity check that rejects an obviously escaping descriptor name — a
+    pre-existing ``dest/link -> /tmp/outside`` turning the validated name
+    ``link/owned.bin`` into a write outside the tree — before anything is
+    created on disk. It cannot be more than that: it reasons about a resolved
+    *name*, and the directory that name points at can be swapped for a symlink
+    immediately afterwards.
+
+    Containment is guaranteed instead by the anchored walk in
+    :mod:`weaver._safeio`, which pins the destination directory by descriptor
+    and issues every write, hash, rename and unlink relative to it.
 
     Raises:
         ValueError: When the resolved parent escapes the destination.

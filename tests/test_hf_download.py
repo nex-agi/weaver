@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
+from pathlib import PurePosixPath
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -25,7 +27,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
-from weaver import _async_http, _http, async_service_client, service_client
+from weaver import _async_http, _http, _safeio, async_service_client, service_client
 from weaver._artifacts import (
     descriptor_files,
     parse_download_target,
@@ -290,16 +292,19 @@ class TestDescriptorFiles:
 
 
 class TestStreamDownload:
+    """The streamer writes into a sink its caller opened (and anchored)."""
+
     def test_full_download(self, tmp_path):
         content = FILES["adapter_model.safetensors"]
         transport = httpx.MockTransport(_presigned_handler(FILES))
         dest = tmp_path / "shard.bin"
         with httpx.Client(transport=transport) as client:
-            written = stream_download_to_file(
-                "https://tos.example.com/files/adapter_model.safetensors?sig=ok",
-                dest,
-                client=client,
-            )
+            with open(dest, "wb") as sink:
+                written = stream_download_to_file(
+                    "https://tos.example.com/files/adapter_model.safetensors?sig=ok",
+                    sink,
+                    client=client,
+                )
         assert written == len(content)
         assert dest.read_bytes() == content
 
@@ -309,12 +314,13 @@ class TestStreamDownload:
         dest = tmp_path / "shard.bin"
         dest.write_bytes(content[:100])
         with httpx.Client(transport=transport) as client:
-            written = stream_download_to_file(
-                "https://tos.example.com/files/adapter_model.safetensors?sig=ok",
-                dest,
-                client=client,
-                resume_from=100,
-            )
+            with open(dest, "ab") as sink:
+                written = stream_download_to_file(
+                    "https://tos.example.com/files/adapter_model.safetensors?sig=ok",
+                    sink,
+                    client=client,
+                    resume_from=100,
+                )
         assert written == len(content)
         assert dest.read_bytes() == content
 
@@ -327,21 +333,25 @@ class TestStreamDownload:
         dest = tmp_path / "f.bin"
         dest.write_bytes(b"stale-partial")
         with httpx.Client(transport=httpx.MockTransport(handler)) as client:
-            written = stream_download_to_file(
-                "https://tos.example.com/f", dest, client=client, resume_from=13
-            )
+            # Opened for append because the caller intended to resume; the 200
+            # forces the streamer to drop the stale bytes rather than append.
+            with open(dest, "ab") as sink:
+                written = stream_download_to_file(
+                    "https://tos.example.com/f", sink, client=client, resume_from=13
+                )
         assert written == len(content)
         assert dest.read_bytes() == content
 
     def test_expired_url_raises_dedicated_error(self, tmp_path):
         transport = httpx.MockTransport(_presigned_handler(FILES))
         with httpx.Client(transport=transport) as client:
-            with pytest.raises(DownloadURLExpiredError):
-                stream_download_to_file(
-                    "https://tos.example.com/files/adapter_config.json?sig=expired",
-                    tmp_path / "f.bin",
-                    client=client,
-                )
+            with open(tmp_path / "f.bin", "wb") as sink:
+                with pytest.raises(DownloadURLExpiredError):
+                    stream_download_to_file(
+                        "https://tos.example.com/files/adapter_config.json?sig=expired",
+                        sink,
+                        client=client,
+                    )
 
     def test_async_twin_full_download(self, tmp_path):
         content = FILES["adapter_model.safetensors"]
@@ -350,11 +360,32 @@ class TestStreamDownload:
 
         async def run():
             async with httpx.AsyncClient(transport=transport) as client:
-                return await _async_http.async_stream_download_to_file(
-                    "https://tos.example.com/files/adapter_model.safetensors?sig=ok",
-                    dest,
-                    client=client,
-                )
+                with open(dest, "wb") as sink:
+                    return await _async_http.async_stream_download_to_file(
+                        "https://tos.example.com/files/adapter_model.safetensors?sig=ok",
+                        sink,
+                        client=client,
+                    )
+
+        written = asyncio.run(run())
+        assert written == len(content)
+        assert dest.read_bytes() == content
+
+    def test_async_twin_restart_when_server_ignores_range(self, tmp_path):
+        content = b"full-content"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=content)  # no Range support
+
+        dest = tmp_path / "f.bin"
+        dest.write_bytes(b"stale-partial")
+
+        async def run():
+            async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+                with open(dest, "ab") as sink:
+                    return await _async_http.async_stream_download_to_file(
+                        "https://tos.example.com/f", sink, client=client, resume_from=13
+                    )
 
         written = asyncio.run(run())
         assert written == len(content)
@@ -734,6 +765,7 @@ class TestBareDownloadClient:
 
 class TestSymlinkContainment:
     def test_symlink_inside_dest_cannot_escape(self, tmp_path, monkeypatch):
+        calls: list = []
         outside = tmp_path / "outside"
         outside.mkdir()
         dest = tmp_path / "out"
@@ -744,7 +776,7 @@ class TestSymlinkContainment:
             service_client,
             "build_download_client",
             lambda timeout=None: httpx.Client(
-                transport=httpx.MockTransport(_presigned_handler(files))
+                transport=httpx.MockTransport(_presigned_handler(files, calls))
             ),
         )
         client = _make_sync_client(_api_routes(_descriptor(files)))
@@ -752,8 +784,10 @@ class TestSymlinkContainment:
             client.download_weights(ARTIFACT_UUID, dest)
         assert not (outside / "owned.bin").exists()
         assert not (outside / "owned.bin.part").exists()
+        assert not calls  # rejected before a single byte was fetched
 
     def test_async_symlink_inside_dest_cannot_escape(self, tmp_path, monkeypatch):
+        calls: list = []
         outside = tmp_path / "outside"
         outside.mkdir()
         dest = tmp_path / "out"
@@ -764,13 +798,277 @@ class TestSymlinkContainment:
             async_service_client,
             "build_async_download_client",
             lambda timeout=None: httpx.AsyncClient(
-                transport=httpx.MockTransport(_presigned_handler(files))
+                transport=httpx.MockTransport(_presigned_handler(files, calls))
             ),
         )
         client = _make_async_client(_api_routes(_descriptor(files)))
         with pytest.raises(ValueError, match="outside the destination"):
             asyncio.run(client.download_weights(ARTIFACT_UUID, dest))
         assert not (outside / "owned.bin").exists()
+        assert not calls
+
+
+# ---------------------------------------------------------------------------
+# Descriptor-anchored destination walk (weaver._safeio)
+# ---------------------------------------------------------------------------
+
+requires_dir_fd = pytest.mark.skipif(
+    not _safeio.supports_dir_fd(), reason="platform has no dir_fd support"
+)
+
+
+@requires_dir_fd
+class TestAnchoredWalk:
+    def test_creates_and_returns_the_leaf_directory(self, tmp_path):
+        dest = tmp_path / "out"
+        dest.mkdir()
+
+        parent_fd = _safeio.open_parent_fd(dest, PurePosixPath("a/b/file.bin"), create=True)
+        try:
+            assert (dest / "a" / "b").is_dir()
+            with _safeio.open_for_write(parent_fd, "file.bin", append=False) as sink:
+                sink.write(b"payload")
+        finally:
+            os.close(parent_fd)
+
+        assert (dest / "a" / "b" / "file.bin").read_bytes() == b"payload"
+
+    def test_symlinked_intermediate_is_rejected(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "sub").symlink_to(outside)
+
+        with pytest.raises(ValueError, match="unsafe path component"):
+            _safeio.open_parent_fd(dest, PurePosixPath("sub/owned.bin"), create=True)
+
+    def test_walk_creates_nothing_outside_before_rejecting(self, tmp_path):
+        # Regression for the reported side effect: mkdir(parents=True) used to
+        # run ahead of the containment check and materialized a directory in
+        # the link target before anything raised.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "link").symlink_to(outside)
+
+        with pytest.raises(ValueError, match="unsafe path component"):
+            _safeio.open_parent_fd(dest, PurePosixPath("link/newdir/file.bin"), create=True)
+
+        assert list(outside.iterdir()) == []
+
+    def test_symlink_to_a_directory_inside_dest_is_also_rejected(self, tmp_path):
+        # The resolved-parent check would accept this one. The walk follows NO
+        # component, which is what makes the anchor unconditional.
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "real").mkdir()
+        (dest / "link").symlink_to(dest / "real")
+
+        with pytest.raises(ValueError, match="unsafe path component"):
+            _safeio.open_parent_fd(dest, PurePosixPath("link/owned.bin"), create=True)
+
+    def test_file_where_a_directory_is_expected_is_rejected(self, tmp_path):
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "sub").write_bytes(b"not a directory")
+
+        with pytest.raises(ValueError, match="unsafe path component"):
+            _safeio.open_parent_fd(dest, PurePosixPath("sub/owned.bin"), create=True)
+
+    def test_anchor_survives_a_directory_swap(self, tmp_path):
+        """The TOCTOU kill in isolation: swap the name AFTER the walk.
+
+        A descriptor names an inode. Once the walk has one, re-pointing the
+        path it came from is inert — no later call re-traverses the name.
+        """
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "sub").mkdir()
+
+        parent_fd = _safeio.open_parent_fd(dest, PurePosixPath("sub/owned.bin"), create=True)
+        try:
+            # Everything an attacker winning the race could do to the name.
+            os.rename(dest / "sub", dest / "sub-moved")
+            (dest / "sub").symlink_to(outside)
+
+            with _safeio.open_for_write(parent_fd, "owned.bin.part", append=False) as sink:
+                sink.write(b"anchored")
+            _safeio.rename_within(parent_fd, "owned.bin.part", "owned.bin")
+            assert os.listdir(parent_fd) == ["owned.bin"]
+        finally:
+            os.close(parent_fd)
+
+        assert (dest / "sub-moved" / "owned.bin").read_bytes() == b"anchored"
+        assert list(outside.iterdir()) == []
+
+
+@requires_dir_fd
+class TestDownloadAnchoring:
+    """End-to-end: the bytes land where the walk pointed, not where the name does."""
+
+    @staticmethod
+    def _swapping_handler(files, dest, outside, swapped):
+        """Presigned handler that swaps ``dest/sub`` out mid-download.
+
+        By the time a request reaches the transport, ``_download_weights_file``
+        has already walked and pinned the parent descriptor, so this is the
+        exact interleaving a racing attacker needs — made deterministic. The
+        first attempt then dies with a transport error, which puts the *whole*
+        remainder of the download after the swap: the resume stat, the reopen,
+        the write, the hash and the publishing rename.
+        """
+        base = _presigned_handler(files)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if not swapped:
+                os.rename(dest / "sub", dest / "sub-moved")
+                (dest / "sub").symlink_to(outside)
+                swapped.append(True)
+                raise httpx.ReadError("connection reset")
+            return base(request)
+
+        return handler
+
+    def _prepare(self, tmp_path):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "sub").mkdir()
+        return dest, outside, {"sub/owned.bin": b"anchored-bytes"}
+
+    def _assert_landed_inside(self, dest, outside, swapped):
+        assert swapped, "the swap must actually have happened mid-download"
+        assert (dest / "sub-moved" / "owned.bin").read_bytes() == b"anchored-bytes"
+        assert not (outside / "owned.bin").exists()
+        assert not (outside / "owned.bin.part").exists()
+        assert list(outside.iterdir()) == []
+
+    def test_sync_write_and_publish_follow_the_descriptor(self, tmp_path, monkeypatch):
+        dest, outside, files = self._prepare(tmp_path)
+        swapped: list = []
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(self._swapping_handler(files, dest, outside, swapped))
+            ),
+        )
+        client = _make_sync_client(_api_routes(_descriptor(files)))
+
+        client.download_weights(ARTIFACT_UUID, dest)
+
+        self._assert_landed_inside(dest, outside, swapped)
+
+    def test_async_write_and_publish_follow_the_descriptor(self, tmp_path, monkeypatch):
+        dest, outside, files = self._prepare(tmp_path)
+        swapped: list = []
+        monkeypatch.setattr(
+            async_service_client,
+            "build_async_download_client",
+            lambda timeout=None: httpx.AsyncClient(
+                transport=httpx.MockTransport(self._swapping_handler(files, dest, outside, swapped))
+            ),
+        )
+        client = _make_async_client(_api_routes(_descriptor(files)))
+
+        asyncio.run(client.download_weights(ARTIFACT_UUID, dest))
+
+        self._assert_landed_inside(dest, outside, swapped)
+
+
+class TestUnanchoredFallback:
+    """Platforms without ``dir_fd`` (Windows) keep the previous path-based flow."""
+
+    @pytest.fixture
+    def no_dir_fd(self, monkeypatch):
+        monkeypatch.setattr(os, "supports_dir_fd", frozenset())
+        assert not _safeio.supports_dir_fd()
+
+    def test_sync_download_uses_the_legacy_path(self, tmp_path, monkeypatch, no_dir_fd):
+        def unreachable(*_args, **_kwargs):
+            raise AssertionError("the anchored walk must not run without dir_fd support")
+
+        monkeypatch.setattr(service_client, "open_parent_fd", unreachable)
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(_presigned_handler(FILES))
+            ),
+        )
+        client = _make_sync_client(_api_routes(_descriptor(FILES)))
+
+        dest = client.download_weights(ARTIFACT_UUID, tmp_path / "out")
+
+        for name, content in FILES.items():
+            assert (dest / name).read_bytes() == content
+        assert not list(dest.rglob("*.part"))
+
+    def test_async_download_uses_the_legacy_path(self, tmp_path, monkeypatch, no_dir_fd):
+        def unreachable(*_args, **_kwargs):
+            raise AssertionError("the anchored walk must not run without dir_fd support")
+
+        monkeypatch.setattr(async_service_client, "open_parent_fd", unreachable)
+        monkeypatch.setattr(
+            async_service_client,
+            "build_async_download_client",
+            lambda timeout=None: httpx.AsyncClient(
+                transport=httpx.MockTransport(_presigned_handler(FILES))
+            ),
+        )
+        client = _make_async_client(_api_routes(_descriptor(FILES)))
+
+        dest = asyncio.run(client.download_weights(ARTIFACT_UUID, tmp_path / "out"))
+
+        for name, content in FILES.items():
+            assert (dest / name).read_bytes() == content
+        assert not list(dest.rglob("*.part"))
+
+    def test_legacy_path_still_resumes(self, tmp_path, monkeypatch, no_dir_fd):
+        calls: list = []
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(_presigned_handler(SINGLE_FILE, calls))
+            ),
+        )
+        client = _make_sync_client(_api_routes(_descriptor(SINGLE_FILE)))
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "shard.bin.part").write_bytes(SINGLE_FILE["shard.bin"][:100])
+
+        client.download_weights(ARTIFACT_UUID, dest, max_concurrency=1)
+
+        assert (dest / "shard.bin").read_bytes() == SINGLE_FILE["shard.bin"]
+        assert calls[0].headers["Range"] == "bytes=100-"
+
+    def test_legacy_path_still_rejects_a_preplanted_part_symlink(
+        self, tmp_path, monkeypatch, no_dir_fd
+    ):
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        files = {"owned.bin": b"x"}
+        (dest / "owned.bin.part").symlink_to(outside)
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(_presigned_handler(files))
+            ),
+        )
+        client = _make_sync_client(_api_routes(_descriptor(files)))
+
+        with pytest.raises(ValueError, match="refusing to write through a symlink"):
+            client.download_weights(ARTIFACT_UUID, dest)
+        assert outside.read_bytes() == b""
 
 
 class TestUriModelIdGuard:
@@ -801,6 +1099,12 @@ class TestUriModelIdGuard:
 
 
 class TestPartSymlinkGuard:
+    """A ``.part`` name held by a symlink is refused, not written through.
+
+    The anchored path catches this at the resume ``lstat``, before anything is
+    opened: the link is seen as a link instead of being measured through.
+    """
+
     def test_preplanted_part_symlink_is_rejected(self, tmp_path, monkeypatch):
         outside = tmp_path / "outside.bin"
         outside.write_bytes(b"")
@@ -819,3 +1123,48 @@ class TestPartSymlinkGuard:
         with pytest.raises(ValueError, match="refusing to write through a symlink"):
             client.download_weights(ARTIFACT_UUID, dest)
         assert outside.read_bytes() == b""
+
+    def test_async_preplanted_part_symlink_is_rejected(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        files = {"owned.bin": b"x"}
+        (dest / "owned.bin.part").symlink_to(outside)
+        monkeypatch.setattr(
+            async_service_client,
+            "build_async_download_client",
+            lambda timeout=None: httpx.AsyncClient(
+                transport=httpx.MockTransport(_presigned_handler(files))
+            ),
+        )
+        client = _make_async_client(_api_routes(_descriptor(files)))
+        with pytest.raises(ValueError, match="refusing to write through a symlink"):
+            asyncio.run(client.download_weights(ARTIFACT_UUID, dest))
+        assert outside.read_bytes() == b""
+
+    @requires_dir_fd
+    def test_symlink_at_the_final_name_is_replaced_not_written_through(self, tmp_path, monkeypatch):
+        # A link planted at the *published* name must not be treated as
+        # finished work, and the publishing rename must replace the link
+        # itself rather than following it.
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"untouched")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        files = {"owned.bin": b"real-content"}
+        (dest / "owned.bin").symlink_to(outside)
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(_presigned_handler(files))
+            ),
+        )
+        client = _make_sync_client(_api_routes(_descriptor(files)))
+
+        client.download_weights(ARTIFACT_UUID, dest)
+
+        assert not (dest / "owned.bin").is_symlink()
+        assert (dest / "owned.bin").read_bytes() == b"real-content"
+        assert outside.read_bytes() == b"untouched"

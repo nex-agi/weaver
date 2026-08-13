@@ -25,8 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from pathlib import Path
-from typing import Any, Mapping, MutableMapping
+from typing import Any, BinaryIO, Mapping, MutableMapping
 
 import httpx
 from opentelemetry import baggage, context, trace
@@ -55,16 +54,6 @@ from .config import WeaverConfig
 logger = logging.getLogger(__name__)
 
 
-def _no_follow_opener(path: str, flags: int) -> int:
-    """Open refusing to follow a symlink at the final component.
-
-    Descriptor names are untrusted; a symlink pre-planted where the ``.part``
-    lands must fail instead of redirecting the write. O_NOFOLLOW is absent on
-    Windows, where the containment check remains the only guard.
-    """
-    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0))
-
-
 def build_async_download_client(timeout: httpx.Timeout | float | None = None) -> httpx.AsyncClient:
     """Asyncio twin of :func:`weaver._http.build_download_client`.
 
@@ -82,7 +71,7 @@ def build_async_download_client(timeout: httpx.Timeout | float | None = None) ->
 
 async def async_stream_download_to_file(
     url: str,
-    dest: Path,
+    sink: BinaryIO,
     *,
     client: httpx.AsyncClient,
     resume_from: int = 0,
@@ -91,12 +80,15 @@ async def async_stream_download_to_file(
     """Asyncio twin of :func:`weaver._http.stream_download_to_file`.
 
     Network reads are awaited so the event loop stays free; the per-chunk
-    ``fh.write`` is a buffered local-disk write that is fast relative to the
+    ``sink.write`` is a buffered local-disk write that is fast relative to the
     awaited network reads, which keeps the loop responsive without a thread
     hop per chunk.
 
+    The caller owns *sink* — see the sync twin for why opening it here would
+    defeat the descriptor anchoring in :mod:`weaver._safeio`.
+
     Returns:
-        Total bytes now present in *dest*.
+        Total bytes now present in *sink*.
 
     Raises:
         DownloadURLExpiredError: The URL was rejected with 401/403 — refresh
@@ -122,17 +114,18 @@ async def async_stream_download_to_file(
             await response.aread()
             raise_for_response(response)
         partial = response.status_code == httpx.codes.PARTIAL_CONTENT
-        mode = "ab" if partial else "wb"
-        written = resume_from if partial else 0
-        if dest.is_symlink():
-            # Portable guard: on platforms without O_NOFOLLOW the opener
-            # silently follows links, so a pre-planted .part symlink would
-            # redirect the write outside the destination.
-            raise ValueError(f"refusing to write through a symlink: {dest}")
-        with open(dest, mode, opener=_no_follow_opener) as fh:
-            async for chunk in response.aiter_bytes(chunk_size):
-                fh.write(chunk)
-                written += len(chunk)
+        if partial:
+            written = resume_from
+        else:
+            # The server ignored the Range header and is sending the whole
+            # body. The sink may be open for append and already hold a
+            # partial, so drop those bytes rather than doubling the file.
+            sink.seek(0)
+            sink.truncate()
+            written = 0
+        async for chunk in response.aiter_bytes(chunk_size):
+            sink.write(chunk)
+            written += len(chunk)
     return written
 
 
