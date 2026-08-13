@@ -85,6 +85,7 @@ from typing import (
     Optional,
     Sequence,
     Union,
+    overload,
 )
 
 import httpx
@@ -107,14 +108,23 @@ from ._async_http import (
     async_stream_download_to_file,
     build_async_download_client,
 )
-from ._http import DownloadURLExpiredError, compute_retry_delay
+from ._deployments import (
+    DEPLOYMENT_PAGE_SIZE,
+    deployment_items,
+    next_page_offset,
+    translate_deployment_error,
+)
+from ._http import DownloadURLExpiredError, WeaverAPIError, compute_retry_delay
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import AsyncOperationHandle, build_async_operation_handle
 from .types import LoraConfig
+from .types.deployment import Deployment
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
+    from typing import Literal
+
     from .async_sampling_client import AsyncSamplingClient
     from .async_training_client import AsyncTrainingClient
 
@@ -885,3 +895,69 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         await asyncio.to_thread(check_downloaded_file, part_path, entry, verify=verify)
         # Atomic publish: readers never observe a half-written file.
         part_path.replace(final_path)
+
+    # ------------------------------------------------------------------
+    # NorthGate deployments
+    # ------------------------------------------------------------------
+
+    async def list_deployments(self) -> List[Deployment]:
+        """List the deployments this principal published.
+
+        See :meth:`weaver.service_client.ServiceClient.list_deployments`.
+        """
+        deployments: List[Deployment] = []
+        offset = 0
+        while True:
+            params = {"limit": DEPLOYMENT_PAGE_SIZE, "offset": offset}
+            try:
+                payload = await self.http.get("/api/v1/deployments", params=params)
+            except WeaverAPIError as exc:
+                raise translate_deployment_error(exc) from exc
+            page = deployment_items(payload)
+            deployments.extend(Deployment.from_payload(item) for item in page)
+            next_offset = next_page_offset(payload, offset, len(page))
+            if next_offset is None:
+                return deployments
+            offset = next_offset
+
+    async def get_deployment(self, deployment_id: str) -> Deployment:
+        """Fetch one deployment by id.
+
+        See :meth:`weaver.service_client.ServiceClient.get_deployment`.
+        """
+        try:
+            payload = await self.http.get(f"/api/v1/deployments/{deployment_id}")
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        return Deployment.from_payload(payload if isinstance(payload, dict) else {})
+
+    @overload
+    async def delete_deployment(
+        self, deployment_id: str, *, wait: "Literal[True]" = True
+    ) -> Deployment: ...
+
+    @overload
+    async def delete_deployment(
+        self, deployment_id: str, *, wait: "Literal[False]"
+    ) -> AsyncOperationHandle: ...
+
+    async def delete_deployment(
+        self, deployment_id: str, *, wait: bool = True
+    ) -> Deployment | AsyncOperationHandle:
+        """Take a deployment down.
+
+        See :meth:`weaver.service_client.ServiceClient.delete_deployment`.
+        Returns the stopped :class:`~weaver.types.Deployment` when *wait* is
+        True, else an ``AsyncOperationHandle``.
+        """
+        try:
+            response = await self.http.delete(f"/api/v1/deployments/{deployment_id}")
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        handle = build_async_operation_handle(
+            self.http, response if isinstance(response, dict) else {}
+        )
+        if not wait:
+            return handle
+        result = await handle.result()
+        return Deployment.from_payload(result if isinstance(result, dict) else {})

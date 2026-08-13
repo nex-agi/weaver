@@ -14,6 +14,10 @@
 
 """High-level ServiceClient that manages sessions and child clients."""
 
+# The client is the SDK's single entry point, so it aggregates every resource
+# family (sessions, models, checkpoints, artifacts, deployments) by design.
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import atexit
@@ -22,7 +26,18 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+    overload,
+)
 
 import httpx
 
@@ -39,9 +54,16 @@ from ._artifacts import (
     resolve_checkpoint_id_from_listing,
     select_artifact_payload,
 )
+from ._deployments import (
+    DEPLOYMENT_PAGE_SIZE,
+    deployment_items,
+    next_page_offset,
+    translate_deployment_error,
+)
 from ._http import (
     APIClient,
     DownloadURLExpiredError,
+    WeaverAPIError,
     build_download_client,
     compute_retry_delay,
     stream_download_to_file,
@@ -50,9 +72,12 @@ from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
 from .types import LoraConfig
+from .types.deployment import Deployment
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
+    from typing import Literal
+
     from .sampling_client import SamplingClient
     from .training_client import TrainingClient
 
@@ -921,3 +946,104 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         check_downloaded_file(part_path, entry, verify=verify)
         # Atomic publish: readers never observe a half-written file.
         part_path.replace(final_path)
+
+    # ------------------------------------------------------------------
+    # NorthGate deployments
+    # ------------------------------------------------------------------
+
+    def list_deployments(self) -> List[Deployment]:
+        """List the deployments this principal published.
+
+        Deployments are owner-scoped: the listing shows the ones this
+        principal created, not every deployment of the models it can access.
+        Stopped and failed deployments are included, so the history of an
+        endpoint stays visible after it is taken down.
+
+        Returns:
+            Every :class:`~weaver.types.Deployment` the caller owns, newest
+            first.
+
+        Raises:
+            WeaverAPIError: If deployments are disabled on this server (503).
+        """
+        deployments: List[Deployment] = []
+        offset = 0
+        while True:
+            params = {"limit": DEPLOYMENT_PAGE_SIZE, "offset": offset}
+            try:
+                payload = self.http.get("/api/v1/deployments", params=params)
+            except WeaverAPIError as exc:
+                raise translate_deployment_error(exc) from exc
+            page = deployment_items(payload)
+            deployments.extend(Deployment.from_payload(item) for item in page)
+            next_offset = next_page_offset(payload, offset, len(page))
+            if next_offset is None:
+                return deployments
+            offset = next_offset
+
+    def get_deployment(self, deployment_id: str) -> Deployment:
+        """Fetch one deployment by id.
+
+        Args:
+            deployment_id: The deployment's server-generated id.
+
+        Returns:
+            The :class:`~weaver.types.Deployment`, including its endpoint URL
+            once it is running.
+
+        Raises:
+            WeaverAPIError: If the deployment does not exist or belongs to
+                another principal (404 — a deployment owned by someone else
+                is reported as missing), or deployments are disabled (503).
+        """
+        try:
+            payload = self.http.get(f"/api/v1/deployments/{deployment_id}")
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        return Deployment.from_payload(payload if isinstance(payload, dict) else {})
+
+    @overload
+    def delete_deployment(
+        self, deployment_id: str, *, wait: Literal[True] = True
+    ) -> Deployment: ...
+
+    @overload
+    def delete_deployment(self, deployment_id: str, *, wait: Literal[False]) -> OperationHandle: ...
+
+    def delete_deployment(
+        self, deployment_id: str, *, wait: bool = True
+    ) -> Deployment | OperationHandle:
+        """Take a deployment down.
+
+        Offboards the model from the gateway, stops the workload, releases the
+        job name, and frees the materialized weights the deployment was
+        pinning. The name becomes available again once the deployment reaches
+        ``stopped``.
+
+        Deleting deliberately does not need the ``deployment.publish``
+        capability: whoever published an endpoint must always be able to take
+        it down, even if their grant was revoked afterwards.
+
+        Args:
+            deployment_id: The deployment's server-generated id.
+            wait: If True (default), blocks until teardown finishes and
+                returns the stopped :class:`~weaver.types.Deployment`.
+
+        Returns:
+            The stopped :class:`~weaver.types.Deployment` when *wait* is True,
+            else an :class:`OperationHandle` whose result is that deployment.
+
+        Raises:
+            WeaverAPIError: If the deployment is unknown or owned by someone
+                else (404), is already stopped (409 ``already_stopped``), or
+                deployments are disabled on this server (503).
+        """
+        try:
+            response = self.http.delete(f"/api/v1/deployments/{deployment_id}")
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        handle = build_operation_handle(self.http, response if isinstance(response, dict) else {})
+        if not wait:
+            return handle
+        result = handle.result()
+        return Deployment.from_payload(result if isinstance(result, dict) else {})

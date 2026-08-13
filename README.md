@@ -134,6 +134,46 @@ Three things to know:
 Downloads run in parallel, resume interrupted files, refresh expired URLs, and verify each
 file's sha256 before publishing it. Both methods have `Async*` twins.
 
+### Deploying a checkpoint
+
+`deploy_checkpoint()` publishes a checkpoint as a public, OpenAI-compatible endpoint: the
+server converts it to HuggingFace format, launches a dedicated inference workload, and
+registers that workload on the NorthGate gateway under the name you choose.
+
+```python
+deployment = training_client.deploy_checkpoint(ckpt, name="my-chat-model")
+print(deployment.endpoint)          # OpenAI-compatible URL
+
+service.list_deployments()
+service.get_deployment(deployment.id)
+service.delete_deployment(deployment.id)
+```
+
+```bash
+weaver deployment create weaver://<model>/checkpoints/step-42 --name my-chat-model
+weaver deployment list
+weaver deployment get <deployment-id>
+weaver deployment delete <deployment-id>
+```
+
+Four things to know:
+
+- **Publishing is permission-gated and off by default.** The `deployment.publish` capability
+  is granted by principal origin, not by Weaver role: an SSO session always qualifies, an API
+  key only when it was minted under an IAM `biz_code` on the server's allowlist, and a service
+  credential never. A server with the feature switched off answers 503. Both cases raise a
+  `WeaverAPIError` that names what has to change. Listing, reading and deleting your own
+  deployments need no capability — whoever published an endpoint can always take it down.
+- **A deployment is independent and long-lived.** It does not share the training inference
+  instance, it outlives the training session, and it holds its GPUs until you delete it. It
+  also pins the source checkpoint and the exported artifact against garbage collection.
+- **The name is global and must be valid everywhere it lands.** It is the served model name,
+  the gateway's `model_name`, and a Kubernetes label at once: at most 63 characters of
+  letters, digits, `.`, `-` and `_`, starting and ending alphanumerically. `overwrite=True`
+  replaces an existing *gateway* registration; it does not free a name Weaver already uses.
+- **It takes tens of minutes**, dominated by the conversion. Pass `wait=False` to get an
+  `OperationHandle` instead of blocking. Every method has an `Async*` twin.
+
 ## Ecosystem
 
 [NexRL](https://github.com/nex-agi/NexRL) is the companion RL training framework.

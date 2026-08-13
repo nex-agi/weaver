@@ -16,6 +16,7 @@
 
 from .checkpoint import Checkpoint
 from .datum import Datum
+from .deployment import Deployment
 from .logprobs import LogprobsParams
 from .lora_config import LoraConfig
 from .model_input import ModelInput, ModelInputChunk
@@ -59,6 +60,7 @@ __all__ = [
     "AdamParams",
     "Checkpoint",
     "Datum",
+    "Deployment",
     "LoraConfig",
     "LogprobsParams",
     "ModelInput",
