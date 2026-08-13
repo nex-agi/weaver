@@ -771,3 +771,51 @@ class TestSymlinkContainment:
         with pytest.raises(ValueError, match="outside the destination"):
             asyncio.run(client.download_weights(ARTIFACT_UUID, dest))
         assert not (outside / "owned.bin").exists()
+
+
+class TestUriModelIdGuard:
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "weaver://../checkpoints/x",
+            "weaver://%2e%2e/checkpoints/x",
+            "weaver://a\\b/checkpoints/x",
+            "weaver://.hidden/checkpoints/x",
+        ],
+    )
+    def test_parse_rejects_unsafe_model_ids(self, uri):
+        with pytest.raises(ValueError, match="unsafe model id|Unrecognized weaver URI"):
+            parse_download_target(uri)
+
+    def test_download_rejects_unsafe_model_id_before_any_request(self, tmp_path):
+        client = _make_sync_client(None)
+        with pytest.raises(ValueError, match="unsafe model id"):
+            client.download_weights("weaver://../checkpoints/x", tmp_path / "out")
+        client.http.get.assert_not_called()
+
+    def test_async_download_rejects_unsafe_model_id(self, tmp_path):
+        client = _make_async_client(None)
+        with pytest.raises(ValueError, match="unsafe model id"):
+            asyncio.run(client.download_weights("weaver://../checkpoints/x", tmp_path / "out"))
+        client.http.get.assert_not_called()
+
+
+class TestPartSymlinkGuard:
+    def test_preplanted_part_symlink_is_rejected(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside.bin"
+        outside.write_bytes(b"")
+        dest = tmp_path / "out"
+        dest.mkdir()
+        files = {"owned.bin": b"x"}
+        (dest / "owned.bin.part").symlink_to(outside)
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(_presigned_handler(files))
+            ),
+        )
+        client = _make_sync_client(_api_routes(_descriptor(files)))
+        with pytest.raises(ValueError, match="refusing to write through a symlink"):
+            client.download_weights(ARTIFACT_UUID, dest)
+        assert outside.read_bytes() == b""

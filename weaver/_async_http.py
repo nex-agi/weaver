@@ -124,6 +124,11 @@ async def async_stream_download_to_file(
         partial = response.status_code == httpx.codes.PARTIAL_CONTENT
         mode = "ab" if partial else "wb"
         written = resume_from if partial else 0
+        if dest.is_symlink():
+            # Portable guard: on platforms without O_NOFOLLOW the opener
+            # silently follows links, so a pre-planted .part symlink would
+            # redirect the write outside the destination.
+            raise ValueError(f"refusing to write through a symlink: {dest}")
         with open(dest, mode, opener=_no_follow_opener) as fh:
             async for chunk in response.aiter_bytes(chunk_size):
                 fh.write(chunk)

@@ -55,6 +55,10 @@ _WINDOWS_RESERVED_NAMES = frozenset(
     | {f"LPT{i}" for i in range(1, 10)}
 )
 
+# URL path segments derived from URIs must never contain dot-segments or
+# separator characters; server ids are hyphenated-hex UUIDs, well within this.
+_SAFE_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
+
 _ARTIFACT_URI_RE = re.compile(
     r"^weaver://(?P<model_id>[^/]+)/checkpoints/(?P<name>[^/]+)"
     r"(?:/artifacts/(?P<kind>[^/]+))?/?$"
@@ -139,6 +143,11 @@ def parse_download_target(target: str) -> ArtifactTarget:
             f"Unknown artifact kind {kind!r} in {normalized!r}; expected one of {ARTIFACT_KINDS}"
         )
     model_id = match.group("model_id")
+    if not _SAFE_SEGMENT_RE.fullmatch(model_id):
+        # The model id is interpolated into /api/v1/models/{id}/... routes;
+        # '..', encoded dots, '\\' etc. would let a crafted URI reroute the
+        # request. Real model ids are UUIDs, so a conservative charset is safe.
+        raise ValueError(f"unsafe model id in weaver URI: {model_id!r}")
     name = match.group("name")
     return ArtifactTarget(
         model_id=model_id,
