@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import uuid
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional
 
 from ._utils import lookup_case_insensitive
@@ -50,6 +51,34 @@ _ARTIFACT_URI_RE = re.compile(
     r"^weaver://(?P<model_id>[^/]+)/checkpoints/(?P<name>[^/]+)"
     r"(?:/artifacts/(?P<kind>[^/]+))?/?$"
 )
+
+
+def validate_resource_id(value: str, *, kind: str) -> str:
+    """Validate a caller-supplied resource id before it becomes a URL segment.
+
+    Raw ids are interpolated into API paths; without this check a value like
+    ``../checkpoints/<uuid>`` is dot-segment-normalized by the HTTP stack into
+    a DIFFERENT route (e.g. deleting a checkpoint through the deployments
+    surface). Server resource ids are UUIDs, so anything else is rejected
+    before any request is built.
+
+    Returns:
+        The canonical lowercase hyphenated UUID text, safe to interpolate.
+
+    Raises:
+        ValueError: If *value* is not a canonical UUID.
+    """
+    candidate = (value or "").strip()
+    try:
+        parsed = uuid.UUID(candidate)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{kind} id must be a UUID, got {value!r}") from exc
+    canonical = str(parsed)
+    if candidate.lower() != canonical:
+        # Reject aliases (unhyphenated/braced/urn forms) so the text that
+        # reaches the URL is exactly the text that was validated.
+        raise ValueError(f"{kind} id must be a canonical hyphenated UUID, got {value!r}")
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -86,8 +115,9 @@ def parse_download_target(target: str) -> ArtifactTarget:
     if not normalized:
         raise ValueError("download target must not be empty")
     if not normalized.startswith("weaver://"):
-        # Anything that is not a weaver URI is treated as an artifact id.
-        return ArtifactTarget(artifact_id=normalized)
+        # Anything that is not a weaver URI is treated as an artifact id, and
+        # must therefore be a canonical UUID (it becomes a URL path segment).
+        return ArtifactTarget(artifact_id=validate_resource_id(normalized, kind="artifact"))
     match = _ARTIFACT_URI_RE.match(normalized)
     if not match:
         raise ValueError(
@@ -226,6 +256,16 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
         url = str(lookup_case_insensitive(raw, "url") or "")
         if not name or not url:
             raise ValueError(f"descriptor file entry missing name or url: {raw!r}")
+        if "\\" in name:
+            # PurePosixPath treats backslashes as ordinary characters, but the
+            # final ``dest_dir / name`` uses HOST semantics — on Windows a
+            # backslash is a separator and ``..\\owned.bin`` escapes dest_dir.
+            raise ValueError(f"unsafe file name in download descriptor: {name!r}")
+        windows_view = PureWindowsPath(name)
+        if windows_view.drive or windows_view.root or ".." in windows_view.parts:
+            # Rejects drive-absolute (C:\\...), drive-relative (C:foo) and
+            # rooted (\\Windows\\...) spellings that are traversal on Windows.
+            raise ValueError(f"unsafe file name in download descriptor: {name!r}")
         pure = PurePosixPath(name)
         if not pure.parts or pure.is_absolute() or ".." in pure.parts:
             raise ValueError(f"unsafe file name in download descriptor: {name!r}")

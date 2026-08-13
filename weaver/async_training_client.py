@@ -31,7 +31,11 @@ import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
-from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload
+from ._artifacts import (
+    DEFAULT_EXPORT_TTL_SECONDS,
+    is_artifact_payload,
+    validate_resource_id,
+)
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
@@ -653,12 +657,14 @@ class AsyncTrainingClient:
         if isinstance(checkpoint, Checkpoint):
             if not checkpoint.id:
                 raise ValueError("Checkpoint object has no id")
-            return checkpoint.id
+            return validate_resource_id(checkpoint.id, kind="checkpoint")
         reference = checkpoint.strip()
         if not reference:
             raise ValueError("checkpoint reference must not be empty")
         if not reference.startswith("weaver://"):
-            return reference  # already a checkpoint id
+            # A raw id becomes a URL path segment; require a canonical UUID so
+            # dot-segment tricks cannot reroute the request.
+            return validate_resource_id(reference, kind="checkpoint")
         owner = parse_model_id_from_weaver_path(reference)
         if owner and owner != self.model_id:
             raise ValueError(

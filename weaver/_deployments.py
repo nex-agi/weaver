@@ -91,12 +91,18 @@ def build_create_deployment_body(
         "name": validate_deployment_name(name),
         "overwrite": overwrite,
     }
-    if replicas is None or replicas < 1 or replicas > MAX_DEPLOYMENT_REPLICAS:
+    if type(overwrite) is not bool:  # bool is deliberate: reject "false"/1
+        raise ValueError(f"overwrite must be a bool, got {overwrite!r}")
+    if type(replicas) is not int:  # exact type: bool is an int subclass, floats compare
+        raise ValueError(f"replicas must be an int, got {replicas!r}")
+    if replicas < 1 or replicas > MAX_DEPLOYMENT_REPLICAS:
         raise ValueError(
             f"replicas must be between 1 and {MAX_DEPLOYMENT_REPLICAS}, got {replicas}"
         )
     body["replicas"] = replicas
     if gpus_per_replica is not None:
+        if type(gpus_per_replica) is not int:
+            raise ValueError(f"gpus_per_replica must be an int, got {gpus_per_replica!r}")
         if gpus_per_replica < 1 or gpus_per_replica > MAX_DEPLOYMENT_GPUS_PER_REPLICA:
             raise ValueError(
                 f"gpus_per_replica must be between 1 and {MAX_DEPLOYMENT_GPUS_PER_REPLICA}, "
@@ -112,13 +118,25 @@ def build_create_deployment_body(
 
 
 def deployment_items(payload: Any) -> List[Dict[str, Any]]:
-    """Extract the ``items`` array from a deployment list response."""
+    """Extract the ``items`` array from a deployment list response.
+
+    Malformed entries raise instead of being dropped: pagination advances the
+    offset by the item count, so silently filtering would undercount the
+    records consumed from the page — duplicating rows on the next request or
+    terminating the walk early.
+
+    Raises:
+        ValueError: If an items entry is not an object.
+    """
     if not isinstance(payload, dict):
         return []
     items = lookup_case_insensitive(payload, "items")
     if not isinstance(items, list):
         return []
-    return [item for item in items if isinstance(item, dict)]
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(f"malformed deployment list entry: {item!r}")
+    return list(items)
 
 
 # The list endpoint pages at 20 by default and caps a page at 100; both stacks

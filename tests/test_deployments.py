@@ -48,9 +48,12 @@ from weaver.types.deployment import Deployment
 # Mirrors DeploymentService.PublicView in weaver-server
 # (internal/services/deployments.go): a closed allowlist that deliberately
 # omits provisioner metadata and the native workload id.
+DEPLOYMENT_UUID = "11111111-2222-4333-8444-555555555555"
+CHECKPOINT_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
 DEPLOYMENT_PAYLOAD: Dict[str, Any] = {
     "id": "dep-1",
-    "checkpoint_id": "ckpt-1",
+    "checkpoint_id": CHECKPOINT_UUID,
     "artifact_id": "art-1",
     "model_id": "mdl-123",
     "name": "my-chat-model",
@@ -127,7 +130,7 @@ class TestDeploymentType:
     def test_from_payload(self):
         deployment = Deployment.from_payload(DEPLOYMENT_PAYLOAD)
         assert deployment.id == "dep-1"
-        assert deployment.checkpoint_id == "ckpt-1"
+        assert deployment.checkpoint_id == CHECKPOINT_UUID
         assert deployment.artifact_id == "art-1"
         assert deployment.model_id == "mdl-123"
         assert deployment.name == "my-chat-model"
@@ -260,8 +263,11 @@ class TestBuildCreateDeploymentBody:
 
 
 class TestListingHelpers:
-    def test_deployment_items_filters_non_dicts(self):
-        assert deployment_items({"items": [{"id": "a"}, "junk", None]}) == [{"id": "a"}]
+    def test_deployment_items_raises_on_malformed_entries(self):
+        # Pagination advances by item count; silently dropping malformed
+        # entries would undercount the consumed page (duplicates / early stop).
+        with pytest.raises(ValueError, match="malformed deployment list entry"):
+            deployment_items({"items": [{"id": "a"}, "junk", None]})
 
     def test_deployment_items_on_garbage(self):
         assert deployment_items(None) == []
@@ -347,13 +353,13 @@ class TestDeployCheckpoint:
         tc = _make_training_client()
         tc._service.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
 
-        deployment = tc.deploy_checkpoint("ckpt-1", name="my-chat-model")
+        deployment = tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-chat-model")
 
         assert isinstance(deployment, Deployment)
         assert deployment.id == "dep-1"
         assert deployment.endpoint == "https://northgate.example.com/v1"
         args = tc._service.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/deployments"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/deployments"
         assert args[1]["json"] == {
             "name": "my-chat-model",
             "overwrite": False,
@@ -366,7 +372,7 @@ class TestDeployCheckpoint:
         tc._service.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
 
         tc.deploy_checkpoint(
-            "ckpt-1",
+            CHECKPOINT_UUID,
             name="my-chat-model",
             gpu_type="H800",
             replicas=2,
@@ -386,17 +392,23 @@ class TestDeployCheckpoint:
         tc = _make_training_client()
         tc._service.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
 
-        ckpt = Checkpoint(id="ckpt-7", path="weaver://mdl-123/checkpoints/step-5")
+        ckpt = Checkpoint(id=CHECKPOINT_UUID, path="weaver://mdl-123/checkpoints/step-5")
         tc.deploy_checkpoint(ckpt, name="my-chat-model")
 
-        assert tc._service.http.post.call_args[0][0] == "/api/v1/checkpoints/ckpt-7/deployments"
+        assert (
+            tc._service.http.post.call_args[0][0]
+            == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/deployments"
+        )
 
     def test_deploy_resolves_weaver_path(self):
         tc = _make_training_client()
         tc._service.http.get.return_value = {
             "items": [
-                {"id": "ckpt-0", "path": "weaver://mdl-123/checkpoints/step-1"},
-                {"id": "ckpt-1", "path": "weaver://mdl-123/checkpoints/step-5"},
+                {
+                    "id": "00000000-0000-4000-8000-000000000000",
+                    "path": "weaver://mdl-123/checkpoints/step-1",
+                },
+                {"id": CHECKPOINT_UUID, "path": "weaver://mdl-123/checkpoints/step-5"},
             ]
         }
         tc._service.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
@@ -404,7 +416,10 @@ class TestDeployCheckpoint:
         tc.deploy_checkpoint("weaver://mdl-123/checkpoints/step-5", name="my-chat-model")
 
         tc._service.http.get.assert_called_once_with("/api/v1/models/mdl-123/checkpoints")
-        assert tc._service.http.post.call_args[0][0] == "/api/v1/checkpoints/ckpt-1/deployments"
+        assert (
+            tc._service.http.post.call_args[0][0]
+            == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/deployments"
+        )
 
     def test_deploy_foreign_model_path_raises(self):
         tc = _make_training_client()
@@ -416,7 +431,7 @@ class TestDeployCheckpoint:
         tc = _make_training_client()
         tc._service.http.post.return_value = {"id": "op-9", "status": "pending"}
 
-        handle = tc.deploy_checkpoint("ckpt-1", name="my-model", wait=False)
+        handle = tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-model", wait=False)
 
         assert isinstance(handle, OperationHandle)
         assert handle.operation_id == "op-9"
@@ -424,14 +439,14 @@ class TestDeployCheckpoint:
     def test_invalid_name_fails_before_any_request(self):
         tc = _make_training_client()
         with pytest.raises(ValueError, match="invalid deployment name"):
-            tc.deploy_checkpoint("ckpt-1", name="not a valid name")
+            tc.deploy_checkpoint(CHECKPOINT_UUID, name="not a valid name")
         tc._service.http.post.assert_not_called()
         tc._service.http.get.assert_not_called()
 
     def test_out_of_range_replicas_fails_before_any_request(self):
         tc = _make_training_client()
         with pytest.raises(ValueError, match="replicas must be between 1 and 8"):
-            tc.deploy_checkpoint("ckpt-1", name="my-model", replicas=99)
+            tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-model", replicas=99)
         tc._service.http.post.assert_not_called()
 
     def test_permission_error_is_translated(self):
@@ -439,7 +454,7 @@ class TestDeployCheckpoint:
         tc._service.http.post.side_effect = _api_error(403, "forbidden", "insufficient capability")
 
         with pytest.raises(WeaverAPIError) as excinfo:
-            tc.deploy_checkpoint("ckpt-1", name="my-model")
+            tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-model")
 
         assert excinfo.value.status_code == 403
         assert "deployment.publish" in excinfo.value.message
@@ -451,7 +466,7 @@ class TestDeployCheckpoint:
         )
 
         with pytest.raises(WeaverAPIError) as excinfo:
-            tc.deploy_checkpoint("ckpt-1", name="my-model")
+            tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-model")
 
         assert excinfo.value.code == "deployment_unavailable"
         assert "administrator" in excinfo.value.message
@@ -467,19 +482,19 @@ class TestAsyncDeployCheckpoint:
         tc = _make_async_training_client()
         tc._service.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
 
-        deployment = asyncio.run(tc.deploy_checkpoint("ckpt-1", name="my-chat-model"))
+        deployment = asyncio.run(tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-chat-model"))
 
         assert isinstance(deployment, Deployment)
         assert deployment.id == "dep-1"
         args = tc._service.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/deployments"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/deployments"
         assert args[1]["json"] == {"name": "my-chat-model", "overwrite": False, "replicas": 1}
         assert args[1]["max_retries"] == 1
 
     def test_deploy_resolves_weaver_path(self):
         tc = _make_async_training_client()
         tc._service.http.get.return_value = {
-            "items": [{"id": "ckpt-1", "path": "weaver://mdl-123/checkpoints/step-5"}]
+            "items": [{"id": CHECKPOINT_UUID, "path": "weaver://mdl-123/checkpoints/step-5"}]
         }
         tc._service.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
 
@@ -491,14 +506,14 @@ class TestAsyncDeployCheckpoint:
 
         assert isinstance(deployment, Deployment)
         args = tc._service.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/deployments"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/deployments"
         assert args[1]["json"]["gpu_type"] == "H800"
 
     def test_no_wait_returns_async_operation_handle(self):
         tc = _make_async_training_client()
         tc._service.http.post.return_value = {"id": "op-9", "status": "pending"}
 
-        handle = asyncio.run(tc.deploy_checkpoint("ckpt-1", name="my-model", wait=False))
+        handle = asyncio.run(tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-model", wait=False))
 
         assert isinstance(handle, AsyncOperationHandle)
         assert handle.operation_id == "op-9"
@@ -506,7 +521,7 @@ class TestAsyncDeployCheckpoint:
     def test_invalid_name_fails_before_any_request(self):
         tc = _make_async_training_client()
         with pytest.raises(ValueError, match="invalid deployment name"):
-            asyncio.run(tc.deploy_checkpoint("ckpt-1", name="bad name"))
+            asyncio.run(tc.deploy_checkpoint(CHECKPOINT_UUID, name="bad name"))
         tc._service.http.post.assert_not_called()
 
     def test_permission_error_is_translated(self):
@@ -514,7 +529,7 @@ class TestAsyncDeployCheckpoint:
         tc._service.http.post.side_effect = _api_error(403, "forbidden", "insufficient capability")
 
         with pytest.raises(WeaverAPIError) as excinfo:
-            asyncio.run(tc.deploy_checkpoint("ckpt-1", name="my-model"))
+            asyncio.run(tc.deploy_checkpoint(CHECKPOINT_UUID, name="my-model"))
 
         assert "deployment.publish" in excinfo.value.message
 
@@ -564,28 +579,28 @@ class TestServiceClientDeployments:
         client = _make_service_client()
         client._http.get.return_value = DEPLOYMENT_PAYLOAD
 
-        deployment = client.get_deployment("dep-1")
+        deployment = client.get_deployment(DEPLOYMENT_UUID)
 
         assert isinstance(deployment, Deployment)
         assert deployment.northgate_model_id == "ng-77"
-        client._http.get.assert_called_once_with("/api/v1/deployments/dep-1")
+        client._http.get.assert_called_once_with(f"/api/v1/deployments/{DEPLOYMENT_UUID}")
 
     def test_delete_deployment_waits_and_returns_stopped(self):
         client = _make_service_client()
         stopped = dict(DEPLOYMENT_PAYLOAD, status="stopped", endpoint=None)
         client._http.delete.return_value = _done_operation(stopped)
 
-        deployment = client.delete_deployment("dep-1")
+        deployment = client.delete_deployment(DEPLOYMENT_UUID)
 
         assert isinstance(deployment, Deployment)
         assert deployment.status == "stopped"
-        client._http.delete.assert_called_once_with("/api/v1/deployments/dep-1")
+        client._http.delete.assert_called_once_with(f"/api/v1/deployments/{DEPLOYMENT_UUID}")
 
     def test_delete_deployment_no_wait_returns_handle(self):
         client = _make_service_client()
         client._http.delete.return_value = {"id": "op-5", "status": "pending"}
 
-        handle = client.delete_deployment("dep-1", wait=False)
+        handle = client.delete_deployment(DEPLOYMENT_UUID, wait=False)
 
         assert isinstance(handle, OperationHandle)
         assert handle.operation_id == "op-5"
@@ -597,7 +612,7 @@ class TestServiceClientDeployments:
         )
 
         with pytest.raises(WeaverAPIError) as excinfo:
-            client.delete_deployment("dep-1")
+            client.delete_deployment(DEPLOYMENT_UUID)
 
         assert excinfo.value.code == "already_stopped"
 
@@ -636,10 +651,10 @@ class TestAsyncServiceClientDeployments:
         client = _make_async_service_client()
         client._http.get.return_value = DEPLOYMENT_PAYLOAD
 
-        deployment = asyncio.run(client.get_deployment("dep-1"))
+        deployment = asyncio.run(client.get_deployment(DEPLOYMENT_UUID))
 
         assert isinstance(deployment, Deployment)
-        client._http.get.assert_called_once_with("/api/v1/deployments/dep-1")
+        client._http.get.assert_called_once_with(f"/api/v1/deployments/{DEPLOYMENT_UUID}")
 
     def test_delete_deployment_waits_and_returns_stopped(self):
         client = _make_async_service_client()
@@ -647,16 +662,16 @@ class TestAsyncServiceClientDeployments:
             dict(DEPLOYMENT_PAYLOAD, status="stopped")
         )
 
-        deployment = asyncio.run(client.delete_deployment("dep-1"))
+        deployment = asyncio.run(client.delete_deployment(DEPLOYMENT_UUID))
 
         assert deployment.status == "stopped"
-        client._http.delete.assert_called_once_with("/api/v1/deployments/dep-1")
+        client._http.delete.assert_called_once_with(f"/api/v1/deployments/{DEPLOYMENT_UUID}")
 
     def test_delete_deployment_no_wait_returns_handle(self):
         client = _make_async_service_client()
         client._http.delete.return_value = {"id": "op-5", "status": "pending"}
 
-        handle = asyncio.run(client.delete_deployment("dep-1", wait=False))
+        handle = asyncio.run(client.delete_deployment(DEPLOYMENT_UUID, wait=False))
 
         assert isinstance(handle, AsyncOperationHandle)
         assert handle.operation_id == "op-5"
@@ -690,13 +705,13 @@ class TestDeploymentCLI:
         client.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
-                cli, ["deployment", "create", "ckpt-1", "--name", "my-chat-model"]
+                cli, ["deployment", "create", CHECKPOINT_UUID, "--name", "my-chat-model"]
             )
 
         assert result.exit_code == 0, result.output
         client.connect.assert_called_once_with(ensure_session=False)
         args = client.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/deployments"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/deployments"
         assert args[1]["json"] == {"name": "my-chat-model", "overwrite": False, "replicas": 1}
         assert args[1]["max_retries"] == 1
         assert "Deployment ready" in result.output
@@ -706,7 +721,7 @@ class TestDeploymentCLI:
         client = MagicMock()
         client.http.post.return_value = _done_operation(DEPLOYMENT_PAYLOAD)
         client.http.get.return_value = {
-            "items": [{"id": "ckpt-7", "path": "weaver://mdl-123/checkpoints/step-5"}]
+            "items": [{"id": CHECKPOINT_UUID, "path": "weaver://mdl-123/checkpoints/step-5"}]
         }
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
@@ -730,7 +745,7 @@ class TestDeploymentCLI:
         assert result.exit_code == 0, result.output
         client.http.get.assert_called_once_with("/api/v1/models/mdl-123/checkpoints")
         args = client.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-7/deployments"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/deployments"
         assert args[1]["json"] == {
             "name": "my-chat-model",
             "overwrite": True,
@@ -744,7 +759,7 @@ class TestDeploymentCLI:
         client.http.post.return_value = {"id": "op-42", "status": "pending"}
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
-                cli, ["deployment", "create", "ckpt-1", "--name", "m", "--no-wait"]
+                cli, ["deployment", "create", CHECKPOINT_UUID, "--name", "m", "--no-wait"]
             )
 
         assert result.exit_code == 0, result.output
@@ -754,7 +769,7 @@ class TestDeploymentCLI:
         client = MagicMock()
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
-                cli, ["deployment", "create", "ckpt-1", "--name", "bad name"]
+                cli, ["deployment", "create", CHECKPOINT_UUID, "--name", "bad name"]
             )
 
         assert result.exit_code == 1
@@ -766,7 +781,7 @@ class TestDeploymentCLI:
         client.http.post.side_effect = _api_error(403, "forbidden", "insufficient capability")
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
-                cli, ["deployment", "create", "ckpt-1", "--name", "my-model"]
+                cli, ["deployment", "create", CHECKPOINT_UUID, "--name", "my-model"]
             )
 
         assert result.exit_code == 1
@@ -779,7 +794,7 @@ class TestDeploymentCLI:
         )
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
-                cli, ["deployment", "create", "ckpt-1", "--name", "my-model"]
+                cli, ["deployment", "create", CHECKPOINT_UUID, "--name", "my-model"]
             )
 
         assert result.exit_code == 1
@@ -841,3 +856,57 @@ class TestDeploymentCLI:
         assert result.exit_code == 0, result.output
         client.delete_deployment.assert_called_once_with("dep-1", wait=False)
         assert "op-77" in result.output
+
+
+class TestDeploymentIdValidation:
+    """A raw deployment id becomes a URL path segment; dot-segment tricks must
+    be rejected before any request is built (httpx normalizes `..`, so
+    `../checkpoints/<uuid>` would otherwise reroute to the checkpoints API)."""
+
+    CHECKPOINT_UUID = "99999999-8888-4777-a666-555555555555"
+
+    @pytest.mark.parametrize(
+        "bad_id",
+        [
+            "../checkpoints/99999999-8888-4777-a666-555555555555",
+            "../models/99999999-8888-4777-a666-555555555555",
+            "a/b",
+            "..",
+            "%2e%2e%2fcheckpoints",
+            "dep-1",
+            "",
+            "11111111222243338444555555555555",  # unhyphenated alias
+            "urn:uuid:11111111-2222-4333-8444-555555555555",
+        ],
+    )
+    def test_get_and_delete_reject_non_uuid_ids(self, bad_id):
+        client = _make_service_client()
+        with pytest.raises(ValueError, match="deployment id must be a"):
+            client.get_deployment(bad_id)
+        with pytest.raises(ValueError, match="deployment id must be a"):
+            client.delete_deployment(bad_id)
+        client._http.get.assert_not_called()
+        client._http.delete.assert_not_called()
+
+    def test_async_twins_reject_traversal(self):
+        client = _make_async_service_client()
+        with pytest.raises(ValueError, match="deployment id must be a"):
+            asyncio.run(client.get_deployment("../checkpoints/x"))
+        with pytest.raises(ValueError, match="deployment id must be a"):
+            asyncio.run(client.delete_deployment("../checkpoints/x"))
+        client._http.get.assert_not_called()
+        client._http.delete.assert_not_called()
+
+    def test_uppercase_uuid_normalized(self):
+        client = _make_service_client()
+        client._http.get.return_value = dict(DEPLOYMENT_PAYLOAD)
+        client.get_deployment(DEPLOYMENT_UUID.upper())
+        client._http.get.assert_called_once_with(f"/api/v1/deployments/{DEPLOYMENT_UUID}")
+
+    def test_checkpoint_raw_id_must_be_uuid(self):
+        # export_weights / deploy_checkpoint share _resolve_checkpoint_id: a
+        # non-weaver:// string is a raw checkpoint id and gets the same guard.
+        client = _make_training_client()
+        with pytest.raises(ValueError, match="checkpoint id must be a"):
+            client.deploy_checkpoint("../models/x", name="n")
+        client._service.http.post.assert_not_called()

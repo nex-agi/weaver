@@ -43,6 +43,7 @@ import httpx
 
 from . import __version__
 from ._artifacts import (
+    validate_resource_id,
     ARTIFACT_KINDS,
     DOWNLOAD_MAX_TRANSPORT_RETRIES,
     DOWNLOAD_MAX_URL_REFRESHES,
@@ -881,7 +882,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         if isinstance(target, WeightsArtifact):
             if not target.id:
                 raise ValueError("WeightsArtifact has no id")
-            return target.id
+            return validate_resource_id(target.id, kind="artifact")
         parsed = parse_download_target(target)
         if parsed.artifact_id:
             return parsed.artifact_id
@@ -996,6 +997,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                 another principal (404 — a deployment owned by someone else
                 is reported as missing), or deployments are disabled (503).
         """
+        deployment_id = validate_resource_id(deployment_id, kind="deployment")
         try:
             payload = self.http.get(f"/api/v1/deployments/{deployment_id}")
         except WeaverAPIError as exc:
@@ -1038,6 +1040,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                 else (404), is already stopped (409 ``already_stopped``), or
                 deployments are disabled on this server (503).
         """
+        deployment_id = validate_resource_id(deployment_id, kind="deployment")
         try:
             response = self.http.delete(f"/api/v1/deployments/{deployment_id}")
         except WeaverAPIError as exc:

@@ -52,17 +52,20 @@ FILES: Dict[str, bytes] = {
 SINGLE_FILE: Dict[str, bytes] = {"shard.bin": bytes(range(256)) * 8}
 
 CHECKPOINT_URI = "weaver://mdl-123/checkpoints/step-5"
+ARTIFACT_UUID_2 = "bbbb2222-cc33-4d44-8e55-ffff6666aaaa"
+CHECKPOINT_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+ARTIFACT_UUID = "aaaa1111-bb22-4c33-8d44-eeee5555ffff"
 ADAPTER_ARTIFACT = {
-    "id": "art-1",
-    "checkpoint_id": "ckpt-1",
+    "id": ARTIFACT_UUID,
+    "checkpoint_id": CHECKPOINT_UUID,
     "model_id": "mdl-123",
     "kind": "hf_adapter",
     "status": "completed",
     "uri": f"{CHECKPOINT_URI}/artifacts/hf_adapter",
 }
 MODEL_ARTIFACT = {
-    "id": "art-2",
-    "checkpoint_id": "ckpt-1",
+    "id": ARTIFACT_UUID_2,
+    "checkpoint_id": CHECKPOINT_UUID,
     "model_id": "mdl-123",
     "kind": "hf_model",
     "status": "completed",
@@ -82,7 +85,7 @@ def _descriptor(
 ) -> Dict[str, Any]:
     overrides = sha_overrides or {}
     return {
-        "artifact_id": "art-1",
+        "artifact_id": ARTIFACT_UUID,
         "kind": "hf_adapter",
         "total_bytes": sum(len(content) for content in files.values()),
         "files": [
@@ -139,13 +142,13 @@ def _api_routes(descriptor: Dict[str, Any], artifacts: list | None = None):
 
     routes = {
         "/api/v1/models/mdl-123/checkpoints": {
-            "items": [{"id": "ckpt-1", "path": CHECKPOINT_URI, "type": "weight"}]
+            "items": [{"id": CHECKPOINT_UUID, "path": CHECKPOINT_URI, "type": "weight"}]
         },
-        "/api/v1/checkpoints/ckpt-1/artifacts": {
+        f"/api/v1/checkpoints/{CHECKPOINT_UUID}/artifacts": {
             "items": artifacts if artifacts is not None else [dict(ADAPTER_ARTIFACT)]
         },
-        "/api/v1/artifacts/art-1/download": descriptor,
-        "/api/v1/artifacts/art-2/download": descriptor,
+        f"/api/v1/artifacts/{ARTIFACT_UUID}/download": descriptor,
+        f"/api/v1/artifacts/{ARTIFACT_UUID_2}/download": descriptor,
     }
 
     def side_effect(path, **_kwargs):
@@ -173,8 +176,8 @@ class TestParseDownloadTarget:
         assert parsed.kind is None
 
     def test_raw_artifact_id(self):
-        parsed = parse_download_target("art-1")
-        assert parsed.artifact_id == "art-1"
+        parsed = parse_download_target(ARTIFACT_UUID)
+        assert parsed.artifact_id == ARTIFACT_UUID
 
     def test_unknown_kind_rejected(self):
         with pytest.raises(ValueError, match="Unknown artifact kind"):
@@ -192,12 +195,12 @@ class TestParseDownloadTarget:
 class TestSelectArtifactPayload:
     def test_single_completed(self):
         selected = select_artifact_payload([dict(ADAPTER_ARTIFACT)], None, context="t")
-        assert selected["id"] == "art-1"
+        assert selected["id"] == ARTIFACT_UUID
 
     def test_kind_filter(self):
         items = [dict(ADAPTER_ARTIFACT), dict(MODEL_ARTIFACT)]
         selected = select_artifact_payload(items, "hf_model", context="t")
-        assert selected["id"] == "art-2"
+        assert selected["id"] == ARTIFACT_UUID_2
 
     def test_no_completed_tells_user_to_export(self):
         items = [{**ADAPTER_ARTIFACT, "status": "pending"}]
@@ -349,7 +352,7 @@ class TestDownloadWeights:
         self._patch_transport(monkeypatch, _presigned_handler(FILES, calls))
         client = _make_sync_client(_api_routes(_descriptor(FILES)))
 
-        dest = client.download_weights("art-1", tmp_path / "out")
+        dest = client.download_weights(ARTIFACT_UUID, tmp_path / "out")
 
         assert dest == tmp_path / "out"
         for name, content in FILES.items():
@@ -357,7 +360,7 @@ class TestDownloadWeights:
         assert not list(dest.rglob("*.part"))
         assert len(calls) == len(FILES)
         # Only the descriptor endpoint is hit for a raw artifact id.
-        client.http.get.assert_called_once_with("/api/v1/artifacts/art-1/download")
+        client.http.get.assert_called_once_with(f"/api/v1/artifacts/{ARTIFACT_UUID}/download")
 
     def test_checkpoint_uri_resolution_flow(self, tmp_path, monkeypatch):
         self._patch_transport(monkeypatch, _presigned_handler(FILES))
@@ -368,8 +371,8 @@ class TestDownloadWeights:
         paths = [call.args[0] for call in client.http.get.call_args_list]
         assert paths == [
             "/api/v1/models/mdl-123/checkpoints",
-            "/api/v1/checkpoints/ckpt-1/artifacts",
-            "/api/v1/artifacts/art-1/download",
+            f"/api/v1/checkpoints/{CHECKPOINT_UUID}/artifacts",
+            f"/api/v1/artifacts/{ARTIFACT_UUID}/download",
         ]
 
     def test_artifact_uri_selects_kind(self, tmp_path, monkeypatch):
@@ -380,7 +383,7 @@ class TestDownloadWeights:
         client.download_weights(f"{CHECKPOINT_URI}/artifacts/hf_model", tmp_path / "out")
 
         paths = [call.args[0] for call in client.http.get.call_args_list]
-        assert paths[-1] == "/api/v1/artifacts/art-2/download"
+        assert paths[-1] == f"/api/v1/artifacts/{ARTIFACT_UUID_2}/download"
 
     def test_weights_artifact_object_target(self, tmp_path, monkeypatch):
         self._patch_transport(monkeypatch, _presigned_handler(FILES))
@@ -389,7 +392,7 @@ class TestDownloadWeights:
         artifact = WeightsArtifact.from_payload(ADAPTER_ARTIFACT)
         client.download_weights(artifact, tmp_path / "out")
 
-        client.http.get.assert_called_once_with("/api/v1/artifacts/art-1/download")
+        client.http.get.assert_called_once_with(f"/api/v1/artifacts/{ARTIFACT_UUID}/download")
 
     def test_no_completed_artifact_never_exports_implicitly(self, tmp_path, monkeypatch):
         self._patch_transport(monkeypatch, _presigned_handler(FILES))
@@ -418,7 +421,7 @@ class TestDownloadWeights:
     def test_invalid_kind_rejected(self, tmp_path):
         client = _make_sync_client(_api_routes(_descriptor(FILES)))
         with pytest.raises(ValueError, match="kind must be one of"):
-            client.download_weights("art-1", tmp_path / "out", kind="onnx")
+            client.download_weights(ARTIFACT_UUID, tmp_path / "out", kind="onnx")
 
     def test_sha256_mismatch_raises_and_removes_file(self, tmp_path, monkeypatch):
         self._patch_transport(monkeypatch, _presigned_handler(FILES))
@@ -426,7 +429,7 @@ class TestDownloadWeights:
         client = _make_sync_client(_api_routes(descriptor))
 
         with pytest.raises(RuntimeError, match="sha256 mismatch"):
-            client.download_weights("art-1", tmp_path / "out")
+            client.download_weights(ARTIFACT_UUID, tmp_path / "out")
         assert not (tmp_path / "out" / "adapter_config.json").exists()
         assert not (tmp_path / "out" / "adapter_config.json.part").exists()
 
@@ -435,7 +438,7 @@ class TestDownloadWeights:
         descriptor = _descriptor(FILES, sha_overrides={"adapter_config.json": "0" * 64})
         client = _make_sync_client(_api_routes(descriptor))
 
-        dest = client.download_weights("art-1", tmp_path / "out", verify=False)
+        dest = client.download_weights(ARTIFACT_UUID, tmp_path / "out", verify=False)
 
         assert (dest / "adapter_config.json").read_bytes() == FILES["adapter_config.json"]
 
@@ -444,7 +447,7 @@ class TestDownloadWeights:
         descriptor_calls = {"count": 0}
 
         def api_get(path, **_kwargs):
-            if path == "/api/v1/artifacts/art-1/download":
+            if path == f"/api/v1/artifacts/{ARTIFACT_UUID}/download":
                 descriptor_calls["count"] += 1
                 # First descriptor hands out already-expired URLs; the re-fetch
                 # (triggered by the 403) returns working ones.
@@ -453,7 +456,7 @@ class TestDownloadWeights:
             raise AssertionError(f"unexpected API GET {path}")
 
         client = _make_sync_client(api_get)
-        dest = client.download_weights("art-1", tmp_path / "out")
+        dest = client.download_weights(ARTIFACT_UUID, tmp_path / "out")
 
         assert descriptor_calls["count"] >= 2
         for name, content in FILES.items():
@@ -468,7 +471,7 @@ class TestDownloadWeights:
         for name, content in FILES.items():
             (dest / name).write_bytes(content)
 
-        client.download_weights("art-1", dest)
+        client.download_weights(ARTIFACT_UUID, dest)
 
         assert not calls  # everything already on disk and verified
 
@@ -477,7 +480,7 @@ class TestDownloadWeights:
         client = _make_sync_client(_api_routes(_descriptor({"../evil.bin": b"x"})))
 
         with pytest.raises(ValueError, match="unsafe file name"):
-            client.download_weights("art-1", tmp_path / "out")
+            client.download_weights(ARTIFACT_UUID, tmp_path / "out")
 
     def test_resumes_from_existing_part_file(self, tmp_path, monkeypatch):
         calls: list = []
@@ -488,7 +491,7 @@ class TestDownloadWeights:
         # A previous interrupted run left the first 100 bytes on disk.
         (dest / "shard.bin.part").write_bytes(SINGLE_FILE["shard.bin"][:100])
 
-        client.download_weights("art-1", dest, max_concurrency=1)
+        client.download_weights(ARTIFACT_UUID, dest, max_concurrency=1)
 
         assert (dest / "shard.bin").read_bytes() == SINGLE_FILE["shard.bin"]
         assert calls[0].headers["Range"] == "bytes=100-"
@@ -502,7 +505,7 @@ class TestDownloadWeights:
         # Longer than the manifest size: not resumable, must restart at 0.
         (dest / "shard.bin.part").write_bytes(b"x" * (len(SINGLE_FILE["shard.bin"]) + 10))
 
-        client.download_weights("art-1", dest, max_concurrency=1)
+        client.download_weights(ARTIFACT_UUID, dest, max_concurrency=1)
 
         assert (dest / "shard.bin").read_bytes() == SINGLE_FILE["shard.bin"]
         assert "Range" not in calls[0].headers
@@ -526,7 +529,7 @@ class TestDownloadWeights:
         dest.mkdir()
         (dest / "shard.bin.part").write_bytes(content[:100])
 
-        client.download_weights("art-1", dest, max_concurrency=1)
+        client.download_weights(ARTIFACT_UUID, dest, max_concurrency=1)
 
         assert (dest / "shard.bin").read_bytes() == content
         assert len(seen) == 2
@@ -535,7 +538,7 @@ class TestDownloadWeights:
     def test_max_concurrency_must_be_positive(self, tmp_path):
         client = _make_sync_client(_api_routes(_descriptor(FILES)))
         with pytest.raises(ValueError, match="max_concurrency"):
-            client.download_weights("art-1", tmp_path / "out", max_concurrency=0)
+            client.download_weights(ARTIFACT_UUID, tmp_path / "out", max_concurrency=0)
 
 
 # ---------------------------------------------------------------------------
@@ -556,13 +559,13 @@ class TestAsyncDownloadWeights:
         self._patch_transport(monkeypatch, _presigned_handler(FILES, calls))
         client = _make_async_client(_api_routes(_descriptor(FILES)))
 
-        dest = asyncio.run(client.download_weights("art-1", tmp_path / "out"))
+        dest = asyncio.run(client.download_weights(ARTIFACT_UUID, tmp_path / "out"))
 
         for name, content in FILES.items():
             assert (dest / name).read_bytes() == content
         assert not list(dest.rglob("*.part"))
         assert len(calls) == len(FILES)
-        client.http.get.assert_awaited_once_with("/api/v1/artifacts/art-1/download")
+        client.http.get.assert_awaited_once_with(f"/api/v1/artifacts/{ARTIFACT_UUID}/download")
 
     def test_checkpoint_uri_resolution_flow(self, tmp_path, monkeypatch):
         self._patch_transport(monkeypatch, _presigned_handler(FILES))
@@ -573,8 +576,8 @@ class TestAsyncDownloadWeights:
         paths = [call.args[0] for call in client.http.get.call_args_list]
         assert paths == [
             "/api/v1/models/mdl-123/checkpoints",
-            "/api/v1/checkpoints/ckpt-1/artifacts",
-            "/api/v1/artifacts/art-1/download",
+            f"/api/v1/checkpoints/{CHECKPOINT_UUID}/artifacts",
+            f"/api/v1/artifacts/{ARTIFACT_UUID}/download",
         ]
 
     def test_no_completed_artifact_never_exports_implicitly(self, tmp_path, monkeypatch):
@@ -591,14 +594,14 @@ class TestAsyncDownloadWeights:
         client = _make_async_client(_api_routes(descriptor))
 
         with pytest.raises(RuntimeError, match="sha256 mismatch"):
-            asyncio.run(client.download_weights("art-1", tmp_path / "out"))
+            asyncio.run(client.download_weights(ARTIFACT_UUID, tmp_path / "out"))
 
     def test_expired_url_refreshes_descriptor(self, tmp_path, monkeypatch):
         self._patch_transport(monkeypatch, _presigned_handler(FILES))
         descriptor_calls = {"count": 0}
 
         async def api_get(path, **_kwargs):
-            if path == "/api/v1/artifacts/art-1/download":
+            if path == f"/api/v1/artifacts/{ARTIFACT_UUID}/download":
                 descriptor_calls["count"] += 1
                 sig = "expired" if descriptor_calls["count"] == 1 else "ok"
                 return _descriptor(FILES, sig=sig)
@@ -608,7 +611,7 @@ class TestAsyncDownloadWeights:
         client._http = MagicMock()
         client._http.get = AsyncMock(side_effect=api_get)
 
-        dest = asyncio.run(client.download_weights("art-1", tmp_path / "out"))
+        dest = asyncio.run(client.download_weights(ARTIFACT_UUID, tmp_path / "out"))
 
         assert descriptor_calls["count"] >= 2
         for name, content in FILES.items():
@@ -622,7 +625,7 @@ class TestAsyncDownloadWeights:
         dest.mkdir()
         (dest / "shard.bin.part").write_bytes(SINGLE_FILE["shard.bin"][:100])
 
-        asyncio.run(client.download_weights("art-1", dest, max_concurrency=1))
+        asyncio.run(client.download_weights(ARTIFACT_UUID, dest, max_concurrency=1))
 
         assert (dest / "shard.bin").read_bytes() == SINGLE_FILE["shard.bin"]
         assert calls[0].headers["Range"] == "bytes=100-"
@@ -630,7 +633,7 @@ class TestAsyncDownloadWeights:
     def test_max_concurrency_must_be_positive(self, tmp_path):
         client = _make_async_client(_api_routes(_descriptor(FILES)))
         with pytest.raises(ValueError, match="max_concurrency"):
-            asyncio.run(client.download_weights("art-1", tmp_path / "out", max_concurrency=0))
+            asyncio.run(client.download_weights(ARTIFACT_UUID, tmp_path / "out", max_concurrency=0))
 
 
 # ---------------------------------------------------------------------------
@@ -675,7 +678,7 @@ class TestCheckpointDownloadCLI:
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
                 cli,
-                ["checkpoint", "download", "art-1", "-o", str(tmp_path / "out")],
+                ["checkpoint", "download", ARTIFACT_UUID, "-o", str(tmp_path / "out")],
             )
 
         assert result.exit_code == 1
