@@ -30,6 +30,7 @@ from ._artifacts import (
     is_artifact_payload,
     parse_download_target,
     resolve_checkpoint_id_from_listing,
+    validate_resource_id,
 )
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
@@ -728,7 +729,10 @@ def checkpoint_set_ttl_cmd(  # pylint: disable=too-many-positional-arguments
 def _resolve_cli_checkpoint_id(client: ServiceClient, target: str) -> str:
     """Resolve a ``weaver://`` checkpoint URI (or raw id) to a checkpoint id."""
     if not target.startswith("weaver://"):
-        return target
+        # Raw ids are interpolated into API paths by the commands below; the
+        # same UUID guard the client methods apply must hold here, or
+        # `deployment create ../models/<id>` reroutes the request.
+        return validate_resource_id(target, kind="checkpoint")
     parsed = parse_download_target(target)
     listing = client.http.get(f"/api/v1/models/{parsed.model_id}/checkpoints")
     items = (listing or {}).get("items", []) if isinstance(listing, dict) else []

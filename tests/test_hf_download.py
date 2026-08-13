@@ -263,6 +263,16 @@ class TestDescriptorFiles:
         with pytest.raises(ValueError, match="unsafe file name"):
             descriptor_files(_descriptor({name: b"x"}))
 
+    @pytest.mark.parametrize(
+        "name",
+        ["CON", "NUL", "con.txt", "a/PRN/b", "COM1", "foo.", "foo ", "a/b:stream", "d/trail. /x"],
+    )
+    def test_rejects_windows_special_components(self, name):
+        # Device names (any extension), trailing dot/space aliases and ADS
+        # syntax target something other than the manifest path on Windows.
+        with pytest.raises(ValueError, match="unsafe file name"):
+            descriptor_files(_descriptor({name: b"x"}))
+
     def test_rejects_duplicate_names(self):
         descriptor = _descriptor(FILES)
         descriptor["files"].append(dict(descriptor["files"][0]))
@@ -720,3 +730,44 @@ class TestBareDownloadClient:
                 assert client.headers.get("User-Agent", "").startswith("weaver-sdk/")
 
         asyncio.run(run())
+
+
+class TestSymlinkContainment:
+    def test_symlink_inside_dest_cannot_escape(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "link").symlink_to(outside)
+        files = {"link/owned.bin": b"x"}
+        monkeypatch.setattr(
+            service_client,
+            "build_download_client",
+            lambda timeout=None: httpx.Client(
+                transport=httpx.MockTransport(_presigned_handler(files))
+            ),
+        )
+        client = _make_sync_client(_api_routes(_descriptor(files)))
+        with pytest.raises(ValueError, match="outside the destination"):
+            client.download_weights(ARTIFACT_UUID, dest)
+        assert not (outside / "owned.bin").exists()
+        assert not (outside / "owned.bin.part").exists()
+
+    def test_async_symlink_inside_dest_cannot_escape(self, tmp_path, monkeypatch):
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        dest = tmp_path / "out"
+        dest.mkdir()
+        (dest / "link").symlink_to(outside)
+        files = {"link/owned.bin": b"x"}
+        monkeypatch.setattr(
+            async_service_client,
+            "build_async_download_client",
+            lambda timeout=None: httpx.AsyncClient(
+                transport=httpx.MockTransport(_presigned_handler(files))
+            ),
+        )
+        client = _make_async_client(_api_routes(_descriptor(files)))
+        with pytest.raises(ValueError, match="outside the destination"):
+            asyncio.run(client.download_weights(ARTIFACT_UUID, dest))
+        assert not (outside / "owned.bin").exists()

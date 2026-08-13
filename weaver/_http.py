@@ -57,6 +57,16 @@ DOWNLOAD_TIMEOUT = httpx.Timeout(timeout=60.0, connect=10.0)
 logger = logging.getLogger(__name__)
 
 
+def _no_follow_opener(path: str, flags: int) -> int:
+    """Open refusing to follow a symlink at the final component.
+
+    Descriptor names are untrusted; a symlink pre-planted where the ``.part``
+    lands must fail instead of redirecting the write. O_NOFOLLOW is absent on
+    Windows, where the containment check remains the only guard.
+    """
+    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0))
+
+
 def _is_connection_error(exc: BaseException) -> bool:
     """Return True if *exc* represents a transport-level failure.
 
@@ -293,7 +303,7 @@ def stream_download_to_file(
         partial = response.status_code == httpx.codes.PARTIAL_CONTENT
         mode = "ab" if partial else "wb"
         written = resume_from if partial else 0
-        with open(dest, mode) as fh:
+        with open(dest, mode, opener=_no_follow_opener) as fh:
             for chunk in response.iter_bytes(chunk_size):
                 fh.write(chunk)
                 written += len(chunk)

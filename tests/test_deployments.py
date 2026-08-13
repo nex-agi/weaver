@@ -927,3 +927,15 @@ class TestDeploymentIdValidation:
         with pytest.raises(ValueError, match="checkpoint id must be a"):
             client.deploy_checkpoint("../models/x", name="n")
         client._service.http.post.assert_not_called()
+
+
+class TestCLIIdGuard:
+    @pytest.mark.parametrize("raw", ["../models/target", "a/b", "%2e%2e%2fmodels", "ckpt-1"])
+    def test_deployment_create_rejects_traversal_ids(self, clean_env, raw):
+        client = MagicMock()
+        with patch("weaver.cli.ServiceClient", return_value=client):
+            result = CliRunner().invoke(
+                cli, ["deployment", "create", raw, "--name", "m", "--no-wait"]
+            )
+        assert result.exit_code != 0
+        client.http.post.assert_not_called()

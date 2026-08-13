@@ -47,6 +47,14 @@ DOWNLOAD_MAX_TRANSPORT_RETRIES = 3
 
 # ``weaver://{model_id}/checkpoints/{name}`` optionally followed by
 # ``/artifacts/{kind}`` (the artifact URI shape).
+# Windows device names are reserved in EVERY directory and with any extension
+# ("CON.txt" still names the console device). Checked per path component.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
 _ARTIFACT_URI_RE = re.compile(
     r"^weaver://(?P<model_id>[^/]+)/checkpoints/(?P<name>[^/]+)"
     r"(?:/artifacts/(?P<kind>[^/]+))?/?$"
@@ -269,6 +277,15 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
         pure = PurePosixPath(name)
         if not pure.parts or pure.is_absolute() or ".." in pure.parts:
             raise ValueError(f"unsafe file name in download descriptor: {name!r}")
+        for component in pure.parts:
+            stripped = component.rstrip(" .")
+            stem = component.split(".", 1)[0].upper()
+            if (
+                ":" in component  # ADS syntax / drive remnants
+                or stripped != component  # trailing dot/space alias on Windows
+                or stem in _WINDOWS_RESERVED_NAMES  # device names, with or without extension
+            ):
+                raise ValueError(f"unsafe file name in download descriptor: {name!r}")
         if name != str(pure):
             # A name whose literal text differs from its normalized form
             # (``a//b``, ``a/./b``, ``foo/``) can alias another entry's
@@ -344,3 +361,24 @@ def is_file_already_complete(final_path: Path, entry: ArtifactFile, *, verify: b
     if verify and entry.sha256:
         return file_sha256(final_path) == entry.sha256
     return True
+
+
+def ensure_within_directory(dest_dir: Path, candidate_parent: Path) -> None:
+    """Require *candidate_parent* (resolved) to stay under *dest_dir* (resolved).
+
+    Lexical name validation cannot see the filesystem: a pre-existing symlink
+    inside the destination (``dest/link -> /tmp/outside``) turns the validated
+    name ``link/owned.bin`` into a write outside the tree. Resolving both
+    sides closes that hole; combined with O_NOFOLLOW on the final open this
+    leaves only a narrow, accepted check-to-use window.
+
+    Raises:
+        ValueError: When the resolved parent escapes the destination.
+    """
+    resolved_dest = dest_dir.resolve()
+    resolved_parent = candidate_parent.resolve()
+    if not (resolved_parent == resolved_dest or resolved_parent.is_relative_to(resolved_dest)):
+        raise ValueError(
+            f"descriptor file resolves outside the destination directory: "
+            f"{candidate_parent} -> {resolved_parent}"
+        )

@@ -98,6 +98,7 @@ from ._artifacts import (
     ArtifactFile,
     check_downloaded_file,
     descriptor_files,
+    ensure_within_directory,
     is_file_already_complete,
     parse_download_target,
     resolve_checkpoint_id_from_listing,
@@ -861,6 +862,7 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         """Download one manifest file with resume, URL refresh, and verification."""
         final_path = dest_dir / entry.name
         final_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_within_directory(dest_dir, final_path.parent)
         # Hashing an existing multi-GB file is blocking CPU+disk work; keep it
         # off the event loop.
         if await asyncio.to_thread(is_file_already_complete, final_path, entry, verify=verify):

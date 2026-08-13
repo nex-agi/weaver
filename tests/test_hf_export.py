@@ -395,3 +395,15 @@ class TestCheckpointExportCLI:
 
         assert result.exit_code == 0
         assert "already completed" in result.output
+
+
+class TestExportCLIIdGuard:
+    @pytest.mark.parametrize("raw", ["../models/target", "a/b", "ckpt-1"])
+    def test_checkpoint_export_rejects_traversal_ids(self, monkeypatch, raw):
+        monkeypatch.delenv("WEAVER_BASE_URL", raising=False)
+        monkeypatch.delenv("WEAVER_API_KEY", raising=False)
+        client = MagicMock()
+        with patch("weaver.cli.ServiceClient", return_value=client):
+            result = CliRunner().invoke(cli, ["checkpoint", "export", raw, "--no-wait"])
+        assert result.exit_code != 0
+        client.http.post.assert_not_called()
