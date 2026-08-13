@@ -16,6 +16,7 @@
 
 import json
 import sys
+from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -29,10 +30,13 @@ from ._artifacts import (
     is_artifact_payload,
     parse_download_target,
     resolve_checkpoint_id_from_listing,
+    validate_resource_id,
 )
+from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from .operations import build_operation_handle
 from .service_client import ServiceClient
+from .types.deployment import Deployment
 
 console = Console()
 
@@ -135,6 +139,31 @@ def create_training_runs_table(items: List[Dict[str, Any]]) -> Table:
             item.get("base_model", ""),
             training_mode,
             format_date(item.get("last_request_at")),
+        )
+
+    return table
+
+
+def create_deployments_table(items: List[Deployment]) -> Table:
+    """Create a rich table for deployments."""
+    table = Table(title="Deployments", box=box.ROUNDED)
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Name", style="green")
+    table.add_column("Status", style="yellow")
+    table.add_column("Endpoint", style="blue")
+    table.add_column("GPU", style="magenta")
+    table.add_column("Replicas", justify="right")
+    table.add_column("Created At", style="magenta")
+
+    for item in items:
+        table.add_row(
+            str(item.id or "")[:8],
+            item.name or "",
+            item.status or "",
+            item.endpoint or "-",
+            item.gpu_type or "default",
+            str(item.replicas if item.replicas is not None else ""),
+            format_date(item.created_at),
         )
 
     return table
@@ -310,6 +339,11 @@ def show():
 @cli.group()
 def checkpoint():
     """Manage checkpoints."""
+
+
+@cli.group()
+def deployment():
+    """Publish checkpoints as public endpoints and manage them."""
 
 
 @cli.group("organizations")
@@ -695,7 +729,10 @@ def checkpoint_set_ttl_cmd(  # pylint: disable=too-many-positional-arguments
 def _resolve_cli_checkpoint_id(client: ServiceClient, target: str) -> str:
     """Resolve a ``weaver://`` checkpoint URI (or raw id) to a checkpoint id."""
     if not target.startswith("weaver://"):
-        return target
+        # Raw ids are interpolated into API paths by the commands below; the
+        # same UUID guard the client methods apply must hold here, or
+        # `deployment create ../models/<id>` reroutes the request.
+        return validate_resource_id(target, kind="checkpoint")
     parsed = parse_download_target(target)
     listing = client.http.get(f"/api/v1/models/{parsed.model_id}/checkpoints")
     items = (listing or {}).get("items", []) if isinstance(listing, dict) else []
@@ -811,6 +848,151 @@ def checkpoint_download_cmd(  # pylint: disable=too-many-positional-arguments
         client.connect(ensure_session=False)
         dest = client.download_weights(uri, output_dir, kind=kind)
         console.print(f"[green]Downloaded weights to:[/green] {dest}")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+@deployment.command("create")
+@click.argument("checkpoint_uri")
+@click.option("--name", required=True, help="Public model name to publish under")
+@click.option("--gpu-type", default=None, help="GPU type to serve on (default: server's choice)")
+@click.option("--replicas", type=int, default=1, show_default=True, help="Serving replicas (1-8)")
+@click.option(
+    "--gpus-per-replica",
+    type=int,
+    default=None,
+    help="GPUs per replica (1-16, default: sized by the launcher)",
+)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    help="Replace an existing gateway registration with this name",
+)
+@click.option("--no-wait", is_flag=True, help="Start the deployment and exit without waiting")
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def deployment_create_cmd(  # pylint: disable=too-many-positional-arguments,too-many-arguments
+    checkpoint_uri: str,
+    name: str,
+    gpu_type: Optional[str],
+    replicas: int,
+    gpus_per_replica: Optional[int],
+    overwrite: bool,
+    no_wait: bool,
+    base_url: Optional[str],
+    api_key: Optional[str],
+):
+    """Publish a checkpoint as a public OpenAI-compatible endpoint.
+
+    CHECKPOINT_URI is a checkpoint weaver:// URI or a checkpoint id. The
+    checkpoint is converted to HuggingFace format, launched as a standalone
+    inference workload, and registered on the NorthGate gateway under --name.
+    This takes tens of minutes, mostly conversion.
+
+    Publishing is permission-gated: the server grants it by principal origin
+    (SSO always; an API key only when minted under an allowlisted biz_code).
+    """
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        body = build_create_deployment_body(
+            name=name,
+            gpu_type=gpu_type,
+            replicas=replicas,
+            gpus_per_replica=gpus_per_replica,
+            overwrite=overwrite,
+        )
+        checkpoint_id = _resolve_cli_checkpoint_id(client, checkpoint_uri)
+        try:
+            # max_retries=1: this POST launches GPUs and claims a global name.
+            response = client.http.post(
+                f"/api/v1/checkpoints/{checkpoint_id}/deployments", json=body, max_retries=1
+            )
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        handle = build_operation_handle(client.http, response if isinstance(response, dict) else {})
+        if no_wait:
+            console.print(f"[green]Deployment started.[/green] Operation ID: {handle.operation_id}")
+            return
+        console.print(f"Waiting for deployment operation {handle.operation_id}...")
+        result = handle.result()
+        console.print("[green]Deployment ready:[/green]")
+        format_json_output(result)
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+@deployment.command("list")
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def deployment_list_cmd(output_format: str, base_url: Optional[str], api_key: Optional[str]):
+    """List the deployments you published."""
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        deployments = client.list_deployments()
+        if output_format == "json":
+            format_json_output([asdict(item) for item in deployments])
+        else:
+            console.print(create_deployments_table(deployments))
+            console.print(f"\nShowing {len(deployments)} deployment(s)")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+@deployment.command("get")
+@click.argument("deployment_id")
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def deployment_get_cmd(deployment_id: str, base_url: Optional[str], api_key: Optional[str]):
+    """Show one deployment, including its endpoint URL."""
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        format_json_output(asdict(client.get_deployment(deployment_id)))
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+@deployment.command("delete")
+@click.argument("deployment_id")
+@click.option("--no-wait", is_flag=True, help="Start the teardown and exit without waiting")
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def deployment_delete_cmd(
+    deployment_id: str,
+    no_wait: bool,
+    base_url: Optional[str],
+    api_key: Optional[str],
+):
+    """Take a deployment down and release its name."""
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        if no_wait:
+            handle = client.delete_deployment(deployment_id, wait=False)
+            console.print(f"[green]Teardown started.[/green] Operation ID: {handle.operation_id}")
+            return
+        console.print(f"Tearing down deployment {deployment_id}...")
+        stopped = client.delete_deployment(deployment_id)
+        console.print("[green]Deployment stopped:[/green]")
+        format_json_output(asdict(stopped))
     except Exception as e:
         handle_error(e)
     finally:

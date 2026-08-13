@@ -101,6 +101,33 @@ weaver checkpoint download weaver://<model>/checkpoints/step-42 -o ./hf-weights
 
 下载是并行的，支持断点续传、过期 URL 自动刷新，并在落盘前校验每个文件的 sha256。两个方法都有对应的 `Async*` 版本。
 
+### 部署 checkpoint
+
+`deploy_checkpoint()` 把一个 checkpoint 上架成公开的 OpenAI 兼容端点：服务端会把它转换成 HuggingFace 格式，拉起一个独立的推理负载，再用你指定的名字注册到 NorthGate 网关。
+
+```python
+deployment = training_client.deploy_checkpoint(ckpt, name="my-chat-model")
+print(deployment.endpoint)          # OpenAI 兼容的 URL
+
+service.list_deployments()
+service.get_deployment(deployment.id)
+service.delete_deployment(deployment.id)
+```
+
+```bash
+weaver deployment create weaver://<model>/checkpoints/step-42 --name my-chat-model
+weaver deployment list
+weaver deployment get <deployment-id>
+weaver deployment delete <deployment-id>
+```
+
+需要知道四件事：
+
+- **上架有权限门，且默认关闭。** `deployment.publish` 这个能力不按 Weaver 角色授予，而是按主体来源：SSO 会话天然满足；API key 只有在铸造时使用的 IAM `biz_code` 位于服务端白名单里才满足；service credential 一律不满足。功能未开启的服务端会返回 503。两种情况都会抛出 `WeaverAPIError`，并在报错信息里说明该改什么。列出、查看、删除自己的部署不需要这个能力——谁上架的端点，谁始终可以下架。
+- **部署是独立且长期存在的。** 它不复用训练用的推理实例，生命周期长于训练会话，在你删除它之前会一直占着 GPU；同时它会钉住源 checkpoint 和导出产物，使其不被回收。
+- **名字是全局的，且必须在所有下游都合法。** 它同时是 served model name、网关的 `model_name` 和 Kubernetes label：最长 63 个字符，只能包含字母、数字、`.`、`-`、`_`，且首尾必须是字母或数字。`overwrite=True` 只会替换网关上的同名注册，不会释放 Weaver 侧已被占用的名字。
+- **整个过程需要几十分钟**，主要耗时在转换。传 `wait=False` 可以拿到 `OperationHandle` 而不阻塞。所有方法都有对应的 `Async*` 版本。
+
 ## 生态
 
 [NexRL](https://github.com/nex-agi/NexRL) 是配套的 RL 训练框架。在其 **training-service** 模式下，NexRL 负责编排完整的 RL 流程（rollout、轨迹收集、策略更新），Weaver 提供底层的训练和推理服务。

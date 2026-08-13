@@ -20,8 +20,7 @@ import logging
 import os
 import re
 import time
-from pathlib import Path
-from typing import Any, Mapping, MutableMapping
+from typing import Any, BinaryIO, Mapping, MutableMapping
 
 import httpx
 from opentelemetry import baggage, context, trace
@@ -246,26 +245,33 @@ def build_download_client(timeout: httpx.Timeout | float | None = None) -> httpx
 
 def stream_download_to_file(
     url: str,
-    dest: Path,
+    sink: BinaryIO,
     *,
     client: httpx.Client,
     resume_from: int = 0,
     chunk_size: int = DOWNLOAD_CHUNK_SIZE,
 ) -> int:
-    """Stream a plain (non-API) URL to *dest* on disk.
+    """Stream a plain (non-API) URL into the open file *sink*.
+
+    Opening the destination is the caller's job, deliberately: the download
+    path anchors its writes to a directory descriptor (:mod:`weaver._safeio`)
+    so an untrusted descriptor file name cannot be re-pointed at another
+    directory between validation and write. Resolving a path here would put
+    that decision back into this function, where the anchor is not available.
 
     Args:
         url: Presigned download URL. No Weaver auth headers are attached;
             *client* must be a bare client (see :func:`build_download_client`).
-        dest: File to write. Appended to when the server honors the Range
-            request, truncated and rewritten when it does not.
+        sink: Open binary file the body is written into. Must be opened for
+            append when *resume_from* is non-zero, for truncating write
+            otherwise.
         client: Bare ``httpx.Client`` used for the request.
-        resume_from: Byte offset already present in *dest*; sends a ``Range``
+        resume_from: Byte offset already present in *sink*; sends a ``Range``
             header so an interrupted download resumes instead of restarting.
         chunk_size: Streaming chunk size in bytes.
 
     Returns:
-        Total bytes now present in *dest*.
+        Total bytes now present in *sink*.
 
     Raises:
         DownloadURLExpiredError: The URL was rejected with 401/403 — refresh
@@ -291,12 +297,18 @@ def stream_download_to_file(
             response.read()
             raise_for_response(response)
         partial = response.status_code == httpx.codes.PARTIAL_CONTENT
-        mode = "ab" if partial else "wb"
-        written = resume_from if partial else 0
-        with open(dest, mode) as fh:
-            for chunk in response.iter_bytes(chunk_size):
-                fh.write(chunk)
-                written += len(chunk)
+        if partial:
+            written = resume_from
+        else:
+            # The server ignored the Range header and is sending the whole
+            # body. The sink may be open for append and already hold a
+            # partial, so drop those bytes rather than doubling the file.
+            sink.seek(0)
+            sink.truncate()
+            written = 0
+        for chunk in response.iter_bytes(chunk_size):
+            sink.write(chunk)
+            written += len(chunk)
     return written
 
 

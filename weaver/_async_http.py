@@ -25,8 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from pathlib import Path
-from typing import Any, Mapping, MutableMapping
+from typing import Any, BinaryIO, Mapping, MutableMapping
 
 import httpx
 from opentelemetry import baggage, context, trace
@@ -72,7 +71,7 @@ def build_async_download_client(timeout: httpx.Timeout | float | None = None) ->
 
 async def async_stream_download_to_file(
     url: str,
-    dest: Path,
+    sink: BinaryIO,
     *,
     client: httpx.AsyncClient,
     resume_from: int = 0,
@@ -81,12 +80,15 @@ async def async_stream_download_to_file(
     """Asyncio twin of :func:`weaver._http.stream_download_to_file`.
 
     Network reads are awaited so the event loop stays free; the per-chunk
-    ``fh.write`` is a buffered local-disk write that is fast relative to the
+    ``sink.write`` is a buffered local-disk write that is fast relative to the
     awaited network reads, which keeps the loop responsive without a thread
     hop per chunk.
 
+    The caller owns *sink* — see the sync twin for why opening it here would
+    defeat the descriptor anchoring in :mod:`weaver._safeio`.
+
     Returns:
-        Total bytes now present in *dest*.
+        Total bytes now present in *sink*.
 
     Raises:
         DownloadURLExpiredError: The URL was rejected with 401/403 — refresh
@@ -112,12 +114,18 @@ async def async_stream_download_to_file(
             await response.aread()
             raise_for_response(response)
         partial = response.status_code == httpx.codes.PARTIAL_CONTENT
-        mode = "ab" if partial else "wb"
-        written = resume_from if partial else 0
-        with open(dest, mode) as fh:
-            async for chunk in response.aiter_bytes(chunk_size):
-                fh.write(chunk)
-                written += len(chunk)
+        if partial:
+            written = resume_from
+        else:
+            # The server ignored the Range header and is sending the whole
+            # body. The sink may be open for append and already hold a
+            # partial, so drop those bytes rather than doubling the file.
+            sink.seek(0)
+            sink.truncate()
+            written = 0
+        async for chunk in response.aiter_bytes(chunk_size):
+            sink.write(chunk)
+            written += len(chunk)
     return written
 
 

@@ -31,7 +31,13 @@ import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
-from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload
+from ._artifacts import (
+    DEFAULT_EXPORT_TTL_SECONDS,
+    is_artifact_payload,
+    validate_resource_id,
+)
+from ._deployments import build_create_deployment_body, translate_deployment_error
+from ._http import WeaverAPIError
 from ._payloads import (
     build_request_metadata,
     build_surrogate_data,
@@ -45,6 +51,7 @@ from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle, build_async_operation_handle
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
+from .types.deployment import Deployment
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
@@ -650,12 +657,14 @@ class AsyncTrainingClient:
         if isinstance(checkpoint, Checkpoint):
             if not checkpoint.id:
                 raise ValueError("Checkpoint object has no id")
-            return checkpoint.id
+            return validate_resource_id(checkpoint.id, kind="checkpoint")
         reference = checkpoint.strip()
         if not reference:
             raise ValueError("checkpoint reference must not be empty")
         if not reference.startswith("weaver://"):
-            return reference  # already a checkpoint id
+            # A raw id becomes a URL path segment; require a canonical UUID so
+            # dot-segment tricks cannot reroute the request.
+            return validate_resource_id(reference, kind="checkpoint")
         owner = parse_model_id_from_weaver_path(reference)
         if owner and owner != self.model_id:
             raise ValueError(
@@ -670,6 +679,77 @@ class AsyncTrainingClient:
             f"{self.model_id}; pass a Checkpoint from save_state() or "
             "list_checkpoints()"
         )
+
+    # ------------------------------------------------------------------
+    # NorthGate deployment
+    # ------------------------------------------------------------------
+
+    @overload
+    async def deploy_checkpoint(
+        self,
+        checkpoint: str | Checkpoint,
+        *,
+        name: str,
+        gpu_type: str | None = None,
+        replicas: int = 1,
+        gpus_per_replica: int | None = None,
+        overwrite: bool = False,
+        wait: "Literal[True]" = True,
+    ) -> Deployment: ...
+
+    @overload
+    async def deploy_checkpoint(
+        self,
+        checkpoint: str | Checkpoint,
+        *,
+        name: str,
+        gpu_type: str | None = None,
+        replicas: int = 1,
+        gpus_per_replica: int | None = None,
+        overwrite: bool = False,
+        wait: "Literal[False]",
+    ) -> AsyncOperationHandle: ...
+
+    async def deploy_checkpoint(  # pylint: disable=too-many-arguments
+        self,
+        checkpoint: str | Checkpoint,
+        *,
+        name: str,
+        gpu_type: str | None = None,
+        replicas: int = 1,
+        gpus_per_replica: int | None = None,
+        overwrite: bool = False,
+        wait: bool = True,
+    ) -> Deployment | AsyncOperationHandle:
+        """Publish a checkpoint as a public, OpenAI-compatible endpoint.
+
+        See :meth:`weaver.training_client.TrainingClient.deploy_checkpoint`.
+        Returns a :class:`~weaver.types.Deployment` when *wait* is True, else
+        an ``AsyncOperationHandle``.
+        """
+        body = build_create_deployment_body(
+            name=name,
+            gpu_type=gpu_type,
+            replicas=replicas,
+            gpus_per_replica=gpus_per_replica,
+            overwrite=overwrite,
+        )
+        checkpoint_id = await self._resolve_checkpoint_id(checkpoint)
+        try:
+            # max_retries=1: creating a deployment is a non-idempotent POST
+            # that launches GPUs and claims a global gateway name.
+            response = await self._service.http.post(
+                f"/api/v1/checkpoints/{checkpoint_id}/deployments", json=body, max_retries=1
+            )
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        handle = build_async_operation_handle(
+            self._service.http, response if isinstance(response, dict) else {}
+        )
+        if not wait:
+            return handle
+        result = await handle.result()
+        return Deployment.from_payload(result if isinstance(result, dict) else {})
 
     async def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:
         """Terminate trainer and/or inference instances for this model."""

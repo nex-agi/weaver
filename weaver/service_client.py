@@ -14,15 +14,31 @@
 
 """High-level ServiceClient that manages sessions and child clients."""
 
+# The client is the SDK's single entry point, so it aggregates every resource
+# family (sessions, models, checkpoints, artifacts, deployments) by design.
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, Sequence, Union
+from pathlib import Path, PurePosixPath
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+    overload,
+)
 
 import httpx
 
@@ -33,26 +49,48 @@ from ._artifacts import (
     DOWNLOAD_MAX_URL_REFRESHES,
     ArtifactFile,
     check_downloaded_file,
+    check_downloaded_file_at,
     descriptor_files,
+    ensure_within_directory,
     is_file_already_complete,
+    is_file_already_complete_at,
     parse_download_target,
     resolve_checkpoint_id_from_listing,
+    resume_offset_at,
     select_artifact_payload,
+    validate_resource_id,
+)
+from ._deployments import (
+    DEPLOYMENT_PAGE_SIZE,
+    deployment_items,
+    next_page_offset,
+    translate_deployment_error,
 )
 from ._http import (
     APIClient,
     DownloadURLExpiredError,
+    WeaverAPIError,
     build_download_client,
     compute_retry_delay,
     stream_download_to_file,
+)
+from ._safeio import (
+    legacy_open_for_write,
+    open_for_write,
+    open_parent_fd,
+    rename_within,
+    supports_dir_fd,
 )
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import OperationHandle, build_operation_handle
 from .types import LoraConfig
+from .types.deployment import Deployment
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
+    from typing import Literal
+
     from .sampling_client import SamplingClient
     from .training_client import TrainingClient
 
@@ -856,7 +894,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         if isinstance(target, WeightsArtifact):
             if not target.id:
                 raise ValueError("WeightsArtifact has no id")
-            return target.id
+            return validate_resource_id(target.id, kind="artifact")
         parsed = parse_download_target(target)
         if parsed.artifact_id:
             return parsed.artifact_id
@@ -886,9 +924,88 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         current_url: Callable[[str], str],
         refresh_url: Callable[[str], str],
     ) -> None:
-        """Download one manifest file with resume, URL refresh, and verification."""
+        """Download one manifest file with resume, URL refresh, and verification.
+
+        Descriptor file names are untrusted, so nothing here is written
+        through the composed path ``dest_dir / entry.name``. The destination
+        directory is walked one component at a time with no-follow ``openat``
+        semantics, and the resume stat, every write, the hash and the final
+        publish are all issued relative to the descriptor that walk returns
+        (:mod:`weaver._safeio`). Replacing a directory with a symlink after
+        the walk is inert: a descriptor names an inode, and no step after the
+        walk resolves the path again.
+        """
+        rel = PurePosixPath(entry.name)
+        # Cheap early rejection of an obviously escaping name, before anything
+        # is created on disk. The descriptor chain below is the real guarantee.
+        ensure_within_directory(dest_dir, (dest_dir / rel).parent)
+        if not supports_dir_fd():
+            self._download_weights_file_unanchored(
+                download_client,
+                entry,
+                dest_dir=dest_dir,
+                verify=verify,
+                current_url=current_url,
+                refresh_url=refresh_url,
+            )
+            return
+        final_name = rel.name
+        part_name = f"{final_name}.part"
+        parent_fd = open_parent_fd(dest_dir, rel, create=True)
+        try:
+            if is_file_already_complete_at(parent_fd, final_name, entry, verify=verify):
+                return
+            url = current_url(entry.name)
+            url_refreshes = 0
+            transport_retries = 0
+            while True:
+                resume_from = resume_offset_at(parent_fd, part_name, entry)
+                try:
+                    with open_for_write(parent_fd, part_name, append=resume_from > 0) as sink:
+                        stream_download_to_file(
+                            url, sink, client=download_client, resume_from=resume_from
+                        )
+                    break
+                except DownloadURLExpiredError:
+                    url_refreshes += 1
+                    if url_refreshes > DOWNLOAD_MAX_URL_REFRESHES:
+                        raise
+                    url = refresh_url(entry.name)
+                except (httpx.TransportError, OSError):
+                    # GETs are idempotent and the .part keeps its bytes, so retry
+                    # with a Range resume instead of restarting the shard.
+                    transport_retries += 1
+                    if transport_retries > DOWNLOAD_MAX_TRANSPORT_RETRIES:
+                        raise
+                    time.sleep(compute_retry_delay(transport_retries))
+            check_downloaded_file_at(parent_fd, part_name, entry, verify=verify)
+            # Atomic publish through the same descriptor: readers never observe
+            # a half-written file, and the rename cannot be redirected.
+            rename_within(parent_fd, part_name, final_name)
+        finally:
+            os.close(parent_fd)
+
+    def _download_weights_file_unanchored(
+        self,
+        download_client: httpx.Client,
+        entry: ArtifactFile,
+        *,
+        dest_dir: Path,
+        verify: bool,
+        current_url: Callable[[str], str],
+        refresh_url: Callable[[str], str],
+    ) -> None:
+        """Path-based download for platforms without ``dir_fd`` support.
+
+        Only Windows reaches this branch, and Windows is not a supported
+        execution environment for this SDK (see :mod:`weaver._safeio`). It
+        keeps the pre-anchoring behaviour — containment check plus a no-follow
+        open of the final component — and with it the check-to-use window the
+        anchored path above removes.
+        """
         final_path = dest_dir / entry.name
         final_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_within_directory(dest_dir, final_path.parent)
         if is_file_already_complete(final_path, entry, verify=verify):
             return
         part_path = final_path.with_name(final_path.name + ".part")
@@ -902,9 +1019,10 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                 part_path.unlink()
                 resume_from = 0
             try:
-                stream_download_to_file(
-                    url, part_path, client=download_client, resume_from=resume_from
-                )
+                with legacy_open_for_write(part_path, append=resume_from > 0) as sink:
+                    stream_download_to_file(
+                        url, sink, client=download_client, resume_from=resume_from
+                    )
                 break
             except DownloadURLExpiredError:
                 url_refreshes += 1
@@ -921,3 +1039,106 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         check_downloaded_file(part_path, entry, verify=verify)
         # Atomic publish: readers never observe a half-written file.
         part_path.replace(final_path)
+
+    # ------------------------------------------------------------------
+    # NorthGate deployments
+    # ------------------------------------------------------------------
+
+    def list_deployments(self) -> List[Deployment]:
+        """List the deployments this principal published.
+
+        Deployments are owner-scoped: the listing shows the ones this
+        principal created, not every deployment of the models it can access.
+        Stopped and failed deployments are included, so the history of an
+        endpoint stays visible after it is taken down.
+
+        Returns:
+            Every :class:`~weaver.types.Deployment` the caller owns, newest
+            first.
+
+        Raises:
+            WeaverAPIError: If deployments are disabled on this server (503).
+        """
+        deployments: List[Deployment] = []
+        offset = 0
+        while True:
+            params = {"limit": DEPLOYMENT_PAGE_SIZE, "offset": offset}
+            try:
+                payload = self.http.get("/api/v1/deployments", params=params)
+            except WeaverAPIError as exc:
+                raise translate_deployment_error(exc) from exc
+            page = deployment_items(payload)
+            deployments.extend(Deployment.from_payload(item) for item in page)
+            next_offset = next_page_offset(payload, offset, len(page))
+            if next_offset is None:
+                return deployments
+            offset = next_offset
+
+    def get_deployment(self, deployment_id: str) -> Deployment:
+        """Fetch one deployment by id.
+
+        Args:
+            deployment_id: The deployment's server-generated id.
+
+        Returns:
+            The :class:`~weaver.types.Deployment`, including its endpoint URL
+            once it is running.
+
+        Raises:
+            WeaverAPIError: If the deployment does not exist or belongs to
+                another principal (404 — a deployment owned by someone else
+                is reported as missing), or deployments are disabled (503).
+        """
+        deployment_id = validate_resource_id(deployment_id, kind="deployment")
+        try:
+            payload = self.http.get(f"/api/v1/deployments/{deployment_id}")
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        return Deployment.from_payload(payload if isinstance(payload, dict) else {})
+
+    @overload
+    def delete_deployment(
+        self, deployment_id: str, *, wait: Literal[True] = True
+    ) -> Deployment: ...
+
+    @overload
+    def delete_deployment(self, deployment_id: str, *, wait: Literal[False]) -> OperationHandle: ...
+
+    def delete_deployment(
+        self, deployment_id: str, *, wait: bool = True
+    ) -> Deployment | OperationHandle:
+        """Take a deployment down.
+
+        Offboards the model from the gateway, stops the workload, releases the
+        job name, and frees the materialized weights the deployment was
+        pinning. The name becomes available again once the deployment reaches
+        ``stopped``.
+
+        Deleting deliberately does not need the ``deployment.publish``
+        capability: whoever published an endpoint must always be able to take
+        it down, even if their grant was revoked afterwards.
+
+        Args:
+            deployment_id: The deployment's server-generated id.
+            wait: If True (default), blocks until teardown finishes and
+                returns the stopped :class:`~weaver.types.Deployment`.
+
+        Returns:
+            The stopped :class:`~weaver.types.Deployment` when *wait* is True,
+            else an :class:`OperationHandle` whose result is that deployment.
+
+        Raises:
+            WeaverAPIError: If the deployment is unknown or owned by someone
+                else (404), is already stopped (409 ``already_stopped``), or
+                deployments are disabled on this server (503).
+        """
+        deployment_id = validate_resource_id(deployment_id, kind="deployment")
+        try:
+            response = self.http.delete(f"/api/v1/deployments/{deployment_id}")
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        handle = build_operation_handle(self.http, response if isinstance(response, dict) else {})
+        if not wait:
+            return handle
+        result = handle.result()
+        return Deployment.from_payload(result if isinstance(result, dict) else {})

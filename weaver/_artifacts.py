@@ -14,19 +14,25 @@
 
 """HF weights export/download helpers shared by the sync and async clients.
 
-Everything in this module is pure (no IO) so both client stacks build
-identical requests and interpret identical responses; see
-``.claude/rules/async-compatibility.md``.
+Request building and response parsing here are pure (no IO) so both client
+stacks build identical requests and interpret identical responses; see
+``.claude/rules/async-compatibility.md``. The download-side helpers at the end
+of the module are the deliberate exception: they touch the local filesystem,
+and both stacks share them verbatim so resume, verification and publish
+semantics cannot drift apart.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import stat
+import uuid
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import Any, BinaryIO, Dict, List, Optional
 
+from ._safeio import open_for_read, stat_no_follow, unlink_within
 from ._utils import lookup_case_insensitive
 
 # Artifact kinds the server can produce. The server derives the kind
@@ -46,10 +52,50 @@ DOWNLOAD_MAX_TRANSPORT_RETRIES = 3
 
 # ``weaver://{model_id}/checkpoints/{name}`` optionally followed by
 # ``/artifacts/{kind}`` (the artifact URI shape).
+# Windows device names are reserved in EVERY directory and with any extension
+# ("CON.txt" still names the console device). Checked per path component.
+_WINDOWS_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+# URL path segments derived from URIs must never contain dot-segments or
+# separator characters; server ids are hyphenated-hex UUIDs, well within this.
+_SAFE_SEGMENT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*")
+
 _ARTIFACT_URI_RE = re.compile(
     r"^weaver://(?P<model_id>[^/]+)/checkpoints/(?P<name>[^/]+)"
     r"(?:/artifacts/(?P<kind>[^/]+))?/?$"
 )
+
+
+def validate_resource_id(value: str, *, kind: str) -> str:
+    """Validate a caller-supplied resource id before it becomes a URL segment.
+
+    Raw ids are interpolated into API paths; without this check a value like
+    ``../checkpoints/<uuid>`` is dot-segment-normalized by the HTTP stack into
+    a DIFFERENT route (e.g. deleting a checkpoint through the deployments
+    surface). Server resource ids are UUIDs, so anything else is rejected
+    before any request is built.
+
+    Returns:
+        The canonical lowercase hyphenated UUID text, safe to interpolate.
+
+    Raises:
+        ValueError: If *value* is not a canonical UUID.
+    """
+    candidate = (value or "").strip()
+    try:
+        parsed = uuid.UUID(candidate)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{kind} id must be a UUID, got {value!r}") from exc
+    canonical = str(parsed)
+    if candidate.lower() != canonical:
+        # Reject aliases (unhyphenated/braced/urn forms) so the text that
+        # reaches the URL is exactly the text that was validated.
+        raise ValueError(f"{kind} id must be a canonical hyphenated UUID, got {value!r}")
+    return canonical
 
 
 @dataclass(frozen=True)
@@ -86,8 +132,9 @@ def parse_download_target(target: str) -> ArtifactTarget:
     if not normalized:
         raise ValueError("download target must not be empty")
     if not normalized.startswith("weaver://"):
-        # Anything that is not a weaver URI is treated as an artifact id.
-        return ArtifactTarget(artifact_id=normalized)
+        # Anything that is not a weaver URI is treated as an artifact id, and
+        # must therefore be a canonical UUID (it becomes a URL path segment).
+        return ArtifactTarget(artifact_id=validate_resource_id(normalized, kind="artifact"))
     match = _ARTIFACT_URI_RE.match(normalized)
     if not match:
         raise ValueError(
@@ -101,6 +148,11 @@ def parse_download_target(target: str) -> ArtifactTarget:
             f"Unknown artifact kind {kind!r} in {normalized!r}; expected one of {ARTIFACT_KINDS}"
         )
     model_id = match.group("model_id")
+    if not _SAFE_SEGMENT_RE.fullmatch(model_id):
+        # The model id is interpolated into /api/v1/models/{id}/... routes;
+        # '..', encoded dots, '\\' etc. would let a crafted URI reroute the
+        # request. Real model ids are UUIDs, so a conservative charset is safe.
+        raise ValueError(f"unsafe model id in weaver URI: {model_id!r}")
     name = match.group("name")
     return ArtifactTarget(
         model_id=model_id,
@@ -202,8 +254,13 @@ class ArtifactFile:
 def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
     """Validate and normalize ``GET /artifacts/{id}/download`` file entries.
 
-    File names are server-controlled input used to build local paths, so
-    absolute names and ``..`` traversal segments are rejected.
+    File names are server-controlled input used to build local paths, so the
+    validation is strict: absolute names, ``..`` traversal segments, names
+    that normalize to nothing (``.``/``./``, which would alias the destination
+    directory itself), non-canonical spellings (``a//b``, ``a/./b``, trailing
+    slashes — anything whose literal text differs from its normalized form),
+    and duplicate normalized destinations are all rejected before any file is
+    created.
 
     Raises:
         ValueError: On a malformed descriptor or an unsafe file name.
@@ -213,6 +270,7 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
     if not isinstance(raw_files, list) or not raw_files:
         raise ValueError("artifact download descriptor contains no files")
     files: List[ArtifactFile] = []
+    seen_names: set = set()
     for raw in raw_files:
         if not isinstance(raw, dict):
             raise ValueError(f"malformed descriptor file entry: {raw!r}")
@@ -220,9 +278,36 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
         url = str(lookup_case_insensitive(raw, "url") or "")
         if not name or not url:
             raise ValueError(f"descriptor file entry missing name or url: {raw!r}")
-        pure = PurePosixPath(name)
-        if pure.is_absolute() or ".." in pure.parts:
+        if "\\" in name:
+            # PurePosixPath treats backslashes as ordinary characters, but the
+            # final ``dest_dir / name`` uses HOST semantics — on Windows a
+            # backslash is a separator and ``..\\owned.bin`` escapes dest_dir.
             raise ValueError(f"unsafe file name in download descriptor: {name!r}")
+        windows_view = PureWindowsPath(name)
+        if windows_view.drive or windows_view.root or ".." in windows_view.parts:
+            # Rejects drive-absolute (C:\\...), drive-relative (C:foo) and
+            # rooted (\\Windows\\...) spellings that are traversal on Windows.
+            raise ValueError(f"unsafe file name in download descriptor: {name!r}")
+        pure = PurePosixPath(name)
+        if not pure.parts or pure.is_absolute() or ".." in pure.parts:
+            raise ValueError(f"unsafe file name in download descriptor: {name!r}")
+        for component in pure.parts:
+            stripped = component.rstrip(" .")
+            stem = component.split(".", 1)[0].upper()
+            if (
+                ":" in component  # ADS syntax / drive remnants
+                or stripped != component  # trailing dot/space alias on Windows
+                or stem in _WINDOWS_RESERVED_NAMES  # device names, with or without extension
+            ):
+                raise ValueError(f"unsafe file name in download descriptor: {name!r}")
+        if name != str(pure):
+            # A name whose literal text differs from its normalized form
+            # (``a//b``, ``a/./b``, ``foo/``) can alias another entry's
+            # destination or smuggle an empty segment; require canonical form.
+            raise ValueError(f"non-canonical file name in download descriptor: {name!r}")
+        if name in seen_names:
+            raise ValueError(f"duplicate file name in download descriptor: {name!r}")
+        seen_names.add(name)
         size = lookup_case_insensitive(raw, "size")
         sha256 = lookup_case_insensitive(raw, "sha256")
         expires = lookup_case_insensitive(raw, "url_expires_at")
@@ -238,17 +323,36 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
     return files
 
 
+def hash_stream(fh: BinaryIO) -> str:
+    """Compute the sha256 hex digest of an already-open binary stream.
+
+    Taking a file object rather than a path is what lets the anchored download
+    path hash exactly the bytes it wrote, through the descriptor it wrote them
+    with, instead of re-resolving a name that may since have been replaced.
+    """
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def file_sha256(path: Path) -> str:
     """Compute the sha256 hex digest of *path* by streaming it from disk.
 
     Hashing what actually landed on disk (rather than the bytes seen on the
     wire) is deliberate: it also catches short writes and torn resumes.
     """
-    digest = hashlib.sha256()
     with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+        return hash_stream(fh)
+
+
+def sha256_at(parent_fd: int, name: str) -> str:
+    """sha256 of *name* read through *parent_fd*, never through its path."""
+    handle = open_for_read(parent_fd, name)
+    if handle is None:
+        raise FileNotFoundError(name)
+    with handle:
+        return hash_stream(handle)
 
 
 def check_downloaded_file(part_path: Path, entry: ArtifactFile, *, verify: bool) -> None:
@@ -290,3 +394,135 @@ def is_file_already_complete(final_path: Path, entry: ArtifactFile, *, verify: b
     if verify and entry.sha256:
         return file_sha256(final_path) == entry.sha256
     return True
+
+
+# ---------------------------------------------------------------------------
+# Descriptor-anchored twins of the helpers above
+#
+# Same semantics, but every syscall is resolved against a directory descriptor
+# obtained by a no-follow walk (:mod:`weaver._safeio`) instead of against a
+# path that has to be re-traversed — and can therefore be re-pointed — on each
+# call. Both client stacks use these; the path-based versions above survive
+# only for the platform fallback.
+# ---------------------------------------------------------------------------
+
+
+def resume_offset_at(parent_fd: int, part_name: str, entry: ArtifactFile) -> int:
+    """Bytes of *part_name* a Range request may safely resume from.
+
+    Resume policy (option (a) from the review thread): stable-name resume is
+    kept, but only from a ``.part`` that is a plain single-linked regular file
+    the caller can safely append to. Anything else is not resumed:
+
+    - a symlink or non-regular file is refused outright (a planted redirect);
+    - a partial longer than the manifest whole-file size cannot be a prefix of
+      it, so it is discarded and the download restarts;
+    - an empty partial carries nothing to resume, so it too is dropped.
+
+    Whenever this returns 0 the ``.part`` name is guaranteed free, so the
+    caller's fresh :func:`weaver._safeio.open_for_write` can create a brand-new
+    inode with ``O_CREAT | O_EXCL`` rather than truncating whatever sits at the
+    name. When it returns a positive offset the caller resumes in append mode,
+    where the hard-link check on the opened descriptor runs before any bytes
+    are written — so a hard link planted at a resumable partial is caught there
+    even though ``lstat`` here cannot tell it apart from an ordinary file.
+
+    Raises:
+        ValueError: The ``.part`` name is held by a symlink or another
+            non-regular file.
+    """
+    info = stat_no_follow(parent_fd, part_name)
+    if info is None:
+        return 0
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"refusing to write through a symlink: {part_name}")
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"refusing to write through a non-regular file: {part_name}")
+    if entry.size is not None and info.st_size > entry.size:
+        # Longer than the manifest says it should be: poisoned partial.
+        unlink_within(parent_fd, part_name)
+        return 0
+    if info.st_size == 0:
+        # Nothing to resume; drop the empty leftover so the fresh, O_EXCL
+        # create below owns a new inode instead of hitting EEXIST.
+        unlink_within(parent_fd, part_name)
+        return 0
+    return info.st_size
+
+
+def check_downloaded_file_at(
+    parent_fd: int, part_name: str, entry: ArtifactFile, *, verify: bool
+) -> None:
+    """Anchored twin of :func:`check_downloaded_file`.
+
+    Deletes the corrupt file through the same descriptor before raising, so a
+    later retry cannot resume from poisoned bytes.
+
+    Raises:
+        RuntimeError: On a missing file, or a size or sha256 mismatch.
+    """
+    info = stat_no_follow(parent_fd, part_name)
+    if info is None:
+        raise RuntimeError(f"downloaded file disappeared before verification: {entry.name!r}")
+    if entry.size is not None and info.st_size != entry.size:
+        unlink_within(parent_fd, part_name)
+        raise RuntimeError(
+            f"Downloaded size mismatch for {entry.name!r}: "
+            f"expected {entry.size} bytes, got {info.st_size}"
+        )
+    if verify and entry.sha256:
+        actual = sha256_at(parent_fd, part_name)
+        if actual != entry.sha256:
+            unlink_within(parent_fd, part_name)
+            raise RuntimeError(
+                f"sha256 mismatch for {entry.name!r}: " f"expected {entry.sha256}, got {actual}"
+            )
+
+
+def is_file_already_complete_at(
+    parent_fd: int, name: str, entry: ArtifactFile, *, verify: bool
+) -> bool:
+    """Anchored twin of :func:`is_file_already_complete`.
+
+    Only a regular file counts as complete: unlike ``Path.is_file()`` this
+    does not follow a symlink standing at *name*, so a planted link is
+    re-downloaded over (via the ``.part`` and an anchored rename) instead of
+    being trusted as finished work.
+    """
+    if entry.size is None:
+        return False
+    info = stat_no_follow(parent_fd, name)
+    if info is None or not stat.S_ISREG(info.st_mode):
+        return False
+    if info.st_size != entry.size:
+        return False
+    if verify and entry.sha256:
+        return sha256_at(parent_fd, name) == entry.sha256
+    return True
+
+
+def ensure_within_directory(dest_dir: Path, candidate_parent: Path) -> None:
+    """Require *candidate_parent* (resolved) to stay under *dest_dir* (resolved).
+
+    Defense in depth, and no longer the guarantee. This is a cheap early
+    sanity check that rejects an obviously escaping descriptor name — a
+    pre-existing ``dest/link -> /tmp/outside`` turning the validated name
+    ``link/owned.bin`` into a write outside the tree — before anything is
+    created on disk. It cannot be more than that: it reasons about a resolved
+    *name*, and the directory that name points at can be swapped for a symlink
+    immediately afterwards.
+
+    Containment is guaranteed instead by the anchored walk in
+    :mod:`weaver._safeio`, which pins the destination directory by descriptor
+    and issues every write, hash, rename and unlink relative to it.
+
+    Raises:
+        ValueError: When the resolved parent escapes the destination.
+    """
+    resolved_dest = dest_dir.resolve()
+    resolved_parent = candidate_parent.resolve()
+    if not (resolved_parent == resolved_dest or resolved_parent.is_relative_to(resolved_dest)):
+        raise ValueError(
+            f"descriptor file resolves outside the destination directory: "
+            f"{candidate_parent} -> {resolved_parent}"
+        )

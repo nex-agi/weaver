@@ -30,6 +30,7 @@ from .async_service_client import AsyncServiceClient  # noqa: F401
 from .async_training_client import AsyncTrainingClient  # noqa: F401
 from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
+from .types.deployment import Deployment  # noqa: F401
 from .types.weights_artifact import WeightsArtifact  # noqa: F401
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "AsyncOperationHandle",
     "WeaverAPIError",
     "WeightsArtifact",
+    "Deployment",
     "types",
     "__version__",
 ]

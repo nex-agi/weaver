@@ -22,7 +22,13 @@ from datetime import datetime, timezone
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
-from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload
+from ._artifacts import (
+    DEFAULT_EXPORT_TTL_SECONDS,
+    is_artifact_payload,
+    validate_resource_id,
+)
+from ._deployments import build_create_deployment_body, translate_deployment_error
+from ._http import WeaverAPIError
 from ._payloads import (
     build_request_metadata,
     build_surrogate_data,
@@ -37,6 +43,7 @@ from .operations import OperationHandle, build_operation_handle
 from .service_client import ServiceClient
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
+from .types.deployment import Deployment
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
@@ -792,12 +799,14 @@ class TrainingClient:
         if isinstance(checkpoint, Checkpoint):
             if not checkpoint.id:
                 raise ValueError("Checkpoint object has no id")
-            return checkpoint.id
+            return validate_resource_id(checkpoint.id, kind="checkpoint")
         reference = checkpoint.strip()
         if not reference:
             raise ValueError("checkpoint reference must not be empty")
         if not reference.startswith("weaver://"):
-            return reference  # already a checkpoint id
+            # A raw id becomes a URL path segment; require a canonical UUID so
+            # dot-segment tricks cannot reroute the request.
+            return validate_resource_id(reference, kind="checkpoint")
         owner = parse_model_id_from_weaver_path(reference)
         if owner and owner != self.model_id:
             raise ValueError(
@@ -812,6 +821,125 @@ class TrainingClient:
             f"{self.model_id}; pass a Checkpoint from save_state() or "
             "list_checkpoints()"
         )
+
+    # ------------------------------------------------------------------
+    # NorthGate deployment
+    # ------------------------------------------------------------------
+
+    @overload
+    def deploy_checkpoint(
+        self,
+        checkpoint: str | Checkpoint,
+        *,
+        name: str,
+        gpu_type: str | None = None,
+        replicas: int = 1,
+        gpus_per_replica: int | None = None,
+        overwrite: bool = False,
+        wait: Literal[True] = True,
+    ) -> Deployment: ...
+
+    @overload
+    def deploy_checkpoint(
+        self,
+        checkpoint: str | Checkpoint,
+        *,
+        name: str,
+        gpu_type: str | None = None,
+        replicas: int = 1,
+        gpus_per_replica: int | None = None,
+        overwrite: bool = False,
+        wait: Literal[False],
+    ) -> OperationHandle: ...
+
+    def deploy_checkpoint(  # pylint: disable=too-many-arguments
+        self,
+        checkpoint: str | Checkpoint,
+        *,
+        name: str,
+        gpu_type: str | None = None,
+        replicas: int = 1,
+        gpus_per_replica: int | None = None,
+        overwrite: bool = False,
+        wait: bool = True,
+    ) -> Deployment | OperationHandle:
+        """Publish a checkpoint as a public, OpenAI-compatible endpoint.
+
+        The server converts the checkpoint to HuggingFace format (reusing an
+        existing export when one is available), launches a standalone
+        inference workload for it, and registers that workload on the
+        NorthGate gateway under *name*. The whole sequence runs as one
+        operation and takes tens of minutes, dominated by the conversion.
+
+        The deployment is independent of this model's training inference
+        instance and of the training session's lifetime: it keeps serving
+        until :meth:`~weaver.service_client.ServiceClient.delete_deployment`
+        stops it, and it pins the source checkpoint and the exported artifact
+        against garbage collection while it lives.
+
+        Publishing is permission-gated. The server grants it by principal
+        origin — SSO sessions always, API keys only when minted under an
+        allowlisted IAM biz_code — and answers 403 otherwise; a server with
+        the feature switched off answers 503. Both are raised as
+        :class:`~weaver.WeaverAPIError` with guidance on what to change.
+
+        Args:
+            checkpoint: The checkpoint to publish. Accepts a
+                :class:`~weaver.types.Checkpoint`, a ``weaver://`` checkpoint
+                path (resolved via :meth:`list_checkpoints`), or a raw
+                checkpoint id.
+            name: Public model name callers will address the endpoint by. It
+                is also the gateway registration name and a Kubernetes label,
+                so it is limited to 63 characters of letters, digits, ``.``,
+                ``-`` and ``_``, starting and ending alphanumerically. Unique
+                across all deployments that are not stopped.
+            gpu_type: GPU type to serve on. ``None`` (default) uses the
+                server's configured default.
+            replicas: Number of serving replicas (1-8).
+            gpus_per_replica: GPUs per replica (1-16). ``None`` (default)
+                lets the launcher size it from the model.
+            overwrite: Replace an existing *gateway* registration of this
+                name. Off by default because the gateway's name space is
+                global and shared with everything else published there. It
+                does not affect Weaver's own name uniqueness.
+            wait: If True (default), blocks until the endpoint is live and
+                returns the :class:`~weaver.types.Deployment`.
+
+        Returns:
+            A :class:`~weaver.types.Deployment` when *wait* is True, else an
+            :class:`OperationHandle` whose result is that deployment.
+
+        Raises:
+            ValueError: On an invalid *name* or sizing argument, or a
+                ``weaver://`` *checkpoint* path that does not resolve to a
+                checkpoint of this model.
+            WeaverAPIError: If the caller may not publish (403), the feature
+                is disabled (503), the name is taken (409), or the per-user
+                deployment cap is reached (409).
+        """
+        body = build_create_deployment_body(
+            name=name,
+            gpu_type=gpu_type,
+            replicas=replicas,
+            gpus_per_replica=gpus_per_replica,
+            overwrite=overwrite,
+        )
+        checkpoint_id = self._resolve_checkpoint_id(checkpoint)
+        try:
+            # max_retries=1: creating a deployment is a non-idempotent POST
+            # that launches GPUs and claims a global gateway name.
+            response = self._service.http.post(
+                f"/api/v1/checkpoints/{checkpoint_id}/deployments", json=body, max_retries=1
+            )
+        except WeaverAPIError as exc:
+            raise translate_deployment_error(exc) from exc
+        handle = build_operation_handle(
+            self._service.http, response if isinstance(response, dict) else {}
+        )
+        if not wait:
+            return handle
+        result = handle.result()
+        return Deployment.from_payload(result if isinstance(result, dict) else {})
 
     def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:
         """Terminate trainer and/or inference instances for this model.

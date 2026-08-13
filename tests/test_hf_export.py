@@ -34,9 +34,11 @@ from weaver.types.weights_artifact import WeightsArtifact
 # Helpers
 # ---------------------------------------------------------------------------
 
+CHECKPOINT_UUID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+
 ARTIFACT_PAYLOAD: Dict[str, Any] = {
-    "id": "art-1",
-    "checkpoint_id": "ckpt-1",
+    "id": "aaaa1111-bb22-4c33-8d44-eeee5555ffff",
+    "checkpoint_id": CHECKPOINT_UUID,
     "model_id": "mdl-123",
     "kind": "hf_adapter",
     "status": "completed",
@@ -88,8 +90,8 @@ def _done_operation(response: Dict[str, Any]) -> Dict[str, Any]:
 class TestWeightsArtifactType:
     def test_from_payload(self):
         artifact = WeightsArtifact.from_payload(ARTIFACT_PAYLOAD)
-        assert artifact.id == "art-1"
-        assert artifact.checkpoint_id == "ckpt-1"
+        assert artifact.id == "aaaa1111-bb22-4c33-8d44-eeee5555ffff"
+        assert artifact.checkpoint_id == CHECKPOINT_UUID
         assert artifact.model_id == "mdl-123"
         assert artifact.kind == "hf_adapter"
         assert artifact.status == "completed"
@@ -118,7 +120,7 @@ class TestWeightsArtifactType:
         assert artifact.error == "conversion failed"
 
     def test_is_frozen(self):
-        artifact = WeightsArtifact(id="art-1")
+        artifact = WeightsArtifact(id="aaaa1111-bb22-4c33-8d44-eeee5555ffff")
         with pytest.raises(AttributeError):
             artifact.id = "art-2"  # type: ignore[misc]
 
@@ -136,7 +138,7 @@ class TestExportWeights:
         artifact = tc.export_weights()
 
         assert isinstance(artifact, WeightsArtifact)
-        assert artifact.id == "art-1"
+        assert artifact.id == "aaaa1111-bb22-4c33-8d44-eeee5555ffff"
         args = tc._service.http.post.call_args
         assert args[0][0] == "/api/v1/models/mdl-123/export-hf"
         assert args[1]["json"] == {
@@ -150,12 +152,12 @@ class TestExportWeights:
         tc = _make_training_client()
         tc._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
 
-        ckpt = Checkpoint(id="ckpt-1", path="weaver://mdl-123/checkpoints/step-5")
+        ckpt = Checkpoint(id=CHECKPOINT_UUID, path="weaver://mdl-123/checkpoints/step-5")
         artifact = tc.export_weights(checkpoint=ckpt, merge_adapter=True, force=True)
 
         assert isinstance(artifact, WeightsArtifact)
         args = tc._service.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/export"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/export"
         assert args[1]["json"] == {
             "format": "huggingface",
             "merge_adapter": True,
@@ -167,10 +169,10 @@ class TestExportWeights:
         tc = _make_training_client()
         tc._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
 
-        tc.export_weights(checkpoint="ckpt-raw", ttl_seconds=None)
+        tc.export_weights(checkpoint=CHECKPOINT_UUID, ttl_seconds=None)
 
         args = tc._service.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-raw/export"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/export"
         assert args[1]["json"]["ttl_seconds"] is None
 
     def test_checkpoint_export_resolves_weaver_path(self):
@@ -178,7 +180,7 @@ class TestExportWeights:
         tc._service.http.get.return_value = {
             "items": [
                 {"id": "ckpt-0", "path": "weaver://mdl-123/checkpoints/step-1"},
-                {"id": "ckpt-1", "path": "weaver://mdl-123/checkpoints/step-5"},
+                {"id": CHECKPOINT_UUID, "path": "weaver://mdl-123/checkpoints/step-5"},
             ]
         }
         tc._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
@@ -187,7 +189,7 @@ class TestExportWeights:
 
         tc._service.http.get.assert_called_once_with("/api/v1/models/mdl-123/checkpoints")
         args = tc._service.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/export"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/export"
 
     def test_checkpoint_export_unknown_path_raises(self):
         tc = _make_training_client()
@@ -210,7 +212,7 @@ class TestExportWeights:
         tc = _make_training_client()
         tc._service.http.post.return_value = dict(ARTIFACT_PAYLOAD)
 
-        artifact = tc.export_weights(checkpoint="ckpt-1", wait=False)
+        artifact = tc.export_weights(checkpoint=CHECKPOINT_UUID, wait=False)
 
         assert isinstance(artifact, WeightsArtifact)
         assert artifact.status == "completed"
@@ -219,7 +221,7 @@ class TestExportWeights:
         tc = _make_training_client()
         tc._service.http.post.return_value = {"id": "op-9", "status": "pending"}
 
-        handle = tc.export_weights(checkpoint="ckpt-1", wait=False)
+        handle = tc.export_weights(checkpoint=CHECKPOINT_UUID, wait=False)
 
         assert isinstance(handle, OperationHandle)
         assert handle.operation_id == "op-9"
@@ -228,11 +230,11 @@ class TestExportWeights:
         tc = _make_training_client()
         tc._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
 
-        artifact = tc.export_weights(checkpoint="ckpt-1")
+        artifact = tc.export_weights(checkpoint=CHECKPOINT_UUID)
 
         assert isinstance(artifact, WeightsArtifact)
         assert artifact.kind == "hf_adapter"
-        assert artifact.checkpoint_id == "ckpt-1"
+        assert artifact.checkpoint_id == CHECKPOINT_UUID
 
     def test_empty_checkpoint_reference_raises(self):
         tc = _make_training_client()
@@ -259,7 +261,7 @@ class TestAsyncExportWeights:
         artifact = asyncio.run(tc.export_weights())
 
         assert isinstance(artifact, WeightsArtifact)
-        assert artifact.id == "art-1"
+        assert artifact.id == "aaaa1111-bb22-4c33-8d44-eeee5555ffff"
         args = tc._service.http.post.call_args
         assert args[0][0] == "/api/v1/models/mdl-123/export-hf"
         assert args[1]["json"] == {
@@ -272,7 +274,7 @@ class TestAsyncExportWeights:
     def test_checkpoint_export_resolves_weaver_path(self):
         tc = _make_async_training_client()
         tc._service.http.get.return_value = {
-            "items": [{"id": "ckpt-1", "path": "weaver://mdl-123/checkpoints/step-5"}]
+            "items": [{"id": CHECKPOINT_UUID, "path": "weaver://mdl-123/checkpoints/step-5"}]
         }
         tc._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
 
@@ -282,14 +284,14 @@ class TestAsyncExportWeights:
 
         assert isinstance(artifact, WeightsArtifact)
         args = tc._service.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/export"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/export"
         assert args[1]["json"]["force"] is True
 
     def test_idempotent_completed_hit_returns_artifact_even_without_wait(self):
         tc = _make_async_training_client()
         tc._service.http.post.return_value = dict(ARTIFACT_PAYLOAD)
 
-        artifact = asyncio.run(tc.export_weights(checkpoint="ckpt-1", wait=False))
+        artifact = asyncio.run(tc.export_weights(checkpoint=CHECKPOINT_UUID, wait=False))
 
         assert isinstance(artifact, WeightsArtifact)
         assert artifact.status == "completed"
@@ -298,7 +300,7 @@ class TestAsyncExportWeights:
         tc = _make_async_training_client()
         tc._service.http.post.return_value = {"id": "op-9", "status": "pending"}
 
-        handle = asyncio.run(tc.export_weights(checkpoint="ckpt-1", wait=False))
+        handle = asyncio.run(tc.export_weights(checkpoint=CHECKPOINT_UUID, wait=False))
 
         assert isinstance(handle, AsyncOperationHandle)
         assert handle.operation_id == "op-9"
@@ -325,12 +327,12 @@ class TestCheckpointExportCLI:
         monkeypatch.delenv("WEAVER_API_KEY", raising=False)
         client = self._client()
         with patch("weaver.cli.ServiceClient", return_value=client):
-            result = CliRunner().invoke(cli, ["checkpoint", "export", "ckpt-1"])
+            result = CliRunner().invoke(cli, ["checkpoint", "export", CHECKPOINT_UUID])
 
         assert result.exit_code == 0
         client.connect.assert_called_once_with(ensure_session=False)
         args = client.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-1/export"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/export"
         assert args[1]["json"] == {
             "format": "huggingface",
             "merge_adapter": False,
@@ -345,7 +347,7 @@ class TestCheckpointExportCLI:
         monkeypatch.delenv("WEAVER_API_KEY", raising=False)
         client = self._client()
         client.http.get.return_value = {
-            "items": [{"id": "ckpt-7", "path": "weaver://mdl-123/checkpoints/step-5"}]
+            "items": [{"id": CHECKPOINT_UUID, "path": "weaver://mdl-123/checkpoints/step-5"}]
         }
         with patch("weaver.cli.ServiceClient", return_value=client):
             result = CliRunner().invoke(
@@ -364,7 +366,7 @@ class TestCheckpointExportCLI:
         assert result.exit_code == 0
         client.http.get.assert_called_once_with("/api/v1/models/mdl-123/checkpoints")
         args = client.http.post.call_args
-        assert args[0][0] == "/api/v1/checkpoints/ckpt-7/export"
+        assert args[0][0] == f"/api/v1/checkpoints/{CHECKPOINT_UUID}/export"
         assert args[1]["json"] == {
             "format": "huggingface",
             "merge_adapter": True,
@@ -378,7 +380,7 @@ class TestCheckpointExportCLI:
         client = MagicMock()
         client.http.post.return_value = {"id": "op-42", "status": "pending"}
         with patch("weaver.cli.ServiceClient", return_value=client):
-            result = CliRunner().invoke(cli, ["checkpoint", "export", "ckpt-1", "--no-wait"])
+            result = CliRunner().invoke(cli, ["checkpoint", "export", CHECKPOINT_UUID, "--no-wait"])
 
         assert result.exit_code == 0
         assert "op-42" in result.output
@@ -389,7 +391,19 @@ class TestCheckpointExportCLI:
         client = MagicMock()
         client.http.post.return_value = dict(ARTIFACT_PAYLOAD)
         with patch("weaver.cli.ServiceClient", return_value=client):
-            result = CliRunner().invoke(cli, ["checkpoint", "export", "ckpt-1"])
+            result = CliRunner().invoke(cli, ["checkpoint", "export", CHECKPOINT_UUID])
 
         assert result.exit_code == 0
         assert "already completed" in result.output
+
+
+class TestExportCLIIdGuard:
+    @pytest.mark.parametrize("raw", ["../models/target", "a/b", "ckpt-1"])
+    def test_checkpoint_export_rejects_traversal_ids(self, monkeypatch, raw):
+        monkeypatch.delenv("WEAVER_BASE_URL", raising=False)
+        monkeypatch.delenv("WEAVER_API_KEY", raising=False)
+        client = MagicMock()
+        with patch("weaver.cli.ServiceClient", return_value=client):
+            result = CliRunner().invoke(cli, ["checkpoint", "export", raw, "--no-wait"])
+        assert result.exit_code != 0
+        client.http.post.assert_not_called()
