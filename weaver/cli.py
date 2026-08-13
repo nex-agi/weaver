@@ -24,7 +24,14 @@ from rich import box
 from rich.console import Console
 from rich.table import Table
 
+from ._artifacts import (
+    DEFAULT_EXPORT_TTL_SECONDS,
+    is_artifact_payload,
+    parse_download_target,
+    resolve_checkpoint_id_from_listing,
+)
 from ._http import WeaverAPIError
+from .operations import build_operation_handle
 from .service_client import ServiceClient
 
 console = Console()
@@ -683,6 +690,131 @@ def checkpoint_set_ttl_cmd(  # pylint: disable=too-many-positional-arguments
                 console.print(f"[green]TTL set to {seconds}s for checkpoint:[/green] {path}")
     except Exception as e:
         handle_error(e)
+
+
+def _resolve_cli_checkpoint_id(client: ServiceClient, target: str) -> str:
+    """Resolve a ``weaver://`` checkpoint URI (or raw id) to a checkpoint id."""
+    if not target.startswith("weaver://"):
+        return target
+    parsed = parse_download_target(target)
+    listing = client.http.get(f"/api/v1/models/{parsed.model_id}/checkpoints")
+    items = (listing or {}).get("items", []) if isinstance(listing, dict) else []
+    checkpoint_id = resolve_checkpoint_id_from_listing(items, parsed.checkpoint_path or "")
+    if checkpoint_id is None:
+        raise ValueError(
+            f"No checkpoint with path {parsed.checkpoint_path!r} found for "
+            f"model {parsed.model_id}"
+        )
+    return checkpoint_id
+
+
+@checkpoint.command("export")
+@click.argument("target")
+@click.option(
+    "--merge-adapter",
+    is_flag=True,
+    help="Merge a LoRA adapter into the base model (exports a full HF model)",
+)
+@click.option(
+    "--ttl",
+    "ttl_seconds",
+    type=int,
+    default=DEFAULT_EXPORT_TTL_SECONDS,
+    show_default=True,
+    help="Artifact TTL in seconds",
+)
+@click.option("--force", is_flag=True, help="Re-export even if a completed artifact exists")
+@click.option("--no-wait", is_flag=True, help="Enqueue the export and exit without waiting")
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def checkpoint_export_cmd(  # pylint: disable=too-many-positional-arguments
+    target: str,
+    merge_adapter: bool,
+    ttl_seconds: int,
+    force: bool,
+    no_wait: bool,
+    base_url: Optional[str],
+    api_key: Optional[str],
+):
+    """Export a checkpoint to HuggingFace format.
+
+    TARGET is a checkpoint weaver:// URI or a checkpoint id. The export
+    produces a downloadable artifact (full HF model for full fine-tuning,
+    HF PEFT adapter for LoRA); fetch it with `weaver checkpoint download`.
+    """
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        checkpoint_id = _resolve_cli_checkpoint_id(client, target)
+        body = {
+            "format": "huggingface",
+            "merge_adapter": merge_adapter,
+            "ttl_seconds": ttl_seconds,
+            "force": force,
+        }
+        response = client.http.post(
+            f"/api/v1/checkpoints/{checkpoint_id}/export", json=body, max_retries=1
+        )
+        # A completed idempotent hit answers with the artifact itself instead
+        # of an operation envelope.
+        if is_artifact_payload(response):
+            console.print("[green]Export already completed:[/green]")
+            format_json_output(response)
+            return
+        handle = build_operation_handle(client.http, response if isinstance(response, dict) else {})
+        if no_wait:
+            console.print(f"[green]Export enqueued.[/green] Operation ID: {handle.operation_id}")
+            return
+        console.print(f"Waiting for export operation {handle.operation_id}...")
+        result = handle.result()
+        console.print("[green]Export completed:[/green]")
+        format_json_output(result)
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
+
+
+@checkpoint.command("download")
+@click.argument("uri")
+@click.option(
+    "--output",
+    "-o",
+    "output_dir",
+    required=True,
+    type=click.Path(file_okay=False),
+    help="Directory to download the files into",
+)
+@click.option(
+    "--kind",
+    type=click.Choice(["hf_model", "hf_adapter"]),
+    default=None,
+    help="Artifact kind to select when the checkpoint has several",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def checkpoint_download_cmd(  # pylint: disable=too-many-positional-arguments
+    uri: str,
+    output_dir: str,
+    kind: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+):
+    """Download exported HF weights to a local directory.
+
+    URI is an artifact weaver:// URI (…/artifacts/{kind}), a checkpoint
+    weaver:// URI, or an artifact id. Requires a completed export — run
+    `weaver checkpoint export` first.
+    """
+    client = ServiceClient(base_url=base_url, api_key=api_key)
+    try:
+        client.connect(ensure_session=False)
+        dest = client.download_weights(uri, output_dir, kind=kind)
+        console.print(f"[green]Downloaded weights to:[/green] {dest}")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":

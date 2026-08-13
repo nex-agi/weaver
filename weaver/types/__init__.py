@@ -50,6 +50,7 @@ from .router_replay import (
 from .sampling import SamplingParams
 from .sampling_control import PauseMode, coerce_pause_mode
 from .tensor import TensorData
+from .weights_artifact import WeightsArtifact
 
 # Public API only. Router-replay / payload-ref symbols are imported above for
 # internal consumers (NexRL, weaver-trainer) but intentionally omitted here so
@@ -65,5 +66,6 @@ __all__ = [
     "PauseMode",
     "SamplingParams",
     "TensorData",
+    "WeightsArtifact",
     "coerce_pause_mode",
 ]

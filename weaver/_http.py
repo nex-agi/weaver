@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Mapping, MutableMapping
 
 import httpx
@@ -45,6 +46,13 @@ MAX_RETRY_DELAY = 10.0
 # Transport-layer errors that indicate the request never reached the server.
 # Safe to retry regardless of idempotency because no server-side state was created.
 CONNECTION_ERRORS = (OSError, httpx.ConnectError, httpx.RemoteProtocolError)
+
+# Artifact file downloads stream multi-GB safetensors shards; chunks are
+# written to disk as they arrive so memory stays flat.
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MiB
+# Per-read timeout, not whole-transfer: httpx applies ``read`` between socket
+# reads, so a long download stays alive as long as bytes keep flowing.
+DOWNLOAD_TIMEOUT = httpx.Timeout(timeout=60.0, connect=10.0)
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +219,85 @@ def apply_request_span_attributes(
 def compute_retry_delay(attempt: int) -> float:
     """Exponential backoff delay for retry *attempt* (1-based)."""
     return min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+
+
+class DownloadURLExpiredError(RuntimeError):
+    """A presigned artifact URL was rejected (HTTP 401/403).
+
+    Presigned URLs are short-lived (~15 minutes); callers recover by
+    re-fetching the download descriptor for fresh URLs and retrying.
+    """
+
+
+def build_download_client(timeout: httpx.Timeout | float | None = None) -> httpx.Client:
+    """Build a bare client for downloading presigned artifact URLs.
+
+    Presigned URLs are self-authorizing plain object-storage URLs; the Weaver
+    API key must never be sent to an external host, so this client carries no
+    auth headers and no Weaver base URL — only a User-Agent.
+    """
+    return httpx.Client(
+        timeout=timeout or DOWNLOAD_TIMEOUT,
+        headers={"User-Agent": USER_AGENT},
+        limits=DEFAULT_CONNECTION_LIMITS,
+        follow_redirects=True,
+    )
+
+
+def stream_download_to_file(
+    url: str,
+    dest: Path,
+    *,
+    client: httpx.Client,
+    resume_from: int = 0,
+    chunk_size: int = DOWNLOAD_CHUNK_SIZE,
+) -> int:
+    """Stream a plain (non-API) URL to *dest* on disk.
+
+    Args:
+        url: Presigned download URL. No Weaver auth headers are attached;
+            *client* must be a bare client (see :func:`build_download_client`).
+        dest: File to write. Appended to when the server honors the Range
+            request, truncated and rewritten when it does not.
+        client: Bare ``httpx.Client`` used for the request.
+        resume_from: Byte offset already present in *dest*; sends a ``Range``
+            header so an interrupted download resumes instead of restarting.
+        chunk_size: Streaming chunk size in bytes.
+
+    Returns:
+        Total bytes now present in *dest*.
+
+    Raises:
+        DownloadURLExpiredError: The URL was rejected with 401/403 — refresh
+            the download descriptor and retry with a fresh URL.
+        WeaverAPIError: Any other non-success response.
+    """
+    headers: dict[str, str] = {}
+    if resume_from > 0:
+        headers["Range"] = f"bytes={resume_from}-"
+    with client.stream("GET", url, headers=headers) as response:
+        if response.status_code in (401, 403):
+            response.read()
+            raise DownloadURLExpiredError(
+                f"presigned URL rejected with HTTP {response.status_code}; "
+                "the download descriptor must be re-fetched for a fresh URL"
+            )
+        if response.status_code == httpx.codes.REQUESTED_RANGE_NOT_SATISFIABLE:
+            # The requested offset is at/past EOF: the bytes on disk already
+            # cover the file. The caller verifies size/sha before trusting it.
+            response.read()
+            return resume_from
+        if not response.is_success:
+            response.read()
+            raise_for_response(response)
+        partial = response.status_code == httpx.codes.PARTIAL_CONTENT
+        mode = "ab" if partial else "wb"
+        written = resume_from if partial else 0
+        with open(dest, mode) as fh:
+            for chunk in response.iter_bytes(chunk_size):
+                fh.write(chunk)
+                written += len(chunk)
+    return written
 
 
 class APIClient:

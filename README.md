@@ -103,6 +103,37 @@ Prefer `paused()` over calling `pause_generation()` / `continue_generation()` di
 a pause that never reaches its resume leaves the engine frozen indefinitely, and there is
 no server-side auto-resume. The async client mirrors this as `async with`.
 
+### HuggingFace weights export
+
+Checkpoints are stored in the trainer's native distributed format. `export_weights()`
+converts one into a HuggingFace directory — a full model for full fine-tuning, a PEFT
+adapter for LoRA — and `download_weights()` fetches it to disk:
+
+```python
+artifact = training_client.export_weights()          # save current weights + export
+artifact = training_client.export_weights(checkpoint=ckpt)  # export an existing checkpoint
+
+service.download_weights(artifact, "./hf-weights")
+```
+
+```bash
+weaver checkpoint export weaver://<model>/checkpoints/step-42
+weaver checkpoint download weaver://<model>/checkpoints/step-42 -o ./hf-weights
+```
+
+Three things to know:
+
+- **Export is explicit, download never triggers one.** Converting a full model is minutes
+  of compute and tens of GB of storage, so `download_weights()` fails with a "run
+  export_weights first" error rather than silently starting a conversion.
+- **Artifacts expire independently of their checkpoint** (7 days by default, `ttl_seconds`
+  to change). Deleting the source checkpoint does not delete the artifact, and vice versa.
+- **LoRA exports an adapter by default.** Pass `merge_adapter=True` to fold it into the
+  base model and get a full HF model instead; it is rejected for full fine-tuning models.
+
+Downloads run in parallel, resume interrupted files, refresh expired URLs, and verify each
+file's sha256 before publishing it. Both methods have `Async*` twins.
+
 ## Ecosystem
 
 [NexRL](https://github.com/nex-agi/NexRL) is the companion RL training framework.

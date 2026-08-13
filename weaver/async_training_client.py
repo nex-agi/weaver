@@ -31,6 +31,7 @@ import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
+from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload
 from ._payloads import (
     build_request_metadata,
     build_surrogate_data,
@@ -38,11 +39,13 @@ from ._payloads import (
     forward_payload,
     parse_logprob_tensors,
 )
+from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
-from .operations import AsyncOperationHandle
+from .operations import AsyncOperationHandle, build_async_operation_handle
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
+from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -574,6 +577,98 @@ class AsyncTrainingClient:
         return await self._service.http.patch(
             f"/api/v1/models/{self.model_id}/checkpoints/ttl",
             json=body,
+        )
+
+    # ------------------------------------------------------------------
+    # HF weights export
+    # ------------------------------------------------------------------
+
+    @overload
+    async def export_weights(
+        self,
+        *,
+        checkpoint: str | Checkpoint | None = None,
+        merge_adapter: bool = False,
+        ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
+        force: bool = False,
+        wait: "Literal[True]" = True,
+    ) -> WeightsArtifact: ...
+
+    @overload
+    async def export_weights(
+        self,
+        *,
+        checkpoint: str | Checkpoint | None = None,
+        merge_adapter: bool = False,
+        ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
+        force: bool = False,
+        wait: "Literal[False]",
+    ) -> WeightsArtifact | AsyncOperationHandle: ...
+
+    async def export_weights(
+        self,
+        *,
+        checkpoint: str | Checkpoint | None = None,
+        merge_adapter: bool = False,
+        ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
+        force: bool = False,
+        wait: bool = True,
+    ) -> WeightsArtifact | AsyncOperationHandle:
+        """Export model weights in HuggingFace format.
+
+        See :meth:`weaver.training_client.TrainingClient.export_weights`.
+        Returns a :class:`~weaver.types.WeightsArtifact` when *wait* is True
+        (or on an idempotent completed hit), else an ``AsyncOperationHandle``.
+        """
+        body: Dict[str, Any] = {
+            "format": "huggingface",
+            "merge_adapter": merge_adapter,
+            "ttl_seconds": ttl_seconds,
+        }
+        if checkpoint is None:
+            path = f"/api/v1/models/{self.model_id}/export-hf"
+        else:
+            checkpoint_id = await self._resolve_checkpoint_id(checkpoint)
+            body["force"] = force
+            path = f"/api/v1/checkpoints/{checkpoint_id}/export"
+        # max_retries=1: exports are non-idempotent POSTs (see enqueue_operation).
+        response = await self._service.http.post(path, json=body, max_retries=1)
+        # A completed idempotent hit answers with the artifact itself instead
+        # of an operation envelope; return it directly even when wait=False.
+        if is_artifact_payload(response):
+            return WeightsArtifact.from_payload(response)
+        handle = build_async_operation_handle(
+            self._service.http, response if isinstance(response, dict) else {}
+        )
+        if not wait:
+            return handle
+        result = await handle.result()
+        return WeightsArtifact.from_payload(result if isinstance(result, dict) else {})
+
+    async def _resolve_checkpoint_id(self, checkpoint: str | Checkpoint) -> str:
+        """Resolve a checkpoint reference to its server-side id."""
+        if isinstance(checkpoint, Checkpoint):
+            if not checkpoint.id:
+                raise ValueError("Checkpoint object has no id")
+            return checkpoint.id
+        reference = checkpoint.strip()
+        if not reference:
+            raise ValueError("checkpoint reference must not be empty")
+        if not reference.startswith("weaver://"):
+            return reference  # already a checkpoint id
+        owner = parse_model_id_from_weaver_path(reference)
+        if owner and owner != self.model_id:
+            raise ValueError(
+                f"Checkpoint path {reference!r} belongs to model {owner}, "
+                f"but this client trains model {self.model_id}"
+            )
+        for existing in await self.list_checkpoints():
+            if existing.path == reference:
+                return existing.id
+        raise ValueError(
+            f"No checkpoint with path {reference!r} found for model "
+            f"{self.model_id}; pass a Checkpoint from save_state() or "
+            "list_checkpoints()"
         )
 
     async def terminate(self, instance_types: list[str] | None = None) -> Dict[str, Any]:
