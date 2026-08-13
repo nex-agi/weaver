@@ -246,6 +246,23 @@ class TestDescriptorFiles:
         with pytest.raises(ValueError, match="non-canonical file name"):
             descriptor_files(bad)
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "..\\owned.bin",
+            "a\\..\\owned.bin",
+            "C:\\Users\\victim\\owned.bin",
+            "\\Windows\\owned.bin",
+            "C:foo",
+        ],
+    )
+    def test_rejects_windows_traversal_names(self, name):
+        # PurePosixPath treats these as single ordinary names, but the final
+        # dest_dir / name write uses HOST semantics — on Windows they escape
+        # or replace dest_dir.
+        with pytest.raises(ValueError, match="unsafe file name"):
+            descriptor_files(_descriptor({name: b"x"}))
+
     def test_rejects_duplicate_names(self):
         descriptor = _descriptor(FILES)
         descriptor["files"].append(dict(descriptor["files"][0]))

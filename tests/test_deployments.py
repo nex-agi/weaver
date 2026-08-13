@@ -227,6 +227,23 @@ class TestBuildCreateDeploymentBody:
         body = build_create_deployment_body(name="my-model")
         assert body == {"name": "my-model", "overwrite": False, "replicas": 1}
 
+    @pytest.mark.parametrize("replicas", [True, 1.5, "2", None])
+    def test_rejects_non_int_replicas(self, replicas):
+        # bool is an int subclass and floats compare fine against range
+        # bounds, so exact-type checks are required to keep them off the wire.
+        with pytest.raises(ValueError, match="replicas must be"):
+            build_create_deployment_body(name="my-model", replicas=replicas)
+
+    @pytest.mark.parametrize("gpus", [True, 2.5, "4"])
+    def test_rejects_non_int_gpus_per_replica(self, gpus):
+        with pytest.raises(ValueError, match="gpus_per_replica must be"):
+            build_create_deployment_body(name="my-model", gpus_per_replica=gpus)
+
+    @pytest.mark.parametrize("overwrite", ["false", 1, 0, None])
+    def test_rejects_non_bool_overwrite(self, overwrite):
+        with pytest.raises(ValueError, match="overwrite must be"):
+            build_create_deployment_body(name="my-model", overwrite=overwrite)
+
     def test_all_fields(self):
         body = build_create_deployment_body(
             name="my-model",
