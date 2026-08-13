@@ -43,7 +43,6 @@ import httpx
 
 from . import __version__
 from ._artifacts import (
-    validate_resource_id,
     ARTIFACT_KINDS,
     DOWNLOAD_MAX_TRANSPORT_RETRIES,
     DOWNLOAD_MAX_URL_REFRESHES,
@@ -54,6 +53,7 @@ from ._artifacts import (
     parse_download_target,
     resolve_checkpoint_id_from_listing,
     select_artifact_payload,
+    validate_resource_id,
 )
 from ._deployments import (
     DEPLOYMENT_PAGE_SIZE,
