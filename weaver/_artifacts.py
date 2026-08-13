@@ -202,8 +202,13 @@ class ArtifactFile:
 def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
     """Validate and normalize ``GET /artifacts/{id}/download`` file entries.
 
-    File names are server-controlled input used to build local paths, so
-    absolute names and ``..`` traversal segments are rejected.
+    File names are server-controlled input used to build local paths, so the
+    validation is strict: absolute names, ``..`` traversal segments, names
+    that normalize to nothing (``.``/``./``, which would alias the destination
+    directory itself), non-canonical spellings (``a//b``, ``a/./b``, trailing
+    slashes — anything whose literal text differs from its normalized form),
+    and duplicate normalized destinations are all rejected before any file is
+    created.
 
     Raises:
         ValueError: On a malformed descriptor or an unsafe file name.
@@ -213,6 +218,7 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
     if not isinstance(raw_files, list) or not raw_files:
         raise ValueError("artifact download descriptor contains no files")
     files: List[ArtifactFile] = []
+    seen_names: set = set()
     for raw in raw_files:
         if not isinstance(raw, dict):
             raise ValueError(f"malformed descriptor file entry: {raw!r}")
@@ -221,8 +227,16 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
         if not name or not url:
             raise ValueError(f"descriptor file entry missing name or url: {raw!r}")
         pure = PurePosixPath(name)
-        if pure.is_absolute() or ".." in pure.parts:
+        if not pure.parts or pure.is_absolute() or ".." in pure.parts:
             raise ValueError(f"unsafe file name in download descriptor: {name!r}")
+        if name != str(pure):
+            # A name whose literal text differs from its normalized form
+            # (``a//b``, ``a/./b``, ``foo/``) can alias another entry's
+            # destination or smuggle an empty segment; require canonical form.
+            raise ValueError(f"non-canonical file name in download descriptor: {name!r}")
+        if name in seen_names:
+            raise ValueError(f"duplicate file name in download descriptor: {name!r}")
+        seen_names.add(name)
         size = lookup_case_insensitive(raw, "size")
         sha256 = lookup_case_insensitive(raw, "sha256")
         expires = lookup_case_insensitive(raw, "url_expires_at")

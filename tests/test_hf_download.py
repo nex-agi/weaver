@@ -228,6 +228,27 @@ class TestDescriptorFiles:
         with pytest.raises(ValueError, match="unsafe file name"):
             descriptor_files(bad)
 
+    @pytest.mark.parametrize("name", [".", "./"])
+    def test_rejects_names_that_normalize_to_nothing(self, name):
+        # Regression: PurePosixPath(".").parts is empty, so "." used to pass
+        # validation; the download path then aliased dest_dir itself and the
+        # .part landed OUTSIDE the requested directory as its sibling.
+        bad = _descriptor({name: b"x"})
+        with pytest.raises(ValueError, match="unsafe file name"):
+            descriptor_files(bad)
+
+    @pytest.mark.parametrize("name", ["a//b", "a/./b", "foo/", "./foo"])
+    def test_rejects_non_canonical_names(self, name):
+        bad = _descriptor({name: b"x"})
+        with pytest.raises(ValueError, match="non-canonical file name"):
+            descriptor_files(bad)
+
+    def test_rejects_duplicate_names(self):
+        descriptor = _descriptor(FILES)
+        descriptor["files"].append(dict(descriptor["files"][0]))
+        with pytest.raises(ValueError, match="duplicate file name"):
+            descriptor_files(descriptor)
+
     def test_rejects_empty_descriptor(self):
         with pytest.raises(ValueError, match="no files"):
             descriptor_files({"files": []})
