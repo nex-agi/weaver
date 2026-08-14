@@ -34,6 +34,11 @@ from .types.nccl_weight_sync import (  # noqa: F401
     NCCL_V1_CHECKSUM_MODES,
     NCCLWeightSyncV1Result,
 )
+from .types.weight_sync import (  # noqa: F401
+    WEIGHT_SYNC_BACKENDS,
+    WEIGHT_SYNC_UPDATES,
+    WeightSyncSelection,
+)
 
 __all__ = [
     "ServiceClient",
@@ -45,6 +50,9 @@ __all__ = [
     "WeaverAPIError",
     "NCCL_V1_CHECKSUM_MODES",
     "NCCLWeightSyncV1Result",
+    "WEIGHT_SYNC_BACKENDS",
+    "WEIGHT_SYNC_UPDATES",
+    "WeightSyncSelection",
     "types",
     "__version__",
 ]
