@@ -45,6 +45,7 @@ from .operations import AsyncOperationHandle
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.nccl_weight_sync import NCCLWeightSyncV1Result
+from .types.weight_sync import WeightPublication, WeightSyncSelection
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -318,6 +319,62 @@ class AsyncTrainingClient:
         )
         return await handle.result() if wait else handle
 
+    async def publish_weights(
+        self,
+        sampling_client: "AsyncSamplingClient",
+        *,
+        version: str,
+        base_version: str | None = None,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        transaction_id: str | None = None,
+    ) -> WeightPublication:
+        """Async twin of the backend-neutral publication.
+
+        See :meth:`weaver.training_client.TrainingClient.publish_weights` for
+        the contract.
+        """
+
+        if getattr(sampling_client, "_service", None) is not self._service:
+            raise ValueError("sampling client belongs to another Weaver service")
+        if sampling_client.model_id != self.model_id:
+            raise ValueError("sampling client is not bound to this training model")
+        selection = getattr(sampling_client, "weight_sync", None) or WeightSyncSelection()
+        if selection.is_live_collective:
+            receipt = await self._publish_live_weights(
+                sampling_client,
+                expected_weight_version=(
+                    base_version or getattr(sampling_client, "weight_version", None) or "v0"
+                ),
+                proposed_weight_version=version,
+                transaction_id=transaction_id,
+                checksum_mode="sha256" if selection.debug_checksum else "off",
+                wait=True,
+            )
+            assert isinstance(receipt, NCCLWeightSyncV1Result)
+            sampling_client.weight_version = receipt.committed_weight_version
+            return WeightPublication(
+                backend=selection.backend,
+                update=selection.update,
+                version=receipt.committed_weight_version,
+                base_version=receipt.expected_weight_version,
+                sampling_session_id=sampling_client.sampling_session_id,
+                nccl=receipt,
+            )
+        if base_version is not None:
+            raise ValueError(
+                f"backend={selection.backend!r} resolves its own base version in the "
+                "control plane; base_version is only accepted for the live collective"
+            )
+        model_path = await self.save_weights_for_sampler(name=version, ttl_seconds=ttl_seconds)
+        sampling_client.weight_version = version
+        return WeightPublication(
+            backend=selection.backend,
+            update=selection.update,
+            version=version,
+            sampling_session_id=sampling_client.sampling_session_id,
+            model_path=str(model_path),
+        )
+
     @overload
     async def publish_live_weights_to_sampler_nccl_v1(
         self,
@@ -352,7 +409,35 @@ class AsyncTrainingClient:
         checksum_mode: str = "off",
         wait: bool = True,
     ) -> NCCLWeightSyncV1Result | AsyncOperationHandle:
-        """Async twin of the explicit control-only NCCL-v1 publication."""
+        """Async twin of the live-collective compatibility entry point."""
+
+        selection = getattr(sampling_client, "weight_sync", None)
+        if selection is not None and not selection.is_live_collective:
+            raise ValueError(
+                "this sampling session was created with "
+                f"backend={selection.backend!r}; publishing live weights would "
+                "silently use a transport the session was not configured for"
+            )
+        return await self._publish_live_weights(
+            sampling_client,
+            expected_weight_version=expected_weight_version,
+            proposed_weight_version=proposed_weight_version,
+            transaction_id=transaction_id,
+            checksum_mode=checksum_mode,
+            wait=wait,
+        )
+
+    async def _publish_live_weights(
+        self,
+        sampling_client: "AsyncSamplingClient",
+        *,
+        expected_weight_version: str,
+        proposed_weight_version: str,
+        transaction_id: str | None,
+        checksum_mode: str,
+        wait: bool,
+    ) -> NCCLWeightSyncV1Result | AsyncOperationHandle:
+        """Run one live-collective transaction."""
 
         if getattr(sampling_client, "_service", None) is not self._service:
             raise ValueError("sampling client belongs to another Weaver service")

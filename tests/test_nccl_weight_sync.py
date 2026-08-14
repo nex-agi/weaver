@@ -23,12 +23,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from weaver._payloads import (
-    nccl_v1_sampling_session_payload,
     publish_live_weights_nccl_v1_payload,
+    sampling_session_payload,
 )
 from weaver.async_training_client import AsyncTrainingClient
 from weaver.training_client import TrainingClient
 from weaver.types.nccl_weight_sync import NCCLWeightSyncV1Result
+from weaver.types.weight_sync import WeightSyncSelection
 
 TRANSACTION = "11111111-1111-4111-8111-111111111111"
 GENERATION = "target-generation-1"
@@ -90,8 +91,11 @@ def _operation_response(**updates):
 
 
 def test_control_payload_has_no_checkpoint_or_weight_bytes() -> None:
-    session = nccl_v1_sampling_session_payload(
-        sampling_session_seq_id=1, base_model="supported/model", model_id="model-1"
+    session = sampling_session_payload(
+        sampling_session_seq_id=1,
+        selection=WeightSyncSelection(backend="nccl"),
+        base_model="supported/model",
+        model_id="model-1",
     )
     payload = publish_live_weights_nccl_v1_payload(
         seq_id=2,

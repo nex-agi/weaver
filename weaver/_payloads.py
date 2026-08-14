@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Sequence
 
 from .types import Datum
 from .types.nccl_weight_sync import normalize_nccl_v1_checksum_mode
+from .types.weight_sync import WeightSyncSelection, reported_selection
 
 if TYPE_CHECKING:
     import torch
@@ -45,13 +46,88 @@ def _normalized_nccl_v1_text(name: str, value: object) -> str:
     return value
 
 
-def nccl_v1_sampling_session_payload(
-    *, sampling_session_seq_id: int, base_model: str, model_id: str
-) -> Dict[str, Any]:
-    """Build the explicit model-bound session used by live NCCL-v1.
+def requested_weight_sync(
+    weight_sync: WeightSyncSelection | None,
+    experimental_nccl_weight_sync_v1: bool,
+) -> WeightSyncSelection:
+    """Reconcile the explicit selection with the deprecated boolean.
 
-    There is deliberately no ``model_path`` field: including one would enter
-    Weaver's durable checkpoint/DCP synchronization path.
+    Args:
+        weight_sync: Explicit selection, or ``None``.
+        experimental_nccl_weight_sync_v1: Deprecated flag naming the live
+            collective backend.
+
+    Returns:
+        The selection to create the session under.
+
+    Raises:
+        ValueError: If both are given and name different backends.
+    """
+
+    if weight_sync is None:
+        if experimental_nccl_weight_sync_v1:
+            return WeightSyncSelection(backend="nccl")
+        return WeightSyncSelection()
+    if experimental_nccl_weight_sync_v1 and not weight_sync.is_live_collective:
+        raise ValueError(
+            "experimental_nccl_weight_sync_v1=True contradicts "
+            f"weight_sync.backend={weight_sync.backend!r}; pass only weight_sync"
+        )
+    return weight_sync
+
+
+def resolve_session_weight_sync(
+    requested: WeightSyncSelection, session: object
+) -> WeightSyncSelection:
+    """Bind the selection the control plane froze for a created session.
+
+    Args:
+        requested: What the caller asked for.
+        session: The created sampling-session payload.
+
+    Returns:
+        The control plane's frozen selection when it reports one, otherwise the
+        caller's -- a control plane that reports nothing has made no statement
+        to check against.
+
+    Raises:
+        RuntimeError: If the control plane froze a different selection.
+    """
+
+    reported = reported_selection(session)
+    if reported is None:
+        return requested
+    return requested.assert_matches(reported)
+
+
+def sampling_session_payload(
+    *,
+    sampling_session_seq_id: int,
+    selection: WeightSyncSelection,
+    base_model: str | None = None,
+    model_id: str | None = None,
+    model_path: str | None = None,
+) -> Dict[str, Any]:
+    """Build one sampling-session body carrying its immutable selection.
+
+    The selection travels as a structured object. A control plane that does not
+    understand it ignores the field, so the narrow legacy ``weight_sync_mode``
+    spelling is emitted alongside it for the live-collective backend and the
+    session still binds correctly.
+
+    Args:
+        sampling_session_seq_id: Caller-assigned session sequence number.
+        selection: The weight-sync configuration this session is created under.
+        base_model: Canonical supported-model name.
+        model_id: Training run to bind to, required by the live collective.
+        model_path: Durable checkpoint URI; forbidden by the live collective,
+            which never manufactures a checkpoint.
+
+    Returns:
+        The request body.
+
+    Raises:
+        ValueError: If the arguments cannot satisfy the selected backend.
     """
 
     if (
@@ -60,12 +136,31 @@ def nccl_v1_sampling_session_payload(
         or sampling_session_seq_id <= 0
     ):
         raise ValueError("sampling_session_seq_id must be a positive integer")
-    return {
+    body: Dict[str, Any] = {
         "sampling_session_seq_id": sampling_session_seq_id,
-        "base_model": _normalized_nccl_v1_text("base_model", base_model),
-        "model_id": _normalized_nccl_v1_text("model_id", model_id),
-        "weight_sync_mode": "nccl_v1",
+        "weight_sync": selection.to_payload(),
     }
+    if selection.is_live_collective:
+        if not model_id or not base_model:
+            raise ValueError("live weight sync requires model_id and base_model")
+        if model_path:
+            raise ValueError(
+                "live weight sync forbids model_path: a checkpoint path would enter "
+                "the durable synchronization path this backend exists to avoid"
+            )
+        body["base_model"] = _normalized_nccl_v1_text("base_model", base_model)
+        body["model_id"] = _normalized_nccl_v1_text("model_id", model_id)
+        # Legacy spelling, so a control plane predating the structured
+        # selection still binds this session to the live collective.
+        body["weight_sync_mode"] = "nccl_v1"
+        return body
+    if model_id and not model_path:
+        raise ValueError("model_path is required when model_id is provided")
+    body["base_model"] = base_model
+    body["model_path"] = model_path
+    if model_id:
+        body["model_id"] = model_id
+    return body
 
 
 def publish_live_weights_nccl_v1_payload(

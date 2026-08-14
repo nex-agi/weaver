@@ -25,6 +25,11 @@ from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
+from .types.weight_sync import WeightSyncSelection
+
+#: The live collective serves the disk-loaded base checkpoint as ``v0`` before
+#: any publication, so a session starts already holding a real version.
+INITIAL_LIVE_WEIGHT_VERSION = "v0"
 
 
 class SamplingClient:
@@ -37,6 +42,7 @@ class SamplingClient:
         model_path: str | None = None,
         model_id: str | None = None,
         tokenizer_path: str | None = None,
+        weight_sync: WeightSyncSelection | None = None,
     ) -> None:
         self._service = service
         self.sampling_session_id = sampling_session_id
@@ -45,6 +51,13 @@ class SamplingClient:
         self.model_id = model_id
         self.tokenizer_path = tokenizer_path
         self._tokenizer: PreTrainedTokenizer | None = None
+        # Frozen at session creation by the control plane. It is never
+        # reassigned: the backend a session was created under is the backend it
+        # keeps for its whole life.
+        self.weight_sync = weight_sync or WeightSyncSelection()
+        self.weight_version: str | None = (
+            INITIAL_LIVE_WEIGHT_VERSION if self.weight_sync.is_live_collective else None
+        )
 
     def sample(
         self,

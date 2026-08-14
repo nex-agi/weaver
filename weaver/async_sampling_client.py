@@ -24,7 +24,9 @@ from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle
+from .sampling_client import INITIAL_LIVE_WEIGHT_VERSION
 from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
+from .types.weight_sync import WeightSyncSelection
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -40,6 +42,7 @@ class AsyncSamplingClient:
         model_path: str | None = None,
         model_id: str | None = None,
         tokenizer_path: str | None = None,
+        weight_sync: WeightSyncSelection | None = None,
     ) -> None:
         self._service = service
         self.sampling_session_id = sampling_session_id
@@ -48,6 +51,11 @@ class AsyncSamplingClient:
         self.model_id = model_id
         self.tokenizer_path = tokenizer_path
         self._tokenizer: PreTrainedTokenizer | None = None
+        # Frozen at session creation by the control plane; never reassigned.
+        self.weight_sync = weight_sync or WeightSyncSelection()
+        self.weight_version: str | None = (
+            INITIAL_LIVE_WEIGHT_VERSION if self.weight_sync.is_live_collective else None
+        )
 
     @overload
     async def sample(

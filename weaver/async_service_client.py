@@ -77,10 +77,16 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, 
 
 from . import __version__
 from ._async_http import AsyncAPIClient
+from ._payloads import requested_weight_sync as _requested_weight_sync
+from ._payloads import (
+    resolve_session_weight_sync,
+    sampling_session_payload,
+)
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import WeaverConfig
 from .operations import AsyncOperationHandle, build_async_operation_handle
 from .types import LoraConfig
+from .types.weight_sync import WeightSyncSelection
 
 if TYPE_CHECKING:
     from .async_sampling_client import AsyncSamplingClient
@@ -450,40 +456,23 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         sampling_session_id: Optional[str] = None,
         model_id: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        weight_sync: Optional[WeightSyncSelection] = None,
         experimental_nccl_weight_sync_v1: bool = False,
     ) -> "AsyncSamplingClient":
         from .async_sampling_client import AsyncSamplingClient  # local import to avoid cycles
 
         await self._ensure_connected()
+        requested = _requested_weight_sync(weight_sync, experimental_nccl_weight_sync_v1)
+        resolved = requested
         if sampling_session_id is None:
-            if experimental_nccl_weight_sync_v1:
-                if not model_id or not base_model:
-                    raise ValueError(
-                        "experimental NCCL-v1 sampling requires model_id and base_model"
-                    )
-                if model_path:
-                    raise ValueError(
-                        "experimental NCCL-v1 sampling forbids model_path/DCP synchronization"
-                    )
-                seq_id = sampling_session_seq_id or self._next_sampling_seq()
-                from ._payloads import nccl_v1_sampling_session_payload
-
-                body = nccl_v1_sampling_session_payload(
-                    sampling_session_seq_id=seq_id,
-                    base_model=base_model,
-                    model_id=model_id,
-                )
-            else:
-                if model_id and not model_path:
-                    raise ValueError("model_path is required when model_id is provided")
-                seq_id = sampling_session_seq_id or self._next_sampling_seq()
-                body = {
-                    "sampling_session_seq_id": seq_id,
-                    "base_model": base_model,
-                    "model_path": model_path,
-                }
-                if model_id:
-                    body["model_id"] = model_id
+            seq_id = sampling_session_seq_id or self._next_sampling_seq()
+            body = sampling_session_payload(
+                sampling_session_seq_id=seq_id,
+                selection=requested,
+                base_model=base_model,
+                model_id=model_id,
+                model_path=model_path,
+            )
 
             resp = await self.http.post(
                 f"/api/v1/sessions/{self.session_id}/sampling-sessions",
@@ -508,6 +497,7 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
                 session = resp
 
             sampling_session_id = extract_id(session)
+            resolved = resolve_session_weight_sync(requested, session)
             if tokenizer_path is None:
                 tokenizer_path = lookup_case_insensitive(session, "tokenizer_path")
             if tokenizer_path is None and base_model:
@@ -524,6 +514,7 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             model_path=model_path,
             model_id=model_id,
             tokenizer_path=tokenizer_path,
+            weight_sync=resolved,
         )
 
     async def get_sampling_client(
