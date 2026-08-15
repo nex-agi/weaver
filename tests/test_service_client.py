@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from weaver.operations import OperationHandle
 from weaver.service_client import ServiceClient
 
 
@@ -148,6 +149,29 @@ def test_create_model_passes_debug_info():
     assert training.debug_info == debug_info
     assert training.debug_info["kubectl_exec"].startswith("kubectl exec")
     assert training.model_id == "abc-123"
+
+
+def test_create_sampling_client_deletes_session_when_sync_wait_fails(monkeypatch):
+    client = ServiceClient(api_key="sk-test-key")
+    client._session_id = "session-1"
+    client._http = MagicMock()
+    client._http.post.return_value = {
+        "sampling_session": {"id": "sampling-1"},
+        "sync_operation": {"id": "operation-1", "status": "pending"},
+    }
+    monkeypatch.setattr(
+        OperationHandle,
+        "wait",
+        MagicMock(side_effect=KeyboardInterrupt),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        client.create_sampling_client(
+            base_model="Qwen/Qwen3.5-9B-Base:262144",
+            model_path="weaver://model/checkpoints/step-1",
+        )
+
+    client._http.delete.assert_called_once_with("/api/v1/sampling-sessions/sampling-1")
 
 
 def _build_atexit_script(marker_path: str, exit_code: str = "") -> str:
