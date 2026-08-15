@@ -45,7 +45,7 @@ def test_backend_and_update_are_independent_dimensions():
     assert set(WEIGHT_SYNC_UPDATES) == {"full", "delta"}
     for backend in WEIGHT_SYNC_BACKENDS:
         for update in WEIGHT_SYNC_UPDATES:
-            if (backend, update) == ("mooncake", "delta"):
+            if (backend, update) in (("mooncake", "delta"), ("nccl", "delta")):
                 continue
             selection = WeightSyncSelection(backend=backend, update=update)
             assert (selection.backend, selection.update) == (backend, update)
@@ -59,10 +59,12 @@ def test_qualified_combinations_are_accepted(backend, update):
     assert WeightSyncSelection(backend=backend, update=update).update == update
 
 
-def test_nccl_delta_is_qualified():
-    selection = WeightSyncSelection(backend="nccl", update="delta")
-    assert selection.is_live_collective
-    assert selection.is_delta
+def test_collective_delta_is_refused_until_it_exists():
+    # Accepting it would run the FULL collective publication while reporting a
+    # delta update. Removed when detection, encoding, transfer and target
+    # application all exist.
+    with pytest.raises(ValueError, match="not implemented yet"):
+        WeightSyncSelection(backend="nccl", update="delta")
 
 
 def test_mooncake_delta_is_refused_with_the_exact_capability_reason():
@@ -104,33 +106,24 @@ def test_debug_checksum_is_off_by_default_and_scoped_to_the_verifying_backend():
 
 
 def test_rebaseline_interval_is_scoped_to_the_collective_delta_path():
-    assert (
-        WeightSyncSelection(
-            backend="nccl", update="delta", rebaseline_interval=8
-        ).rebaseline_interval
-        == 8
-    )
+    # Its one valid combination is unimplemented, so it cannot be set at all yet.
+    with pytest.raises(ValueError, match="not implemented yet"):
+        WeightSyncSelection(backend="nccl", update="delta", rebaseline_interval=8)
     # The durable-checkpoint delta path re-baselines on accumulated byte drift
     # and keeps its own knobs; it must not be steered through this field.
     with pytest.raises(ValueError, match="rebaseline_interval applies only"):
         WeightSyncSelection(backend="default", update="delta", rebaseline_interval=8)
     with pytest.raises(ValueError, match="rebaseline_interval applies only"):
         WeightSyncSelection(backend="nccl", update="full", rebaseline_interval=8)
-    for bad in (0, -1, True, 1.5):
-        with pytest.raises(ValueError):
-            WeightSyncSelection(backend="nccl", update="delta", rebaseline_interval=bad)
 
 
 def test_payload_round_trip():
-    selection = WeightSyncSelection(
-        backend="nccl", update="delta", debug_checksum=True, rebaseline_interval=4
-    )
+    selection = WeightSyncSelection(backend="nccl", update="full", debug_checksum=True)
     payload = selection.to_payload()
     assert payload == {
         "backend": "nccl",
-        "update": "delta",
+        "update": "full",
         "debug_checksum": True,
-        "rebaseline_interval": 4,
     }
     assert WeightSyncSelection.from_payload(payload) == selection
     # An unset interval is omitted rather than sent as null.
@@ -138,9 +131,9 @@ def test_payload_round_trip():
 
 
 def test_from_payload_reads_the_nested_session_selection():
-    session = {"id": "s-1", "weight_sync": {"backend": "nccl", "update": "delta"}}
+    session = {"id": "s-1", "weight_sync": {"backend": "default", "update": "delta"}}
     selection = WeightSyncSelection.from_payload(session)
-    assert (selection.backend, selection.update) == ("nccl", "delta")
+    assert (selection.backend, selection.update) == ("default", "delta")
 
 
 def test_from_payload_accepts_a_control_plane_without_a_structured_selection():
@@ -163,8 +156,8 @@ def test_from_payload_rejects_a_selection_this_sdk_cannot_represent():
 
 
 def test_assert_matches_binds_the_control_plane_value_when_they_agree():
-    requested = WeightSyncSelection(backend="nccl", update="delta")
-    resolved = WeightSyncSelection(backend="nccl", update="delta", rebaseline_interval=16)
+    requested = WeightSyncSelection(backend="default", update="delta")
+    resolved = WeightSyncSelection(backend="default", update="delta")
     # The caller left the interval unset, so the control plane's value stands.
     assert requested.assert_matches(resolved) is resolved
 
@@ -178,8 +171,8 @@ def test_assert_matches_refuses_a_silently_different_backend():
 
 def test_assert_matches_refuses_a_silently_different_update_or_checksum():
     with pytest.raises(RuntimeError, match="update: requested 'delta'"):
-        WeightSyncSelection(backend="nccl", update="delta").assert_matches(
-            WeightSyncSelection(backend="nccl", update="full")
+        WeightSyncSelection(backend="default", update="delta").assert_matches(
+            WeightSyncSelection(backend="default", update="full")
         )
     with pytest.raises(RuntimeError, match="debug_checksum: requested True"):
         WeightSyncSelection(backend="nccl", debug_checksum=True).assert_matches(
@@ -188,7 +181,8 @@ def test_assert_matches_refuses_a_silently_different_update_or_checksum():
 
 
 def test_assert_matches_compares_an_explicitly_requested_interval():
-    with pytest.raises(RuntimeError, match="rebaseline_interval: requested 4"):
-        WeightSyncSelection(backend="nccl", update="delta", rebaseline_interval=4).assert_matches(
-            WeightSyncSelection(backend="nccl", update="delta", rebaseline_interval=16)
-        )
+    # rebaseline_interval only exists on the unimplemented collective delta
+    # path, so this comparison is exercised through the shared code path.
+    requested = WeightSyncSelection(backend="nccl")
+    with pytest.raises(RuntimeError, match="debug_checksum"):
+        WeightSyncSelection(backend="nccl", debug_checksum=True).assert_matches(requested)

@@ -61,6 +61,14 @@ _UNSUPPORTED_COMBINATIONS = {
         "the mooncake backend uploads whole checkpoint shards verbatim and has "
         "no delta producer; use backend='default' for delta, or update='full'"
     ),
+    # Accepting this today would run the FULL collective publication while
+    # reporting a delta update. Change detection, fragment encoding, transfer
+    # and target application do not exist yet.
+    ("nccl", "delta"): (
+        "collective delta is not implemented yet: change detection, fragment "
+        "encoding, transfer and target application are all missing, so this run "
+        "would silently publish a full update"
+    ),
 }
 
 #: Backends whose transport can verify payload integrity on demand. The debug

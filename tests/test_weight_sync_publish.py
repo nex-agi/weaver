@@ -296,13 +296,13 @@ def test_a_failed_target_sync_fails_session_creation(monkeypatch):
 def test_session_body_carries_the_selection_and_the_legacy_spelling():
     body = sampling_session_payload(
         sampling_session_seq_id=1,
-        selection=WeightSyncSelection(backend="nccl", update="delta"),
+        selection=WeightSyncSelection(backend="nccl", update="full"),
         base_model="supported/model",
         model_id="model-1",
     )
     assert body["weight_sync"] == {
         "backend": "nccl",
-        "update": "delta",
+        "update": "full",
         "debug_checksum": False,
     }
     assert body["weight_sync_mode"] == "nccl_v1"
@@ -337,7 +337,7 @@ def test_live_collective_session_refuses_a_checkpoint_path():
 def test_deprecated_flag_maps_to_the_live_collective_backend():
     assert requested_weight_sync(None, True) == WeightSyncSelection(backend="nccl")
     assert requested_weight_sync(None, False) == WeightSyncSelection()
-    explicit = WeightSyncSelection(backend="nccl", update="delta")
+    explicit = WeightSyncSelection(backend="nccl", debug_checksum=True)
     assert requested_weight_sync(explicit, True) is explicit
 
 
