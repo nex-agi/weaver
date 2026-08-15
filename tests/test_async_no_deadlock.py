@@ -23,6 +23,7 @@ deadlock or an accidental blocking call FAILS the test instead of hanging.
 
 import asyncio
 import json
+import os
 import re
 import threading
 from collections import defaultdict
@@ -102,6 +103,14 @@ class _Handler(BaseHTTPRequestHandler):
 @pytest.fixture()
 def server(monkeypatch):
     monkeypatch.setenv("WEAVER_OPERATION_POLL_INTERVAL", "0.02")
+    # The real-socket fixture must never traverse a developer/CI HTTP proxy.
+    # Some environments define NO_PROXY but omit loopback addresses, which
+    # turns this liveness test into a proxy load test and produces spurious
+    # 502 responses under its 200-request burst.
+    no_proxy = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
+    loopback_no_proxy = ",".join(part for part in (no_proxy, "127.0.0.1", "localhost") if part)
+    monkeypatch.setenv("NO_PROXY", loopback_no_proxy)
+    monkeypatch.setenv("no_proxy", loopback_no_proxy)
     _Handler.reset()
     httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)

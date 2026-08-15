@@ -17,12 +17,13 @@
 from __future__ import annotations
 
 from typing import Any, Dict
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from weaver._utils import DEFAULT_SAMPLER_TTL_SECONDS
-from weaver.operations import OperationHandle
+from weaver.async_training_client import AsyncTrainingClient
+from weaver.operations import AsyncOperationHandle, OperationHandle
 from weaver.training_client import TrainingClient
 from weaver.types.checkpoint import Checkpoint
 
@@ -48,6 +49,19 @@ def _make_handle(result: Dict[str, Any] | None = None) -> MagicMock:
     handle = MagicMock(spec=OperationHandle)
     handle.result.return_value = result
     return handle
+
+
+def _make_async_training_client() -> AsyncTrainingClient:
+    service = MagicMock()
+    service.next_operation_seq.return_value = 1
+    service.enqueue_operation = AsyncMock()
+    service.http.get = AsyncMock()
+    return AsyncTrainingClient(
+        service=service,
+        model_id="mdl-123",
+        base_model="Qwen/Qwen3-8B",
+        session_id="sess-abc",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +136,70 @@ class TestSaveState:
 
         assert result is handle
         handle.result.assert_not_called()
+
+    def test_save_state_recovers_checkpoint_when_operation_projection_races(self):
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
+        tc._service.http.get.return_value = {
+            "items": [
+                {
+                    "id": "ckpt-race",
+                    "path": "weaver://mdl-123/checkpoints/step-race",
+                    "name": "step-race",
+                    "type": "weight",
+                    "status": "completed",
+                }
+            ]
+        }
+
+        checkpoint = tc.save_state(name="step-race")
+
+        assert checkpoint.id == "ckpt-race"
+        assert checkpoint.path == "weaver://mdl-123/checkpoints/step-race"
+
+    def test_save_state_never_returns_an_empty_checkpoint(self):
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
+        tc._service.http.get.return_value = {"items": []}
+
+        with pytest.raises(RuntimeError, match="returned no checkpoint metadata"):
+            tc.save_state(name="missing")
+
+
+class TestAsyncSaveState:
+    @pytest.mark.asyncio
+    async def test_recovers_checkpoint_when_operation_projection_races(self):
+        tc = _make_async_training_client()
+        handle = MagicMock(spec=AsyncOperationHandle)
+        handle.result = AsyncMock(return_value={"saved": True})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.get.return_value = {
+            "items": [
+                {
+                    "id": "ckpt-race",
+                    "path": "weaver://mdl-123/checkpoints/step-race",
+                    "name": "step-race",
+                    "type": "weight",
+                    "status": "completed",
+                }
+            ]
+        }
+
+        checkpoint = await tc.save_state(name="step-race")
+
+        assert checkpoint.id == "ckpt-race"
+        assert checkpoint.path == "weaver://mdl-123/checkpoints/step-race"
+
+    @pytest.mark.asyncio
+    async def test_never_returns_an_empty_checkpoint(self):
+        tc = _make_async_training_client()
+        handle = MagicMock(spec=AsyncOperationHandle)
+        handle.result = AsyncMock(return_value={"saved": True})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.get.return_value = {"items": []}
+
+        with pytest.raises(RuntimeError, match="returned no checkpoint metadata"):
+            await tc.save_state(name="missing")
 
 
 # ---------------------------------------------------------------------------

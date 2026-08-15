@@ -22,11 +22,7 @@ from datetime import datetime, timezone
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
-from ._artifacts import (
-    DEFAULT_EXPORT_TTL_SECONDS,
-    is_artifact_payload,
-    validate_resource_id,
-)
+from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
@@ -565,7 +561,26 @@ class TrainingClient:
         if not wait:
             return handle
         result = handle.result()
-        return Checkpoint.from_payload(result if isinstance(result, dict) else {})
+        checkpoint = Checkpoint.from_payload(result if isinstance(result, dict) else {})
+        if checkpoint.id and checkpoint.path:
+            return checkpoint
+
+        # A task-completion poll can observe the operation's terminal status in
+        # the narrow window before the server replaces the trainer's raw result
+        # with the public checkpoint projection.  The checkpoint row already
+        # exists, so recover it from the model-scoped listing instead of
+        # silently returning Checkpoint(id="", path="").
+        for candidate in self.list_checkpoints():
+            if name is not None and candidate.name != name:
+                continue
+            if candidate.checkpoint_type != checkpoint_type:
+                continue
+            if candidate.id and candidate.path:
+                return candidate
+        raise RuntimeError(
+            "Save completed but the server returned no checkpoint metadata "
+            "and the checkpoint could not be recovered from the model listing"
+        )
 
     @overload
     def load_state(
