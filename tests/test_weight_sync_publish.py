@@ -12,16 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""One caller publishes weights through whichever backend was configured."""
+"""Publication reaches the inference target, or it is not a publication.
+
+The two backends have materially different session lifecycles:
+
+* the checkpoint backends export a checkpoint and then bind a **new** sampling
+  session to it; the server's ``sync_weights`` operation behind that session is
+  what actually loads the weights into the engine;
+* the live collective updates the **existing** session's target in place and
+  returns a receipt only after the target committed.
+
+These tests hold each path to its own real sequence. Exporting a checkpoint is
+explicitly *not* treated as having published anything.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from weaver._http import WeaverAPIError
 from weaver._payloads import (
     requested_weight_sync,
     resolve_session_weight_sync,
@@ -29,10 +41,11 @@ from weaver._payloads import (
 )
 from weaver.async_training_client import AsyncTrainingClient
 from weaver.training_client import TrainingClient
-from weaver.types.weight_sync import WeightPublication, WeightSyncSelection
+from weaver.types.weight_sync import WeightSyncSelection
 
 TRANSACTION = "11111111-1111-4111-8111-111111111111"
 SESSION = "22222222-2222-4222-8222-222222222222"
+NEXT_SESSION = "33333333-3333-4333-8333-333333333333"
 
 
 def _live_receipt(expected: str, committed: str) -> dict:
@@ -92,151 +105,86 @@ def _trainer(service):
     )
 
 
-def _sampler(service, selection, *, version=None):
-    return SimpleNamespace(
-        _service=service,
-        model_id="model-1",
-        model_path=None,
+def _sampler(service, selection=None):
+    from weaver.sampling_client import SamplingClient
+
+    return SamplingClient(
+        service=service,
         sampling_session_id=SESSION,
-        weight_sync=selection,
-        weight_version=version or ("v0" if selection.is_live_collective else None),
+        base_model="supported/model",
+        model_id="model-1",
+        weight_sync=selection or WeightSyncSelection(backend="nccl"),
     )
 
 
-def _enqueued_paths(service):
-    return [call.args[0] for call in service.enqueue_operation.call_args_list]
+# --- the live collective updates the existing session in place --------------
 
 
-# --- the same call, three configured backends -------------------------------
-
-
-def test_live_collective_backend_publishes_over_the_collective():
+def test_a_committed_receipt_is_what_advances_the_session_version():
     service = _service(_live_receipt("v0", "v1"))
-    sampler = _sampler(service, WeightSyncSelection(backend="nccl"))
-
-    published = _trainer(service).publish_weights(sampler, version="v1", transaction_id=TRANSACTION)
-
-    assert isinstance(published, WeightPublication)
-    assert (published.backend, published.update) == ("nccl", "full")
-    assert (published.version, published.base_version) == ("v1", "v0")
-    assert published.model_path is None and published.nccl is not None
-    paths = _enqueued_paths(service)
-    assert paths == ["/api/v1/models/model-1/publish-live-weights-nccl-v1"]
-    # No checkpoint was exported on the way.
-    assert not any("export-sampler" in path for path in paths)
-
-
-def test_default_backend_publishes_through_the_established_checkpoint_export():
-    service = _service({"model_path": "weaver://model-1/checkpoints/v1"})
-    sampler = _sampler(service, WeightSyncSelection())
-
-    published = _trainer(service).publish_weights(sampler, version="v1")
-
-    assert (published.backend, published.update) == ("default", "full")
-    assert published.version == "v1"
-    assert published.model_path == "weaver://model-1/checkpoints/v1"
-    assert published.nccl is None
-    paths = _enqueued_paths(service)
-    assert paths == ["/api/v1/models/model-1/export-sampler"]
-    # The unchanged export body: the version is the checkpoint name.
-    assert service.enqueue_operation.call_args.args[1]["path"] == "v1"
-    # ...and nothing reached the live collective.
-    assert not any("publish-live-weights" in path for path in paths)
-
-
-def test_mooncake_backend_uses_the_same_export_operation():
-    service = _service({"model_path": "weaver://model-1/checkpoints/v1"})
-    sampler = _sampler(service, WeightSyncSelection(backend="mooncake"))
-
-    published = _trainer(service).publish_weights(sampler, version="v1")
-
-    assert published.backend == "mooncake"
-    assert _enqueued_paths(service) == ["/api/v1/models/model-1/export-sampler"]
-
-
-def test_default_backend_with_delta_still_uses_the_established_export():
-    # The update dimension does not change which operation the SDK issues; the
-    # control plane and trainer decide full-vs-delta downstream, unchanged.
-    service = _service({"model_path": "weaver://model-1/checkpoints/v1"})
-    sampler = _sampler(service, WeightSyncSelection(update="delta"))
-
-    published = _trainer(service).publish_weights(sampler, version="v1")
-
-    assert (published.backend, published.update) == ("default", "delta")
-    assert _enqueued_paths(service) == ["/api/v1/models/model-1/export-sampler"]
-
-
-# --- lineage ----------------------------------------------------------------
-
-
-def test_live_collective_tracks_the_committed_version_across_publications():
-    service = _service(_live_receipt("v0", "v1"))
-    sampler = _sampler(service, WeightSyncSelection(backend="nccl"))
-    trainer = _trainer(service)
-
+    sampler = _sampler(service)
     assert sampler.weight_version == "v0"
-    trainer.publish_weights(sampler, version="v1", transaction_id=TRANSACTION)
-    assert sampler.weight_version == "v1"
 
-    # The caller never restates the base: the next publication advances from
-    # the version the target actually committed.
-    service.enqueue_operation.return_value.result.return_value = _live_receipt("v1", "v2")
-    trainer.publish_weights(sampler, version="v2", transaction_id=TRANSACTION)
-    assert sampler.weight_version == "v2"
-    assert service.enqueue_operation.call_args.args[1]["expected_weight_version"] == "v1"
-
-
-def test_explicit_base_version_is_honoured_by_the_live_collective():
-    service = _service(_live_receipt("v3", "v4"))
-    sampler = _sampler(service, WeightSyncSelection(backend="nccl"), version="v3")
-
-    _trainer(service).publish_weights(
-        sampler, version="v4", base_version="v3", transaction_id=TRANSACTION
+    receipt = _trainer(service).publish_live_weights_to_sampler_nccl_v1(
+        sampler,
+        expected_weight_version="v0",
+        proposed_weight_version="v1",
+        transaction_id=TRANSACTION,
     )
 
-    assert service.enqueue_operation.call_args.args[1]["expected_weight_version"] == "v3"
+    assert receipt.committed_weight_version == "v1"
+    assert sampler.weight_version == "v1"
+    # The same session keeps serving; nothing was exported.
+    assert sampler.sampling_session_id == SESSION
+    paths = [call.args[0] for call in service.enqueue_operation.call_args_list]
+    assert paths == ["/api/v1/models/model-1/publish-live-weights-nccl-v1"]
 
 
-@pytest.mark.parametrize("backend", ["default", "mooncake"])
-def test_base_version_is_refused_where_the_control_plane_owns_the_lineage(backend):
-    service = _service({"model_path": "weaver://model-1/checkpoints/v1"})
-    sampler = _sampler(service, WeightSyncSelection(backend=backend))
-
-    with pytest.raises(ValueError, match="resolves its own base version"):
-        _trainer(service).publish_weights(sampler, version="v1", base_version="v0")
-    service.enqueue_operation.assert_not_called()
-
-
-def test_debug_checksum_selection_reaches_the_transaction():
+def test_a_failed_publication_leaves_the_session_version_untouched():
     service = _service(_live_receipt("v0", "v1"))
-    sampler = _sampler(service, WeightSyncSelection(backend="nccl", debug_checksum=True))
-    receipt = _live_receipt("v0", "v1")
-    receipt["checksum_algorithm"] = "sha256"
-    receipt["checksum_verified_tensor_count"] = 4
-    receipt["checksum_aggregate_digest"] = "sha256:" + "d" * 64
-    service.enqueue_operation.return_value.result.return_value = receipt
+    service.enqueue_operation.return_value.result.side_effect = WeaverAPIError(
+        500, "publish_failed", "target never committed", True
+    )
+    sampler = _sampler(service)
 
-    _trainer(service).publish_weights(sampler, version="v1", transaction_id=TRANSACTION)
+    with pytest.raises(WeaverAPIError):
+        _trainer(service).publish_live_weights_to_sampler_nccl_v1(
+            sampler,
+            expected_weight_version="v0",
+            proposed_weight_version="v1",
+            transaction_id=TRANSACTION,
+        )
 
-    assert service.enqueue_operation.call_args.args[1]["checksum_mode"] == "sha256"
+    # No commit, no advance.
+    assert sampler.weight_version == "v0"
 
 
-def test_checksum_is_off_by_default_for_the_live_collective():
+def test_a_receipt_for_another_transaction_does_not_advance_the_version():
     service = _service(_live_receipt("v0", "v1"))
-    sampler = _sampler(service, WeightSyncSelection(backend="nccl"))
+    sampler = _sampler(service)
+    with pytest.raises(RuntimeError, match="transaction differs from request"):
+        _trainer(service).publish_live_weights_to_sampler_nccl_v1(
+            sampler,
+            expected_weight_version="v0",
+            proposed_weight_version="v1",
+            transaction_id="44444444-4444-4444-8444-444444444444",
+        )
+    assert sampler.weight_version == "v0"
 
-    _trainer(service).publish_weights(sampler, version="v1", transaction_id=TRANSACTION)
 
-    assert service.enqueue_operation.call_args.args[1]["checksum_mode"] == "off"
+def test_the_frozen_selection_is_not_publicly_assignable():
+    sampler = _sampler(_service(_live_receipt("v0", "v1")))
+    # "Frozen" has to mean caller code cannot change the transport a session
+    # runs on, not merely that the SDK chooses not to.
+    with pytest.raises(AttributeError):
+        sampler.weight_sync = WeightSyncSelection()
+    with pytest.raises(AttributeError):
+        sampler.weight_version = "v9"
 
 
-# --- the compatibility wrapper ---------------------------------------------
-
-
-def test_compat_wrapper_refuses_a_session_frozen_on_another_backend():
+def test_publishing_live_weights_is_refused_on_a_checkpoint_session():
     service = _service(_live_receipt("v0", "v1"))
     sampler = _sampler(service, WeightSyncSelection())
-
     with pytest.raises(ValueError, match="was created with backend='default'"):
         _trainer(service).publish_live_weights_to_sampler_nccl_v1(
             sampler, expected_weight_version="v0", proposed_weight_version="v1"
@@ -244,21 +192,105 @@ def test_compat_wrapper_refuses_a_session_frozen_on_another_backend():
     service.enqueue_operation.assert_not_called()
 
 
-def test_compat_wrapper_still_serves_a_live_collective_session():
-    service = _service(_live_receipt("v0", "v1"))
-    sampler = _sampler(service, WeightSyncSelection(backend="nccl"))
+def test_a_checkpoint_session_tracks_no_weight_version():
+    # It is bound to one checkpoint at creation and is not updated in place, so
+    # there is no version for the client to advance.
+    assert _sampler(_service({}), WeightSyncSelection()).weight_version is None
 
-    result = _trainer(service).publish_live_weights_to_sampler_nccl_v1(
-        sampler,
-        expected_weight_version="v0",
-        proposed_weight_version="v1",
-        transaction_id=TRANSACTION,
+
+# --- the checkpoint backends bind a new session, and the server syncs it ----
+
+
+def _session_service(session_response):
+    service = MagicMock()
+    service.next_operation_seq.return_value = 3
+    export_handle = MagicMock()
+    export_handle.result.return_value = {"model_path": "weaver://model-1/checkpoints/v1"}
+    service.enqueue_operation.return_value = export_handle
+    service.http.post.return_value = session_response
+    service.session_id = "session-1"
+    service._next_sampling_seq.return_value = 2
+    service.get_supported_model_config.return_value = None
+    return service
+
+
+def test_exporting_a_checkpoint_does_not_reach_the_target():
+    # This is the trap: /export-sampler completes the checkpoint export and
+    # returns its path. It updates no engine, so nothing about it constitutes a
+    # publication.
+    service = _service({"model_path": "weaver://model-1/checkpoints/v1"})
+    path = _trainer(service).save_weights_for_sampler(name="v1")
+    assert path == "weaver://model-1/checkpoints/v1"
+    paths = [call.args[0] for call in service.enqueue_operation.call_args_list]
+    assert paths == ["/api/v1/models/model-1/export-sampler"]
+    # Nothing about a sampling session, a router push, or a served version.
+    assert not service.http.post.called
+
+
+def test_binding_a_new_session_is_what_awaits_the_target_update(monkeypatch):
+    # The server answers session creation with 202 + a sync_weights operation;
+    # the SDK must await that operation, because it is the step that loads the
+    # weights into the engine.
+    from weaver import service_client as sc
+
+    awaited = []
+
+    class _SyncHandle:
+        operation_id = "sync-op-1"
+
+        def wait(self):
+            awaited.append("waited")
+            return {"status": "done"}
+
+    monkeypatch.setattr(
+        sc.OperationHandle, "from_payload", classmethod(lambda cls, http, payload: _SyncHandle())
     )
+    service = _session_service(
+        {
+            "sampling_session": {"ID": NEXT_SESSION, "tokenizer_path": "/models/x"},
+            "sync_operation": {"id": "sync-op-1"},
+        }
+    )
+    client = sc.ServiceClient.create_sampling_client(
+        service,
+        base_model="supported/model",
+        model_path="weaver://model-1/checkpoints/v1",
+        model_id="model-1",
+    )
+    assert awaited == ["waited"], "the SDK returned before the target was synced"
+    assert client.sampling_session_id == NEXT_SESSION
 
-    assert result.committed_weight_version == "v1"
+
+def test_a_failed_target_sync_fails_session_creation(monkeypatch):
+    from weaver import service_client as sc
+
+    class _FailingHandle:
+        operation_id = "sync-op-1"
+
+        def wait(self):
+            raise WeaverAPIError(500, "weights_sync_failed", "router push failed", True)
+
+    monkeypatch.setattr(
+        sc.OperationHandle,
+        "from_payload",
+        classmethod(lambda cls, http, payload: _FailingHandle()),
+    )
+    service = _session_service(
+        {
+            "sampling_session": {"ID": NEXT_SESSION},
+            "sync_operation": {"id": "sync-op-1"},
+        }
+    )
+    with pytest.raises(WeaverAPIError, match="router push failed"):
+        sc.ServiceClient.create_sampling_client(
+            service,
+            base_model="supported/model",
+            model_path="weaver://model-1/checkpoints/v1",
+            model_id="model-1",
+        )
 
 
-# --- session creation -------------------------------------------------------
+# --- session creation carries the configured selection ----------------------
 
 
 def test_session_body_carries_the_selection_and_the_legacy_spelling():
@@ -329,8 +361,10 @@ def test_a_control_plane_that_reports_nothing_keeps_the_requested_selection():
 # --- async parity -----------------------------------------------------------
 
 
-def test_async_publish_matches_the_sync_backend_dispatch():
+def test_async_publication_advances_only_on_a_committed_receipt():
     async def exercise():
+        from weaver.async_sampling_client import AsyncSamplingClient
+
         service = MagicMock()
         service.next_operation_seq.return_value = 3
         handle = MagicMock()
@@ -339,45 +373,40 @@ def test_async_publish_matches_the_sync_backend_dispatch():
         trainer = AsyncTrainingClient(
             service=service, model_id="model-1", base_model="supported/model", session_id="s"
         )
-        sampler = _sampler(service, WeightSyncSelection(backend="nccl"))
-        published = await trainer.publish_weights(sampler, version="v1", transaction_id=TRANSACTION)
-        path, _ = service.enqueue_operation.await_args.args
-        return published, path, sampler.weight_version
+        sampler = AsyncSamplingClient(
+            service=service,
+            sampling_session_id=SESSION,
+            model_id="model-1",
+            weight_sync=WeightSyncSelection(backend="nccl"),
+        )
+        receipt = await trainer.publish_live_weights_to_sampler_nccl_v1(
+            sampler,
+            expected_weight_version="v0",
+            proposed_weight_version="v1",
+            transaction_id=TRANSACTION,
+        )
+        return receipt, sampler.weight_version
 
-    published, path, tracked = asyncio.run(exercise())
-    assert published.backend == "nccl" and published.version == "v1"
-    assert path.endswith("/publish-live-weights-nccl-v1")
+    receipt, tracked = asyncio.run(exercise())
+    assert receipt.committed_weight_version == "v1"
     assert tracked == "v1"
 
 
-def test_async_default_backend_uses_the_export_operation():
+def test_async_publication_is_refused_on_a_checkpoint_session():
     async def exercise():
-        service = MagicMock()
-        service.next_operation_seq.return_value = 3
-        handle = MagicMock()
-        handle.result = AsyncMock(return_value={"model_path": "weaver://model-1/checkpoints/v1"})
-        service.enqueue_operation = AsyncMock(return_value=handle)
-        trainer = AsyncTrainingClient(
-            service=service, model_id="model-1", base_model="supported/model", session_id="s"
-        )
-        sampler = _sampler(service, WeightSyncSelection())
-        published = await trainer.publish_weights(sampler, version="v1")
-        path, _ = service.enqueue_operation.await_args.args
-        return published, path
+        from weaver.async_sampling_client import AsyncSamplingClient
 
-    published, path = asyncio.run(exercise())
-    assert published.backend == "default"
-    assert path.endswith("/export-sampler")
-
-
-def test_async_compat_wrapper_refuses_another_backend():
-    async def exercise():
         service = MagicMock()
         service.enqueue_operation = AsyncMock()
         trainer = AsyncTrainingClient(
             service=service, model_id="model-1", base_model="supported/model", session_id="s"
         )
-        sampler = _sampler(service, WeightSyncSelection())
+        sampler = AsyncSamplingClient(
+            service=service,
+            sampling_session_id=SESSION,
+            model_id="model-1",
+            weight_sync=WeightSyncSelection(),
+        )
         with pytest.raises(ValueError, match="was created with backend='default'"):
             await trainer.publish_live_weights_to_sampler_nccl_v1(
                 sampler, expected_weight_version="v0", proposed_weight_version="v1"

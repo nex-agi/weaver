@@ -51,11 +51,41 @@ class AsyncSamplingClient:
         self.model_id = model_id
         self.tokenizer_path = tokenizer_path
         self._tokenizer: PreTrainedTokenizer | None = None
-        # Frozen at session creation by the control plane; never reassigned.
-        self.weight_sync = weight_sync or WeightSyncSelection()
-        self.weight_version: str | None = (
-            INITIAL_LIVE_WEIGHT_VERSION if self.weight_sync.is_live_collective else None
+        # Frozen at session creation by the control plane. Exposed read-only:
+        # a publicly assignable attribute would let caller code change the
+        # transport a session runs on, which is exactly what "frozen" has to
+        # rule out.
+        self._weight_sync = weight_sync or WeightSyncSelection()
+        self._weight_version: str | None = (
+            INITIAL_LIVE_WEIGHT_VERSION if self._weight_sync.is_live_collective else None
         )
+
+    @property
+    def weight_sync(self) -> WeightSyncSelection:
+        """The weight-sync selection this session was created under."""
+
+        return self._weight_sync
+
+    @property
+    def weight_version(self) -> str | None:
+        """The weight version this session's target is known to serve.
+
+        Only the live collective tracks this: its receipt proves the target
+        committed the version. The checkpoint backends bind a session to one
+        checkpoint at creation and are not updated in place, so there is no
+        version for this client to advance.
+        """
+
+        return self._weight_version
+
+    def _bind_committed_weight_version(self, version: str) -> None:
+        """Record a version the target has provably committed.
+
+        Private on purpose: the only caller is the publication path, and only
+        after a receipt that proves the target committed, closed and resumed.
+        """
+
+        self._weight_version = version
 
     @overload
     async def sample(

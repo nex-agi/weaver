@@ -37,7 +37,6 @@ from .service_client import ServiceClient
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.nccl_weight_sync import NCCLWeightSyncV1Result
-from .types.weight_sync import WeightPublication, WeightSyncSelection
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -329,95 +328,6 @@ class TrainingClient:
         )
         return handle.result() if wait else handle
 
-    def publish_weights(
-        self,
-        sampling_client: "SamplingClient",
-        *,
-        version: str,
-        base_version: str | None = None,
-        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
-        transaction_id: str | None = None,
-    ) -> WeightPublication:
-        """Publish one weight version to a sampling session's target.
-
-        The transport is whatever backend the control plane froze for this
-        session, so the same training loop runs against the durable checkpoint
-        path, the RDMA object pool, or the live collective by changing
-        configuration alone. There is no fallback: a backend that cannot
-        complete the publication raises, and no version is committed.
-
-        Args:
-            sampling_client: The session whose target receives the weights.
-            version: Identity of the weights being published. The live
-                collective requires the ``v0``/``v1``/... lineage and advances
-                exactly one step per publication.
-            base_version: The version to publish against. Only the live
-                collective tracks an explicit lineage; the checkpoint-based
-                backends resolve their own base in the control plane, so
-                passing one for them is refused rather than ignored. Defaults
-                to the version the session currently holds.
-            ttl_seconds: Checkpoint retention for the checkpoint-based
-                backends. Not applicable to the live collective.
-            transaction_id: Optional canonical UUID for the live collective's
-                transaction; generated when omitted.
-
-        Returns:
-            The backend-neutral publication receipt.
-
-        Raises:
-            ValueError: If the arguments cannot satisfy the frozen backend.
-            RuntimeError: If the publication does not complete.
-        """
-
-        selection = self._require_bound_sampling_client(sampling_client)
-        if selection.is_live_collective:
-            receipt = self._publish_live_weights(
-                sampling_client,
-                expected_weight_version=(
-                    base_version or getattr(sampling_client, "weight_version", None) or "v0"
-                ),
-                proposed_weight_version=version,
-                transaction_id=transaction_id,
-                checksum_mode="sha256" if selection.debug_checksum else "off",
-                wait=True,
-            )
-            assert isinstance(receipt, NCCLWeightSyncV1Result)
-            # Only advance after the target committed, closed, and resumed.
-            sampling_client.weight_version = receipt.committed_weight_version
-            return WeightPublication(
-                backend=selection.backend,
-                update=selection.update,
-                version=receipt.committed_weight_version,
-                base_version=receipt.expected_weight_version,
-                sampling_session_id=sampling_client.sampling_session_id,
-                nccl=receipt,
-            )
-        if base_version is not None:
-            raise ValueError(
-                f"backend={selection.backend!r} resolves its own base version in the "
-                "control plane; base_version is only accepted for the live collective"
-            )
-        model_path = self.save_weights_for_sampler(name=version, ttl_seconds=ttl_seconds)
-        sampling_client.weight_version = version
-        return WeightPublication(
-            backend=selection.backend,
-            update=selection.update,
-            version=version,
-            sampling_session_id=sampling_client.sampling_session_id,
-            model_path=str(model_path),
-        )
-
-    def _require_bound_sampling_client(
-        self, sampling_client: "SamplingClient"
-    ) -> WeightSyncSelection:
-        """Reject a sampling client that is not this training run's own."""
-
-        if getattr(sampling_client, "_service", None) is not self._service:
-            raise ValueError("sampling client belongs to another Weaver service")
-        if sampling_client.model_id != self.model_id:
-            raise ValueError("sampling client is not bound to this training model")
-        return getattr(sampling_client, "weight_sync", None) or WeightSyncSelection()
-
     @overload
     def publish_live_weights_to_sampler_nccl_v1(
         self,
@@ -454,9 +364,10 @@ class TrainingClient:
     ) -> NCCLWeightSyncV1Result | OperationHandle:
         """Publish live CUDA weights through the live collective backend.
 
-        Compatibility entry point. :meth:`publish_weights` is the intended
-        path: it selects the backend from the session's frozen configuration
-        instead of naming one in the call.
+        The sampling session must have been created for this backend. The
+        session keeps serving the same target across publications, which is
+        why this updates weights in place and returns only after the target
+        has committed the new version.
         """
 
         selection = getattr(sampling_client, "weight_sync", None)
@@ -512,12 +423,18 @@ class TrainingClient:
         )
         if not wait:
             return handle
-        return NCCLWeightSyncV1Result.from_payload(handle.result()).validate_request(
+        receipt = NCCLWeightSyncV1Result.from_payload(handle.result()).validate_request(
             transaction_id=payload["transaction_id"],
             expected_weight_version=payload["expected_weight_version"],
             proposed_weight_version=payload["proposed_weight_version"],
             checksum_mode=payload["checksum_mode"],
         )
+        # Only now: the receipt proves the target committed this version,
+        # closed the transaction and resumed serving.
+        binder = getattr(sampling_client, "_bind_committed_weight_version", None)
+        if binder is not None:
+            binder(receipt.committed_weight_version)
+        return receipt
 
     @overload
     def save_weights_for_sampler(

@@ -40,10 +40,7 @@ never the authority itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Mapping
-
-if TYPE_CHECKING:
-    from .nccl_weight_sync import NCCLWeightSyncV1Result
+from typing import Any, Dict, Mapping
 
 #: Transport backends. ``default`` is the established durable-checkpoint path.
 WEIGHT_SYNC_BACKENDS = ("default", "mooncake", "nccl")
@@ -297,32 +294,3 @@ def reported_selection(value: object) -> WeightSyncSelection | None:
     if isinstance(value.get("weight_sync"), dict) or "weight_sync_mode" in value:
         return WeightSyncSelection.from_payload(value)
     return None
-
-
-@dataclass(frozen=True, slots=True)
-class WeightPublication:
-    """Backend-neutral receipt for one published weight version.
-
-    Every backend answers the same two questions -- which version is now live
-    on the target, and what it was published against -- so an RL loop reads
-    those fields without knowing which transport ran. Backend-specific proof
-    stays in its own field rather than being flattened into the common shape.
-
-    Attributes:
-        backend: The backend that ran, as frozen by the control plane.
-        update: Whether a full or delta update was published.
-        version: The weight version now live on the target.
-        base_version: The version this publication was applied against, when
-            the backend tracks an explicit lineage.
-        sampling_session_id: The session the target serves this version to.
-        model_path: Durable checkpoint URI, for checkpoint-based backends only.
-        nccl: The committed live-collective receipt, for ``nccl`` only.
-    """
-
-    backend: str
-    update: str
-    version: str
-    base_version: str | None = None
-    sampling_session_id: str | None = None
-    model_path: str | None = None
-    nccl: "NCCLWeightSyncV1Result | None" = None
