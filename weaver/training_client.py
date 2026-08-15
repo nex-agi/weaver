@@ -37,6 +37,7 @@ from .service_client import ServiceClient
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.nccl_weight_sync import NCCLWeightSyncV1Result
+from .types.weight_sync import WeightSyncSelection
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -327,6 +328,91 @@ class TrainingClient:
             {"payload": payload},
         )
         return handle.result() if wait else handle
+
+    def publish_weights(
+        self,
+        sampling_client: "SamplingClient",
+        *,
+        version: str,
+        base_version: str | None = None,
+        ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        transaction_id: str | None = None,
+    ) -> "SamplingClient":
+        """Publish one weight version and return the client that serves it.
+
+        One call for every backend, so a training loop moves between them by
+        changing configuration rather than by being rewritten. What differs is
+        real and is not hidden: the checkpoint backends bind a **new** sampling
+        session to the exported checkpoint and the returned client is that new
+        one, while the live collective updates the existing session's target in
+        place and returns the same client with its version advanced. Rebind
+        from the return value and both work::
+
+            sampling = training.publish_weights(sampling, version="v1")
+
+        Nothing is returned until the inference target actually serves the new
+        weights. If the export succeeds but the target sync fails, this raises,
+        no new client exists, and the caller's current client and version are
+        untouched -- so a failed publication cannot be mistaken for a completed
+        one. There is no fallback between backends.
+
+        Args:
+            sampling_client: The session currently serving this training run.
+            version: Identity of the weights being published. The live
+                collective requires the ``v0``/``v1``/... lineage and advances
+                exactly one step; the checkpoint backends use it as the
+                checkpoint name.
+            base_version: The version to publish against. Only the live
+                collective tracks an explicit lineage; the checkpoint backends
+                resolve their own base in the control plane, so passing one for
+                them is refused rather than ignored. Defaults to the version
+                the session currently holds.
+            ttl_seconds: Checkpoint retention, for the checkpoint backends.
+            transaction_id: Optional canonical UUID for the live collective's
+                transaction.
+
+        Returns:
+            The sampling client that serves ``version``.
+
+        Raises:
+            ValueError: If the arguments cannot satisfy the frozen backend.
+            RuntimeError: If the target never served the new weights.
+        """
+
+        if getattr(sampling_client, "_service", None) is not self._service:
+            raise ValueError("sampling client belongs to another Weaver service")
+        if sampling_client.model_id != self.model_id:
+            raise ValueError("sampling client is not bound to this training model")
+        selection = getattr(sampling_client, "weight_sync", None) or WeightSyncSelection()
+
+        if selection.is_live_collective:
+            self.publish_live_weights_to_sampler_nccl_v1(
+                sampling_client,
+                expected_weight_version=(base_version or sampling_client.weight_version or "v0"),
+                proposed_weight_version=version,
+                transaction_id=transaction_id,
+                checksum_mode="sha256" if selection.debug_checksum else "off",
+            )
+            # The receipt already proved the target committed, closed and
+            # resumed, and advanced this client's version.
+            return sampling_client
+
+        if base_version is not None:
+            raise ValueError(
+                f"backend={selection.backend!r} resolves its own base version in the "
+                "control plane; base_version is only accepted for the live collective"
+            )
+        model_path = self.save_weights_for_sampler(name=version, ttl_seconds=ttl_seconds)
+        # Binding the replacement session is what pushes the weights to the
+        # engine and waits for it. Any failure propagates from here, leaving the
+        # caller's existing client and version exactly as they were.
+        return self._service.create_sampling_client(
+            base_model=self.base_model,
+            model_path=str(model_path),
+            model_id=self.model_id,
+            tokenizer_path=self.tokenizer_path,
+            weight_sync=selection,
+        )
 
     @overload
     def publish_live_weights_to_sampler_nccl_v1(
