@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 
@@ -167,8 +168,7 @@ class TestSaveState:
 
 
 class TestAsyncSaveState:
-    @pytest.mark.asyncio
-    async def test_recovers_checkpoint_when_operation_projection_races(self):
+    def test_recovers_checkpoint_when_operation_projection_races(self):
         tc = _make_async_training_client()
         handle = MagicMock(spec=AsyncOperationHandle)
         handle.result = AsyncMock(return_value={"saved": True})
@@ -185,13 +185,12 @@ class TestAsyncSaveState:
             ]
         }
 
-        checkpoint = await tc.save_state(name="step-race")
+        checkpoint = asyncio.run(tc.save_state(name="step-race"))
 
         assert checkpoint.id == "ckpt-race"
         assert checkpoint.path == "weaver://mdl-123/checkpoints/step-race"
 
-    @pytest.mark.asyncio
-    async def test_never_returns_an_empty_checkpoint(self):
+    def test_never_returns_an_empty_checkpoint(self):
         tc = _make_async_training_client()
         handle = MagicMock(spec=AsyncOperationHandle)
         handle.result = AsyncMock(return_value={"saved": True})
@@ -199,7 +198,7 @@ class TestAsyncSaveState:
         tc._service.http.get.return_value = {"items": []}
 
         with pytest.raises(RuntimeError, match="returned no checkpoint metadata"):
-            await tc.save_state(name="missing")
+            asyncio.run(tc.save_state(name="missing"))
 
 
 # ---------------------------------------------------------------------------
