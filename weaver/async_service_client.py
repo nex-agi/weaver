@@ -149,18 +149,30 @@ DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
 _SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
-async def _await_bounded_cleanup(cleanup: Awaitable[Any]) -> None:
-    """Finish bounded cleanup before propagating any parent cancellation."""
+async def _cleanup_sampling_session(client: AsyncAPIClient, session_id: str) -> bool:
+    """Delete a session, returning whether cancellation arrived while waiting."""
 
     cleanup_task = asyncio.create_task(
-        asyncio.wait_for(cleanup, timeout=_SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS)
+        asyncio.wait_for(
+            client.delete(f"/api/v1/sampling-sessions/{session_id}"),
+            timeout=_SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS,
+        )
     )
+    cancelled = False
     while not cleanup_task.done():
         try:
             await asyncio.shield(cleanup_task)
         except asyncio.CancelledError:
-            continue
-    cleanup_task.result()
+            cancelled = True
+    try:
+        cleanup_task.result()
+    except BaseException as cleanup_exc:  # pragma: no cover - best effort
+        logger.warning(
+            "Failed to clean up sampling session %s after weights sync failure: %s",
+            session_id,
+            cleanup_exc,
+        )
+    return cancelled
 
 
 class AsyncServiceClient:  # pylint: disable=too-many-public-methods
@@ -556,24 +568,16 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
                 )
                 try:
                     await sync_handle.wait()
-                except BaseException:
+                except BaseException as sync_exc:
                     # A cancelled task remains cancellation-sensitive while it
                     # unwinds. Run cleanup in its own bounded task and shield it
                     # so the remote session does not outlive a failed create.
                     if created_sampling_session_id:
-                        try:
-                            await _await_bounded_cleanup(
-                                self.http.delete(
-                                    f"/api/v1/sampling-sessions/{created_sampling_session_id}"
-                                )
-                            )
-                        except BaseException as cleanup_exc:  # pragma: no cover - best effort
-                            logger.warning(
-                                "Failed to clean up sampling session %s after weights sync "
-                                "failure: %s",
-                                created_sampling_session_id,
-                                cleanup_exc,
-                            )
+                        cancelled = await _cleanup_sampling_session(
+                            self.http, created_sampling_session_id
+                        )
+                        if cancelled:
+                            raise asyncio.CancelledError() from sync_exc
                     raise
                 logger.info("Weights sync completed.")
             else:

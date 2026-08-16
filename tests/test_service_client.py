@@ -246,6 +246,42 @@ def test_create_sampling_client_deletes_session_when_cancelled(monkeypatch):
     client._http.delete.assert_awaited_once_with("/api/v1/sampling-sessions/sampling-1")
 
 
+def test_cleanup_cancellation_overrides_prior_sync_failure(monkeypatch):
+    client = _make_async_sampling_service()
+
+    async def run():
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        async def fail_sync(_handle):
+            raise RuntimeError("sync failed")
+
+        async def delete_session(_path):
+            cleanup_started.set()
+            await cleanup_release.wait()
+            cleanup_finished.set()
+
+        monkeypatch.setattr(AsyncOperationHandle, "wait", fail_sync)
+        client._http.delete.side_effect = delete_session
+        task = asyncio.create_task(
+            client.create_sampling_client(base_model="Qwen/Qwen3.5-9B-Base:262144")
+        )
+        await cleanup_started.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        cleanup_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleanup_finished.is_set()
+        assert task.cancelled()
+
+    asyncio.run(run())
+    client._http.delete.assert_awaited_once_with("/api/v1/sampling-sessions/sampling-1")
+
+
 def _build_atexit_script(marker_path: str, exit_code: str = "") -> str:
     """Build a subprocess script that verifies atexit calls close().
 
