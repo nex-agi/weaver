@@ -209,6 +209,8 @@ def test_create_sampling_client_deletes_session_when_cancelled(monkeypatch):
 
     async def run():
         wait_started = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_release = asyncio.Event()
         cleanup_finished = asyncio.Event()
 
         async def wait_forever(_handle):
@@ -216,9 +218,8 @@ def test_create_sampling_client_deletes_session_when_cancelled(monkeypatch):
             await asyncio.Event().wait()
 
         async def delete_session(_path):
-            # Yield once so this verifies cleanup is awaited while the parent
-            # task is already unwinding from CancelledError.
-            await asyncio.sleep(0)
+            cleanup_started.set()
+            await cleanup_release.wait()
             cleanup_finished.set()
 
         monkeypatch.setattr(AsyncOperationHandle, "wait", wait_forever)
@@ -228,6 +229,15 @@ def test_create_sampling_client_deletes_session_when_cancelled(monkeypatch):
         )
         await wait_started.wait()
         task.cancel()
+        await cleanup_started.wait()
+
+        # A second cancellation must not detach the shielded DELETE. The
+        # create call stays alive until cleanup completes or its timeout fires.
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+
+        cleanup_release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert cleanup_finished.is_set()

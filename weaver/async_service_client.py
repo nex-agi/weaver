@@ -149,6 +149,20 @@ DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
 _SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
 
 
+async def _await_bounded_cleanup(cleanup: Awaitable[Any]) -> None:
+    """Finish bounded cleanup before propagating any parent cancellation."""
+
+    cleanup_task = asyncio.create_task(
+        asyncio.wait_for(cleanup, timeout=_SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS)
+    )
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            continue
+    cleanup_task.result()
+
+
 class AsyncServiceClient:  # pylint: disable=too-many-public-methods
     def __init__(
         self,
@@ -547,16 +561,12 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
                     # unwinds. Run cleanup in its own bounded task and shield it
                     # so the remote session does not outlive a failed create.
                     if created_sampling_session_id:
-                        cleanup_task = asyncio.create_task(
-                            asyncio.wait_for(
+                        try:
+                            await _await_bounded_cleanup(
                                 self.http.delete(
                                     f"/api/v1/sampling-sessions/{created_sampling_session_id}"
-                                ),
-                                timeout=_SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS,
+                                )
                             )
-                        )
-                        try:
-                            await asyncio.shield(cleanup_task)
                         except BaseException as cleanup_exc:  # pragma: no cover - best effort
                             logger.warning(
                                 "Failed to clean up sampling session %s after weights sync "
