@@ -37,7 +37,7 @@ def _tensor_transport(value: str | None) -> TensorTransport:
 
 
 def _tensor_compression(value: str | None) -> TensorCompression:
-    resolved = value or "raw"
+    resolved = value or "zstd"
     if resolved not in _TENSOR_COMPRESSIONS:
         supported = ", ".join(sorted(_TENSOR_COMPRESSIONS))
         raise ValueError(f"Unsupported tensor compression {resolved!r}. Supported: {supported}")
@@ -51,13 +51,11 @@ class WeaverConfig:
     base_url: str = _DEFAULT_BASE_URL
     api_key: str | None = None
     tensor_transport: TensorTransport = "default"
-    tensor_compression: TensorCompression = "raw"
+    tensor_compression: TensorCompression = "zstd"
 
     def __post_init__(self) -> None:
         self.tensor_transport = _tensor_transport(self.tensor_transport)
         self.tensor_compression = _tensor_compression(self.tensor_compression)
-        if self.tensor_compression != "raw" and self.tensor_transport != "http-binary":
-            raise ValueError("tensor_compression requires tensor_transport='http-binary'")
 
     @classmethod
     def from_env(

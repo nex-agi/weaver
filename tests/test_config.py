@@ -27,7 +27,7 @@ def test_config_defaults():
     assert config.base_url == "https://weaver-console.nex-agi.cn"
     assert config.api_key is None
     assert config.tensor_transport == "default"
-    assert config.tensor_compression == "raw"
+    assert config.tensor_compression == "zstd"
 
 
 def test_config_from_kwargs():
@@ -93,9 +93,10 @@ def test_config_rejects_unknown_tensor_compression(monkeypatch):
         WeaverConfig(tensor_compression="magic")  # type: ignore[arg-type]
 
 
-def test_config_rejects_compression_without_http_transport():
-    with pytest.raises(ValueError, match="requires tensor_transport"):
-        WeaverConfig(tensor_compression="zstd")
+def test_http_binary_defaults_to_zstd():
+    config = WeaverConfig(tensor_transport="http-binary")
+
+    assert config.tensor_compression == "zstd"
 
 
 def test_require_auth_with_credentials():

@@ -213,7 +213,7 @@ def serialize_training_data(
     *,
     loss_fn: str,
     transport: TensorTransport,
-    compression: TensorCompression = "raw",
+    compression: TensorCompression = "zstd",
 ) -> SerializedTrainingData:
     """Serialize datums, optimizing dense cross-entropy tensors only."""
 

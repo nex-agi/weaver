@@ -106,7 +106,7 @@ def prepare_forward_operation(
     loss_fn_config: Mapping[str, Any] | None,
     request_metadata: Dict[str, Any] | None,
     tensor_transport: TensorTransport,
-    tensor_compression: TensorCompression = "raw",
+    tensor_compression: TensorCompression = "zstd",
 ) -> PreparedOperationBody:
     """Prepare a forward operation and optional HTTP tensor attachment."""
 
@@ -132,7 +132,7 @@ def prepare_forward_backward_operation(
     loss_fn_config: Mapping[str, Any] | None,
     request_metadata: Dict[str, Any] | None,
     tensor_transport: TensorTransport,
-    tensor_compression: TensorCompression = "raw",
+    tensor_compression: TensorCompression = "zstd",
 ) -> PreparedOperationBody:
     """Prepare a forward/backward operation and optional HTTP tensor attachment."""
 

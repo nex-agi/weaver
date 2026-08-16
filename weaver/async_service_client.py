@@ -213,7 +213,7 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             tensor_transport: Training tensor transport. Defaults to
                 ``WEAVER_TENSOR_TRANSPORT`` or ``"default"``.
             tensor_compression: HTTP tensor-pack compression. Defaults to
-                ``WEAVER_TENSOR_COMPRESSION`` or ``"raw"``.
+                ``WEAVER_TENSOR_COMPRESSION`` or ``"zstd"``.
         """
         self._config = WeaverConfig.from_env(
             base_url=base_url,

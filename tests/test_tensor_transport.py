@@ -100,9 +100,28 @@ def test_default_transport_remains_inline():
     datum = payload["forward_backward_input"]["data"][0]
 
     assert payload["tensor_transport"] == "default"
+    assert "tensor_compression" not in payload
     assert datum["model_input"]["chunks"][0]["tokens"] == [11, 12, 13]
     assert datum["loss_fn_inputs"]["target_tokens"]["data"] == [12, 13, 14]
     assert datum["loss_fn_inputs"]["weights"]["data"] == [0.0, 1.0, 1.0]
+
+
+def test_http_binary_defaults_to_zstd():
+    prepared = prepare_forward_backward_operation(
+        model_id="model-1",
+        seq_id=7,
+        data=[_datum()],
+        loss_fn="cross_entropy",
+        loss_fn_config=None,
+        request_metadata=None,
+        tensor_transport="http-binary",
+    )
+    try:
+        assert prepared.body["payload"]["tensor_compression"] == "zstd"
+        assert prepared.tensor_pack is not None
+        assert prepared.tensor_pack.codec == "zstd"
+    finally:
+        prepared.close()
 
 
 def test_http_binary_normalizes_dense_input_dtypes():
