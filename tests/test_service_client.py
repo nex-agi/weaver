@@ -14,15 +14,17 @@
 
 """Tests for the ServiceClient."""
 
+import asyncio
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from weaver.operations import OperationHandle
+from weaver.async_service_client import AsyncServiceClient
+from weaver.operations import AsyncOperationHandle, OperationHandle
 from weaver.service_client import ServiceClient
 
 
@@ -172,6 +174,66 @@ def test_create_sampling_client_deletes_session_when_sync_wait_fails(monkeypatch
         )
 
     client._http.delete.assert_called_once_with("/api/v1/sampling-sessions/sampling-1")
+
+
+def _make_async_sampling_service() -> AsyncServiceClient:
+    client = AsyncServiceClient(api_key="sk-test-key", session_id="session-1")
+    client._session = {"id": "session-1"}
+    client._http = MagicMock()
+    client._http.post = AsyncMock(
+        return_value={
+            "sampling_session": {"id": "sampling-1"},
+            "sync_operation": {"id": "operation-1", "status": "pending"},
+        }
+    )
+    client._http.delete = AsyncMock()
+    return client
+
+
+def test_create_sampling_client_deletes_session_when_async_wait_fails(monkeypatch):
+    client = _make_async_sampling_service()
+    monkeypatch.setattr(
+        AsyncOperationHandle,
+        "wait",
+        AsyncMock(side_effect=RuntimeError("sync failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="sync failed"):
+        asyncio.run(client.create_sampling_client(base_model="Qwen/Qwen3.5-9B-Base:262144"))
+
+    client._http.delete.assert_awaited_once_with("/api/v1/sampling-sessions/sampling-1")
+
+
+def test_create_sampling_client_deletes_session_when_cancelled(monkeypatch):
+    client = _make_async_sampling_service()
+
+    async def run():
+        wait_started = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        async def wait_forever(_handle):
+            wait_started.set()
+            await asyncio.Event().wait()
+
+        async def delete_session(_path):
+            # Yield once so this verifies cleanup is awaited while the parent
+            # task is already unwinding from CancelledError.
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+
+        monkeypatch.setattr(AsyncOperationHandle, "wait", wait_forever)
+        client._http.delete.side_effect = delete_session
+        task = asyncio.create_task(
+            client.create_sampling_client(base_model="Qwen/Qwen3.5-9B-Base:262144")
+        )
+        await wait_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert cleanup_finished.is_set()
+
+    asyncio.run(run())
+    client._http.delete.assert_awaited_once_with("/api/v1/sampling-sessions/sampling-1")
 
 
 def _build_atexit_script(marker_path: str, exit_code: str = "") -> str:

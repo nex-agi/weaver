@@ -503,14 +503,18 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                     # point of view.  If waiting is interrupted or the sync
                     # fails, delete the remote sampling session so its pending
                     # sync cannot be redispatched into a later cold-start pool.
-                    try:
-                        self.http.delete(f"/api/v1/sampling-sessions/{created_sampling_session_id}")
-                    except Exception as cleanup_exc:  # pragma: no cover - best effort
-                        logger.warning(
-                            "Failed to clean up sampling session %s after weights sync failure: %s",
-                            created_sampling_session_id,
-                            cleanup_exc,
-                        )
+                    if created_sampling_session_id:
+                        try:
+                            self.http.delete(
+                                f"/api/v1/sampling-sessions/{created_sampling_session_id}"
+                            )
+                        except Exception as cleanup_exc:  # pragma: no cover - best effort
+                            logger.warning(
+                                "Failed to clean up sampling session %s after weights sync "
+                                "failure: %s",
+                                created_sampling_session_id,
+                                cleanup_exc,
+                            )
                     raise
                 logger.info("Weights sync completed.")
             else:
