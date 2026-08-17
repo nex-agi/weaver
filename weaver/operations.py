@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
 
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
+from .tensor_transport import bind_result_tensor_pack_operation
 
 if TYPE_CHECKING:
     from ._async_http import AsyncAPIClient
@@ -127,7 +128,9 @@ class _OperationHandleMixin:
 
     @property
     def response(self) -> Any:
-        return lookup_case_insensitive(self._cached, "response")
+        return bind_result_tensor_pack_operation(
+            lookup_case_insensitive(self._cached, "response"), self.operation_id
+        )
 
     @property
     def error(self) -> Optional[str]:
@@ -192,8 +195,8 @@ class OperationHandle(_OperationHandleMixin):
         return self._cached
 
     def result(self) -> Any:
-        payload = self.wait()
-        return lookup_case_insensitive(payload, "response")
+        self.wait()
+        return self.response
 
     @classmethod
     def wait_all(cls, handles: List["OperationHandle"]) -> List[Any]:
@@ -267,8 +270,8 @@ class AsyncOperationHandle(_OperationHandleMixin):
         return self._cached
 
     async def result(self) -> Any:
-        payload = await self.wait()
-        return lookup_case_insensitive(payload, "response")
+        await self.wait()
+        return self.response
 
     def __await__(self):
         return self.result().__await__()

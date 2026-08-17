@@ -42,7 +42,9 @@ from .operations import OperationHandle, build_operation_handle
 from .service_client import ServiceClient
 from .tensor_transport import (
     PreparedOperationBody,
+    materialize_http_tensors,
     result_tensor_pack_metadata,
+    result_tensor_pack_operation_id,
     result_uses_http_tensor_pack,
 )
 from .types import AdamParams, Datum
@@ -152,6 +154,30 @@ class TrainingClient:
         return self._service.enqueue_operation(
             path, prepared.body, tensor_pack=prepared.tensor_pack
         )
+
+    def materialize_result_tensors(self, result: Mapping[str, Any]) -> Dict[str, Any]:
+        """Download every tensor referenced by an HTTP-binary result.
+
+        Args:
+            result: Completed operation result returned by this client.
+        Returns:
+            A copy with tensor references replaced by tensors.
+        Raises:
+            ValueError: If the result metadata or tensor pack is invalid.
+        """
+        if not isinstance(result.get("tensor_pack"), Mapping):
+            return dict(result)
+        metadata = result_tensor_pack_metadata(result)
+        with tempfile.TemporaryFile(mode="w+b") as tensor_pack:
+            self._service.http.download_tensor_pack(
+                result_tensor_pack_operation_id(result),
+                tensor_pack,
+                size_bytes=metadata.size_bytes,
+                sha256=metadata.sha256,
+                codec=metadata.codec,
+                decoded_size_bytes=metadata.decoded_size_bytes,
+            )
+            return dict(materialize_http_tensors(result, tensor_pack))
 
     @overload
     def forward(
@@ -315,19 +341,8 @@ class TrainingClient:
         fwd_result = fwd_handle.result()
 
         if result_uses_http_tensor_pack(fwd_result):
-            with tempfile.TemporaryFile(mode="w+b") as tensor_pack:
-                metadata = result_tensor_pack_metadata(fwd_result)
-                fwd_handle.client.download_tensor_pack(
-                    fwd_handle.operation_id,
-                    tensor_pack,
-                    size_bytes=metadata.size_bytes,
-                    sha256=metadata.sha256,
-                    codec=metadata.codec,
-                    decoded_size_bytes=metadata.decoded_size_bytes,
-                )
-                logprob_tensors = parse_logprob_tensors(fwd_result, data, tensor_pack=tensor_pack)
-        else:
-            logprob_tensors = parse_logprob_tensors(fwd_result, data)
+            fwd_result = self.materialize_result_tensors(fwd_result)
+        logprob_tensors = parse_logprob_tensors(fwd_result, data)
 
         try:
             loss, metrics = loss_fn(data, logprob_tensors)

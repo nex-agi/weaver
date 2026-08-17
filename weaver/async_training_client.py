@@ -60,7 +60,9 @@ from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle, build_async_operation_handle
 from .tensor_transport import (
     PreparedOperationBody,
+    materialize_http_tensors,
     result_tensor_pack_metadata,
+    result_tensor_pack_operation_id,
     result_uses_http_tensor_pack,
 )
 from .types import AdamParams, Datum
@@ -122,6 +124,35 @@ class AsyncTrainingClient:
         self.tokenizer_path = tokenizer_path
         self.debug_info = debug_info
         self._tokenizer: Any = None
+
+    async def materialize_result_tensors(self, result: Mapping[str, Any]) -> Dict[str, Any]:
+        """Download every tensor referenced by an HTTP-binary result.
+
+        Args:
+            result: Completed operation result returned by this client.
+        Returns:
+            A copy with tensor references replaced by tensors.
+        Raises:
+            ValueError: If the result metadata or tensor pack is invalid.
+        """
+
+        if not isinstance(result.get("tensor_pack"), Mapping):
+            return dict(result)
+        metadata = result_tensor_pack_metadata(result)
+        tensor_pack = await _open_temporary_file()
+        try:
+            await self._service.http.download_tensor_pack(
+                result_tensor_pack_operation_id(result),
+                tensor_pack,
+                size_bytes=metadata.size_bytes,
+                sha256=metadata.sha256,
+                codec=metadata.codec,
+                decoded_size_bytes=metadata.decoded_size_bytes,
+            )
+            materialized = await _await_blocking_io(materialize_http_tensors, result, tensor_pack)
+        finally:
+            await _await_blocking_io(tensor_pack.close)
+        return dict(materialized)
 
     @property
     def training_run_id(self) -> str:
@@ -333,27 +364,8 @@ class AsyncTrainingClient:
         fwd_result = await fwd_handle.result()
 
         if result_uses_http_tensor_pack(fwd_result):
-            tensor_pack = await _open_temporary_file()
-            try:
-                metadata = result_tensor_pack_metadata(fwd_result)
-                await fwd_handle.client.download_tensor_pack(
-                    fwd_handle.operation_id,
-                    tensor_pack,
-                    size_bytes=metadata.size_bytes,
-                    sha256=metadata.sha256,
-                    codec=metadata.codec,
-                    decoded_size_bytes=metadata.decoded_size_bytes,
-                )
-                logprob_tensors = await _await_blocking_io(
-                    parse_logprob_tensors,
-                    fwd_result,
-                    data,
-                    tensor_pack=tensor_pack,
-                )
-            finally:
-                await _await_blocking_io(tensor_pack.close)
-        else:
-            logprob_tensors = await _await_blocking_io(parse_logprob_tensors, fwd_result, data)
+            fwd_result = await self.materialize_result_tensors(fwd_result)
+        logprob_tensors = await _await_blocking_io(parse_logprob_tensors, fwd_result, data)
 
         try:
             loss, metrics = loss_fn(data, logprob_tensors)

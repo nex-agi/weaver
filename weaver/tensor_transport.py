@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import math
+import os
 import secrets
 import tempfile
 from contextlib import ExitStack
@@ -332,21 +333,32 @@ class AsyncMultipartStream(httpx.AsyncByteStream):
 
 
 def result_uses_http_tensor_pack(payload: Mapping[str, Any]) -> bool:
-    """Return whether detailed logprobs reference an HTTP result pack."""
+    """Return whether a result advertises an HTTP tensor pack."""
 
-    result = payload.get("result")
-    outputs = result.get("loss_fn_outputs") if isinstance(result, Mapping) else None
-    if not isinstance(outputs, list):
-        return False
-    for output in outputs:
-        if not isinstance(output, Mapping):
-            continue
-        logprobs = output.get("logprobs")
-        if logprobs is None:
-            logprobs = output.get("Logprobs")
-        if isinstance(logprobs, Mapping) and TENSOR_KEY in logprobs:
-            return True
-    return False
+    return isinstance(payload.get("tensor_pack"), Mapping)
+
+
+def bind_result_tensor_pack_operation(payload: Any, operation_id: str) -> Any:
+    """Attach the operation needed to retrieve a referenced result pack."""
+
+    if not isinstance(payload, Mapping):
+        return payload
+    metadata = payload.get("tensor_pack")
+    if not isinstance(metadata, Mapping):
+        return payload
+    bound = dict(payload)
+    bound["tensor_pack"] = {**metadata, "operation_id": operation_id}
+    return bound
+
+
+def result_tensor_pack_operation_id(payload: Mapping[str, Any]) -> str:
+    """Return the operation identifier bound to an HTTP result pack."""
+
+    metadata = payload.get("tensor_pack")
+    operation_id = metadata.get("operation_id") if isinstance(metadata, Mapping) else None
+    if not isinstance(operation_id, str) or not operation_id:
+        raise ValueError("HTTP tensor result is missing tensor_pack.operation_id")
+    return operation_id
 
 
 def result_tensor_pack_metadata(payload: Mapping[str, Any]) -> TensorPackMetadata:
@@ -388,7 +400,7 @@ def decompress_zstd_tensor_pack(
     destination: BinaryIO,
     decoded_size_bytes: int,
 ) -> None:
-    """Decode exactly one bounded Zstandard frame into ``destination``."""
+    """Decode bounded concatenated Zstandard frames into ``destination``."""
 
     expected_size = _nonnegative_int(decoded_size_bytes, "tensor_pack.decoded_size_bytes")
     source.seek(0)
@@ -402,8 +414,8 @@ def decompress_zstd_tensor_pack(
     )
     try:
         while True:
-            # Reading one byte past the declared size detects expansion and
-            # concatenated frames without allowing an unbounded allocation.
+            # Reading one byte past the declared combined size detects
+            # expansion without allowing an unbounded allocation.
             read_size = min(_STREAM_CHUNK_BYTES, expected_size - decoded + 1)
             try:
                 output = reader.read(read_size)
@@ -438,6 +450,18 @@ def materialize_http_tensor(reference: Mapping[str, Any], pack: BinaryIO) -> tor
     return _materialize_raw_tensor_slice(descriptor, pack, name="$tensor")
 
 
+def materialize_http_tensors(value: Any, pack: BinaryIO) -> Any:
+    """Return a copy with every nested HTTP tensor reference materialized."""
+
+    if isinstance(value, Mapping):
+        if TENSOR_KEY in value:
+            return materialize_http_tensor(value, pack)
+        return {key: materialize_http_tensors(item, pack) for key, item in value.items()}
+    if isinstance(value, list):
+        return [materialize_http_tensors(item, pack) for item in value]
+    return value
+
+
 def _materialize_raw_tensor_slice(
     descriptor: Mapping[str, Any], source: BinaryIO, *, name: str
 ) -> torch.Tensor:
@@ -461,6 +485,13 @@ def _materialize_raw_tensor_slice(
     offset = _nonnegative_int(descriptor.get("offset", 0), f"{name}.offset")
     if math.prod(shape) * torch.empty((), dtype=dtype).element_size() != size_bytes:
         raise ValueError(f"{name} size_bytes does not match shape and dtype")
+
+    original_position = source.tell()
+    source.seek(0, os.SEEK_END)
+    pack_size = source.tell()
+    source.seek(original_position)
+    if offset > pack_size or size_bytes > pack_size - offset:
+        raise ValueError(f"{name} slice exceeds the tensor pack")
     if size_bytes == 0:
         return torch.empty(shape, dtype=dtype)
 
