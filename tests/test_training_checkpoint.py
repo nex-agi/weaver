@@ -16,13 +16,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import weaver.async_training_client as async_training_client_module
+import weaver.training_client as training_client_module
 from weaver._utils import DEFAULT_SAMPLER_TTL_SECONDS
-from weaver.operations import OperationHandle
+from weaver.async_training_client import AsyncTrainingClient
+from weaver.operations import AsyncOperationHandle, OperationHandle
 from weaver.training_client import TrainingClient
 from weaver.types.checkpoint import Checkpoint
 
@@ -48,6 +52,34 @@ def _make_handle(result: Dict[str, Any] | None = None) -> MagicMock:
     handle = MagicMock(spec=OperationHandle)
     handle.result.return_value = result
     return handle
+
+
+def _make_async_training_client() -> AsyncTrainingClient:
+    service = MagicMock()
+    service.next_operation_seq.return_value = 1
+    service.enqueue_operation = AsyncMock()
+    service.http.get = AsyncMock()
+    return AsyncTrainingClient(
+        service=service,
+        model_id="mdl-123",
+        base_model="Qwen/Qwen3-8B",
+        session_id="sess-abc",
+    )
+
+
+def _checkpoint_payload(
+    checkpoint_id: str,
+    *,
+    name: str = "step-race",
+    status: str = "completed",
+) -> Dict[str, Any]:
+    return {
+        "id": checkpoint_id,
+        "path": f"weaver://mdl-123/checkpoints/{name}",
+        "name": name,
+        "type": "weight",
+        "status": status,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +154,181 @@ class TestSaveState:
 
         assert result is handle
         handle.result.assert_not_called()
+
+    def test_save_state_recovers_checkpoint_when_operation_projection_races(self):
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
+        tc._service.http.get.side_effect = [
+            {"items": []},
+            {"items": [_checkpoint_payload("ckpt-race")]},
+        ]
+
+        checkpoint = tc.save_state(name="step-race")
+
+        assert checkpoint.id == "ckpt-race"
+        assert checkpoint.path == "weaver://mdl-123/checkpoints/step-race"
+
+    def test_save_state_ignores_old_checkpoint_regardless_of_listing_order(self):
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
+        old = _checkpoint_payload("ckpt-old")
+        new = _checkpoint_payload("ckpt-new")
+        tc._service.http.get.side_effect = [
+            {"items": [old]},
+            {"items": [old, new]},
+        ]
+
+        checkpoint = tc.save_state(name="step-race")
+
+        assert checkpoint.id == "ckpt-new"
+
+    def test_save_state_rejects_ambiguous_new_checkpoints(self, monkeypatch):
+        monkeypatch.setattr(training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0,))
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
+        old = _checkpoint_payload("ckpt-old")
+        tc._service.http.get.side_effect = [
+            {"items": [old]},
+            {
+                "items": [
+                    old,
+                    _checkpoint_payload("ckpt-new-1"),
+                    _checkpoint_payload("ckpt-new-2"),
+                ]
+            },
+        ]
+
+        with pytest.raises(RuntimeError, match="recovery was ambiguous"):
+            tc.save_state(name="step-race")
+
+    def test_save_state_polls_until_new_checkpoint_is_visible(self, monkeypatch):
+        monkeypatch.setattr(training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0, 0.0))
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
+        tc._service.http.get.side_effect = [
+            {"items": []},  # pre-save snapshot
+            {"items": []},  # first recovery poll
+            {"items": [_checkpoint_payload("ckpt-later")]},
+        ]
+
+        checkpoint = tc.save_state(name="step-race")
+
+        assert checkpoint.id == "ckpt-later"
+        assert tc._service.http.get.call_count == 3
+
+    def test_save_state_uses_partial_operation_id(self):
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"id": "ckpt-new"})
+        tc._service.http.get.side_effect = [
+            {"items": [_checkpoint_payload("ckpt-old")]},
+            {
+                "items": [
+                    _checkpoint_payload("ckpt-other"),
+                    _checkpoint_payload("ckpt-new"),
+                ]
+            },
+        ]
+
+        checkpoint = tc.save_state(name="step-race")
+
+        assert checkpoint.id == "ckpt-new"
+
+    def test_save_state_never_returns_an_empty_checkpoint(self, monkeypatch):
+        monkeypatch.setattr(training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0,))
+        tc = _make_training_client()
+        tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
+        tc._service.http.get.return_value = {"items": []}
+
+        with pytest.raises(RuntimeError, match="returned no checkpoint metadata"):
+            tc.save_state(name="missing")
+
+
+class TestAsyncSaveState:
+    def test_recovers_checkpoint_when_operation_projection_races(self):
+        tc = _make_async_training_client()
+        handle = MagicMock(spec=AsyncOperationHandle)
+        handle.result = AsyncMock(return_value={"saved": True})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.get.side_effect = [
+            {"items": []},
+            {"items": [_checkpoint_payload("ckpt-race")]},
+        ]
+
+        checkpoint = asyncio.run(tc.save_state(name="step-race"))
+
+        assert checkpoint.id == "ckpt-race"
+        assert checkpoint.path == "weaver://mdl-123/checkpoints/step-race"
+
+    def test_ignores_old_checkpoint_regardless_of_listing_order(self):
+        tc = _make_async_training_client()
+        handle = MagicMock(spec=AsyncOperationHandle)
+        handle.result = AsyncMock(return_value={"saved": True})
+        tc._service.enqueue_operation.return_value = handle
+        old = _checkpoint_payload("ckpt-old")
+        new = _checkpoint_payload("ckpt-new")
+        tc._service.http.get.side_effect = [
+            {"items": [old]},
+            {"items": [old, new]},
+        ]
+
+        checkpoint = asyncio.run(tc.save_state(name="step-race"))
+
+        assert checkpoint.id == "ckpt-new"
+
+    def test_polls_until_new_checkpoint_is_visible(self, monkeypatch):
+        monkeypatch.setattr(async_training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0, 0.0))
+        tc = _make_async_training_client()
+        handle = MagicMock(spec=AsyncOperationHandle)
+        handle.result = AsyncMock(return_value={"saved": True})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.get.side_effect = [
+            {"items": []},
+            {"items": []},
+            {"items": [_checkpoint_payload("ckpt-later")]},
+        ]
+
+        checkpoint = asyncio.run(tc.save_state(name="step-race"))
+
+        assert checkpoint.id == "ckpt-later"
+        assert tc._service.http.get.await_count == 3
+
+    def test_recovery_polling_remains_cancellation_responsive(self, monkeypatch):
+        monkeypatch.setattr(async_training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0, 60.0))
+        tc = _make_async_training_client()
+        handle = MagicMock(spec=AsyncOperationHandle)
+        handle.result = AsyncMock(return_value={"saved": True})
+        tc._service.enqueue_operation.return_value = handle
+
+        async def run():
+            second_listing_finished = asyncio.Event()
+            listing_count = 0
+
+            async def list_empty(_path):
+                nonlocal listing_count
+                listing_count += 1
+                if listing_count == 2:
+                    second_listing_finished.set()
+                return {"items": []}
+
+            tc._service.http.get.side_effect = list_empty
+            task = asyncio.create_task(tc.save_state(name="step-race"))
+            await second_listing_finished.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run())
+
+    def test_never_returns_an_empty_checkpoint(self, monkeypatch):
+        monkeypatch.setattr(async_training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0,))
+        tc = _make_async_training_client()
+        handle = MagicMock(spec=AsyncOperationHandle)
+        handle.result = AsyncMock(return_value={"saved": True})
+        tc._service.enqueue_operation.return_value = handle
+        tc._service.http.get.return_value = {"items": []}
+
+        with pytest.raises(RuntimeError, match="returned no checkpoint metadata"):
+            asyncio.run(tc.save_state(name="missing"))
 
 
 # ---------------------------------------------------------------------------

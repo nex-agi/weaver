@@ -68,6 +68,10 @@ or ``await svc.aclose()``: the atexit path is only a best-effort backstop and,
 like the sync client, does not cover ``SIGKILL`` (the server-side reaper does).
 """
 
+# The async client mirrors the synchronous SDK entry point and intentionally
+# aggregates every resource family in one public client.
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import asyncio
@@ -109,11 +113,7 @@ from ._artifacts import (
     select_artifact_payload,
     validate_resource_id,
 )
-from ._async_http import (
-    AsyncAPIClient,
-    async_stream_download_to_file,
-    build_async_download_client,
-)
+from ._async_http import AsyncAPIClient, async_stream_download_to_file, build_async_download_client
 from ._deployments import (
     DEPLOYMENT_PAGE_SIZE,
     deployment_items,
@@ -146,6 +146,33 @@ logger = logging.getLogger(__name__)
 
 # Default LoRA configuration
 DEFAULT_LORA_CONFIG = LoraConfig(rank=32)
+_SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS = 5.0
+
+
+async def _cleanup_sampling_session(client: AsyncAPIClient, session_id: str) -> bool:
+    """Delete a session, returning whether cancellation arrived while waiting."""
+
+    cleanup_task = asyncio.create_task(
+        asyncio.wait_for(
+            client.delete(f"/api/v1/sampling-sessions/{session_id}"),
+            timeout=_SAMPLING_SESSION_CLEANUP_TIMEOUT_SECONDS,
+        )
+    )
+    cancelled = False
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            cancelled = True
+    try:
+        cleanup_task.result()
+    except BaseException as cleanup_exc:  # pragma: no cover - best effort
+        logger.warning(
+            "Failed to clean up sampling session %s after weights sync failure: %s",
+            session_id,
+            cleanup_exc,
+        )
+    return cancelled
 
 
 class AsyncServiceClient:  # pylint: disable=too-many-public-methods
@@ -533,12 +560,25 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             )
             if sync_op_payload and isinstance(sync_op_payload, dict):
                 session = lookup_case_insensitive(resp, "sampling_session") or {}
+                created_sampling_session_id = extract_id(session)
                 sync_handle = AsyncOperationHandle.from_payload(self.http, sync_op_payload)
                 logger.info(
                     "Waiting for background weights sync (operation %s)...",
                     sync_handle.operation_id,
                 )
-                await sync_handle.wait()
+                try:
+                    await sync_handle.wait()
+                except BaseException as sync_exc:
+                    # A cancelled task remains cancellation-sensitive while it
+                    # unwinds. Run cleanup in its own bounded task and shield it
+                    # so the remote session does not outlive a failed create.
+                    if created_sampling_session_id:
+                        cancelled = await _cleanup_sampling_session(
+                            self.http, created_sampling_session_id
+                        )
+                        if cancelled:
+                            raise asyncio.CancelledError() from sync_exc
+                    raise
                 logger.info("Weights sync completed.")
             else:
                 session = resp

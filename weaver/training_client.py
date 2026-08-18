@@ -18,15 +18,13 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from datetime import datetime, timezone
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
-from ._artifacts import (
-    DEFAULT_EXPORT_TTL_SECONDS,
-    is_artifact_payload,
-    validate_resource_id,
-)
+from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
+from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
@@ -558,6 +556,11 @@ class TrainingClient:
             # don't accumulate on shared storage; weight checkpoints stay
             # permanent unless an explicit ttl_seconds is given.
             body["ttl_seconds"] = DEFAULT_SAMPLER_TTL_SECONDS
+        existing_checkpoint_ids = (
+            {checkpoint.id for checkpoint in self.list_checkpoints() if checkpoint.id}
+            if wait
+            else set()
+        )
         handle = self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/checkpoints",
             body,
@@ -565,7 +568,29 @@ class TrainingClient:
         if not wait:
             return handle
         result = handle.result()
-        return Checkpoint.from_payload(result if isinstance(result, dict) else {})
+        checkpoint = Checkpoint.from_payload(result if isinstance(result, dict) else {})
+        if checkpoint.id and checkpoint.path.startswith("weaver://"):
+            return checkpoint
+
+        # Operation completion and its public checkpoint projection are not
+        # atomic. Recover only a checkpoint that can be uniquely tied to this
+        # save, and wait briefly for the row to reach a usable status.
+        for delay in CHECKPOINT_RECOVERY_DELAYS:
+            if delay:
+                time.sleep(delay)
+            candidate = select_recovered_checkpoint(
+                self.list_checkpoints(),
+                existing_ids=existing_checkpoint_ids,
+                partial=checkpoint,
+                name=name,
+                checkpoint_type=checkpoint_type,
+            )
+            if candidate is not None:
+                return candidate
+        raise RuntimeError(
+            "Save completed but the server returned no checkpoint metadata "
+            "and no unique completed checkpoint appeared before the recovery timeout"
+        )
 
     @overload
     def load_state(

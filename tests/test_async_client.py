@@ -177,6 +177,48 @@ class TestAsyncOperationHandle:
 
         asyncio.run(run())
 
+    def test_error_status_surfaces_structured_reason(self, monkeypatch):
+        monkeypatch.setenv("WEAVER_OPERATION_POLL_INTERVAL", "0.01")
+
+        async def run():
+            client = _FakeAsyncClient(
+                [
+                    {
+                        "id": "op-1",
+                        "status": "error",
+                        "error": "operation_failed",
+                        "error_code": "context_length_exceeded",
+                        "error_message": "request exceeds serving context length",
+                        "error_details": {"max_context_length": 32768},
+                    }
+                ]
+            )
+            handle = AsyncOperationHandle(
+                client=client, operation_id="op-1", _cached={"id": "op-1", "status": "running"}
+            )
+            with pytest.raises(WeaverOperationError) as exc_info:
+                await handle.result()
+            return exc_info.value
+
+        error = asyncio.run(run())
+        assert error.code == "context_length_exceeded"
+        assert error.message == "request exceeds serving context length"
+        assert error.details == {"max_context_length": 32768}
+
+    def test_precached_error_status_raises_without_polling(self):
+        async def run():
+            client = _FakeAsyncClient([])
+            handle = AsyncOperationHandle(
+                client=client,
+                operation_id="op-1",
+                _cached={"id": "op-1", "status": "error", "error": "boom"},
+            )
+            with pytest.raises(WeaverOperationError):
+                await handle.result()
+            return client.get_calls
+
+        assert asyncio.run(run()) == 0
+
     def test_await_yields_event_loop_to_other_coroutines(self, monkeypatch):
         """The core requirement: awaiting a handle must not block the loop.
 

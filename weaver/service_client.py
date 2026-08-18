@@ -489,13 +489,33 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             )
             if sync_op_payload and isinstance(sync_op_payload, dict):
                 session = lookup_case_insensitive(resp, "sampling_session") or {}
+                created_sampling_session_id = extract_id(session)
                 # Wait for the background sync_weights to finish
                 sync_handle = OperationHandle.from_payload(self.http, sync_op_payload)
                 logger.info(
                     "Waiting for background weights sync (operation %s)...",
                     sync_handle.operation_id,
                 )
-                sync_handle.wait()
+                try:
+                    sync_handle.wait()
+                except BaseException:
+                    # Creating a sampling client is transactional from the SDK's
+                    # point of view.  If waiting is interrupted or the sync
+                    # fails, delete the remote sampling session so its pending
+                    # sync cannot be redispatched into a later cold-start pool.
+                    if created_sampling_session_id:
+                        try:
+                            self.http.delete(
+                                f"/api/v1/sampling-sessions/{created_sampling_session_id}"
+                            )
+                        except Exception as cleanup_exc:  # pragma: no cover - best effort
+                            logger.warning(
+                                "Failed to clean up sampling session %s after weights sync "
+                                "failure: %s",
+                                created_sampling_session_id,
+                                cleanup_exc,
+                            )
+                    raise
                 logger.info("Weights sync completed.")
             else:
                 # Standard 201 response: body is the SamplingSession directly

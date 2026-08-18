@@ -26,16 +26,14 @@ later, which lets several server-side operations overlap::
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
-from ._artifacts import (
-    DEFAULT_EXPORT_TTL_SECONDS,
-    is_artifact_payload,
-    validate_resource_id,
-)
+from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
+from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
@@ -500,6 +498,11 @@ class AsyncTrainingClient:
             # don't accumulate on shared storage; weight checkpoints stay
             # permanent unless an explicit ttl_seconds is given.
             body["ttl_seconds"] = DEFAULT_SAMPLER_TTL_SECONDS
+        existing_checkpoint_ids = (
+            {checkpoint.id for checkpoint in await self.list_checkpoints() if checkpoint.id}
+            if wait
+            else set()
+        )
         handle = await self._service.enqueue_operation(
             f"/api/v1/models/{self.model_id}/checkpoints",
             body,
@@ -507,7 +510,28 @@ class AsyncTrainingClient:
         if not wait:
             return handle
         result = await handle.result()
-        return Checkpoint.from_payload(result if isinstance(result, dict) else {})
+        checkpoint = Checkpoint.from_payload(result if isinstance(result, dict) else {})
+        if checkpoint.id and checkpoint.path.startswith("weaver://"):
+            return checkpoint
+
+        # See the synchronous client's save_state. asyncio.sleep keeps this
+        # bounded recovery loop cancellation-responsive.
+        for delay in CHECKPOINT_RECOVERY_DELAYS:
+            if delay:
+                await asyncio.sleep(delay)
+            candidate = select_recovered_checkpoint(
+                await self.list_checkpoints(),
+                existing_ids=existing_checkpoint_ids,
+                partial=checkpoint,
+                name=name,
+                checkpoint_type=checkpoint_type,
+            )
+            if candidate is not None:
+                return candidate
+        raise RuntimeError(
+            "Save completed but the server returned no checkpoint metadata "
+            "and no unique completed checkpoint appeared before the recovery timeout"
+        )
 
     @overload
     async def load_state(
