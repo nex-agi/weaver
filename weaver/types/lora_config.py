@@ -45,6 +45,15 @@ class LoraConfig:
     train_attn: bool = True
     """Whether to add LoRAs to the attention layers"""
 
+    lora_alpha: Optional[int] = None
+    """Optional LoRA scaling numerator.
+
+    The effective LoRA scale is ``lora_alpha / rank``. When omitted, the
+    platform keeps its backwards-compatible default (currently 32). Alpha does
+    not change adapter tensor shapes, so models sharing a trainer may choose
+    different values.
+    """
+
     def to_payload(self) -> dict[str, object]:
         """Convert to API payload format."""
         payload: dict[str, object] = {
@@ -53,6 +62,8 @@ class LoraConfig:
             "train_mlp": self.train_mlp,
             "train_attn": self.train_attn,
         }
+        if self.lora_alpha is not None:
+            payload["lora_alpha"] = self.lora_alpha
         if self.seed is not None:
             payload["seed"] = self.seed
         return payload

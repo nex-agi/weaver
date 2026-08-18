@@ -354,7 +354,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             client.create_model(
                 base_model="Qwen/Qwen3-8B",
                 training_mode="lora",
-                lora_config=LoraConfig(rank=16, seed=42)
+                lora_config=LoraConfig(rank=32, lora_alpha=64, seed=42)
             )
 
             # Long-context (256k) variant, full fine-tuning, fast throughput tier
