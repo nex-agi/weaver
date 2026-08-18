@@ -235,6 +235,13 @@ def test_http_binary_is_cross_entropy_only():
     ]
 
 
+def test_http_binary_rejects_protocol_limit_before_upload(monkeypatch):
+    monkeypatch.setattr("weaver.tensor_transport._MAX_TENSOR_PACK_BYTES", 1)
+
+    with pytest.raises(ValueError, match="decoded_size_bytes.*exceeds maximum"):
+        _prepare(transport="http-binary")
+
+
 def test_sync_and_async_multipart_streams_are_identical():
     prepared = _prepare(transport="http-binary")
     assert prepared.tensor_pack is not None
@@ -334,6 +341,18 @@ def test_downloaded_tensor_pack_metadata_is_strict():
     metadata = result_tensor_pack_metadata(payload)
     assert metadata.codec == "raw"
     assert metadata.decoded_size_bytes == 4
+
+
+def test_downloaded_tensor_pack_metadata_reports_protocol_limit():
+    payload = {
+        "tensor_pack": {
+            "size_bytes": (8 << 30) + 1,
+            "sha256": "0" * 64,
+        }
+    }
+
+    with pytest.raises(ValueError, match="size_bytes.*exceeds maximum"):
+        result_tensor_pack_metadata(payload)
 
 
 def test_zstd_result_metadata_and_exact_decompression():
@@ -495,6 +514,33 @@ def test_sync_http_client_downloads_result_pack_once():
 
     assert calls == 1
     assert destination.read() == payload
+
+
+def test_sync_http_client_rejects_protocol_limit_before_request():
+    calls = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500)
+
+    client = APIClient(WeaverConfig(base_url="https://example.test"))
+    client._client.close()
+    client._client = httpx.Client(
+        base_url="https://example.test", transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(ValueError, match="size_bytes.*exceeds maximum"):
+            client.download_tensor_pack(
+                "op-1",
+                io.BytesIO(),
+                size_bytes=(8 << 30) + 1,
+                sha256="0" * 64,
+            )
+    finally:
+        client.close()
+
+    assert calls == 0
 
 
 def test_sync_http_client_verifies_then_decompresses_zstd_result_pack():

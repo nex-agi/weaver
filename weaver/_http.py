@@ -32,7 +32,12 @@ from opentelemetry.trace import Status, StatusCode
 from . import __version__
 from ._telemetry import get_tracer
 from .config import TensorCompression, WeaverConfig
-from .tensor_transport import MultipartLayout, TensorPack, decompress_zstd_tensor_pack
+from .tensor_transport import (
+    MultipartLayout,
+    TensorPack,
+    _bounded_tensor_pack_size,
+    decompress_zstd_tensor_pack,
+)
 
 USER_AGENT: str = f"weaver-sdk/{__version__}"  # type: ignore[has-type]
 
@@ -317,8 +322,7 @@ def stream_download_to_file(
 
 
 def _validate_tensor_pack_expectation(size_bytes: int, sha256: str) -> str:
-    if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
-        raise ValueError("tensor pack size_bytes must be a non-negative integer")
+    _bounded_tensor_pack_size(size_bytes, "tensor_pack.size_bytes")
     if not isinstance(sha256, str) or len(sha256) != 64:
         raise ValueError("tensor pack sha256 must be a SHA-256 hex digest")
     try:
@@ -337,9 +341,10 @@ def _validate_tensor_pack_download(
     digest = _validate_tensor_pack_expectation(size_bytes, sha256)
     if codec not in {"raw", "zstd"}:
         raise ValueError("tensor pack codec must be 'raw' or 'zstd'")
-    decoded_size = size_bytes if decoded_size_bytes is None else decoded_size_bytes
-    if isinstance(decoded_size, bool) or not isinstance(decoded_size, int) or decoded_size < 0:
-        raise ValueError("tensor pack decoded_size_bytes must be a non-negative integer")
+    decoded_size = _bounded_tensor_pack_size(
+        size_bytes if decoded_size_bytes is None else decoded_size_bytes,
+        "tensor_pack.decoded_size_bytes",
+    )
     if codec == "raw" and decoded_size != size_bytes:
         raise ValueError("raw tensor pack decoded_size_bytes must equal size_bytes")
     return digest, decoded_size

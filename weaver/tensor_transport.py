@@ -41,6 +41,7 @@ TENSOR_KEY = "$tensor"
 _RAW_CODEC = "raw"
 _FORMAT = "raw-tensor"
 _STREAM_CHUNK_BYTES = 8 * 1024 * 1024
+_MAX_TENSOR_PACK_BYTES = 8 << 30
 _ZSTD_LEVEL = 3
 _ZSTD_THREADS = 4
 _TORCH_TO_NAME: dict[torch.dtype, str] = {
@@ -62,12 +63,16 @@ class TensorPack:
     decoded_size_bytes: int | None = None
 
     def __post_init__(self) -> None:
+        self.size_bytes = _bounded_tensor_pack_size(self.size_bytes, "tensor_pack.size_bytes")
         if self.codec not in ("raw", "zstd"):
             raise ValueError("tensor pack codec must be 'raw' or 'zstd'")
         if self.decoded_size_bytes is None:
             if self.codec != "raw":
                 raise ValueError("zstd tensor packs require decoded_size_bytes")
             self.decoded_size_bytes = self.size_bytes
+        self.decoded_size_bytes = _bounded_tensor_pack_size(
+            self.decoded_size_bytes, "tensor_pack.decoded_size_bytes"
+        )
         if self.codec == "raw" and self.decoded_size_bytes != self.size_bytes:
             raise ValueError("raw tensor pack decoded_size_bytes must equal size_bytes")
 
@@ -166,6 +171,7 @@ class _PackWriter:
 
         offset = self._offset
         size_bytes = raw.nbytes
+        _bounded_tensor_pack_size(offset + size_bytes, "tensor_pack.decoded_size_bytes")
         self._handle.write(raw)
         if self._codec == "raw":
             self._sha256.update(raw)
@@ -190,9 +196,10 @@ class _PackWriter:
         else:
             self._handle.flush()
         self._resources.close()
+        wire_size = _bounded_tensor_pack_size(self._path.stat().st_size, "tensor_pack.size_bytes")
         return TensorPack(
             self._path,
-            self._path.stat().st_size,
+            wire_size,
             self._sha256.hexdigest(),
             codec=self._codec,
             decoded_size_bytes=self._offset,
@@ -367,7 +374,7 @@ def result_tensor_pack_metadata(payload: Mapping[str, Any]) -> TensorPackMetadat
     metadata = payload.get("tensor_pack")
     if not isinstance(metadata, Mapping):
         raise ValueError("HTTP tensor result is missing tensor_pack metadata")
-    expected_size = _nonnegative_int(metadata.get("size_bytes"), "tensor_pack.size_bytes")
+    expected_size = _bounded_tensor_pack_size(metadata.get("size_bytes"), "tensor_pack.size_bytes")
     expected_sha256 = metadata.get("sha256")
     if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
         raise ValueError("tensor_pack.sha256 must be a SHA-256 hex digest")
@@ -384,7 +391,7 @@ def result_tensor_pack_metadata(payload: Mapping[str, Any]) -> TensorPackMetadat
             raise ValueError("zstd tensor packs require tensor_pack.decoded_size_bytes")
         decoded_size = expected_size
     else:
-        decoded_size = _nonnegative_int(raw_decoded_size, "tensor_pack.decoded_size_bytes")
+        decoded_size = _bounded_tensor_pack_size(raw_decoded_size, "tensor_pack.decoded_size_bytes")
     if codec == "raw" and decoded_size != expected_size:
         raise ValueError("raw tensor pack decoded_size_bytes must equal size_bytes")
     return TensorPackMetadata(
@@ -402,7 +409,7 @@ def decompress_zstd_tensor_pack(
 ) -> None:
     """Decode bounded concatenated Zstandard frames into ``destination``."""
 
-    expected_size = _nonnegative_int(decoded_size_bytes, "tensor_pack.decoded_size_bytes")
+    expected_size = _bounded_tensor_pack_size(decoded_size_bytes, "tensor_pack.decoded_size_bytes")
     source.seek(0)
     destination.seek(0)
     destination.truncate(0)
@@ -513,6 +520,13 @@ def _nonnegative_int(value: Any, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
         raise ValueError(f"{field} must be a non-negative integer")
     return int(value)
+
+
+def _bounded_tensor_pack_size(value: Any, field: str) -> int:
+    size = _nonnegative_int(value, field)
+    if size > _MAX_TENSOR_PACK_BYTES:
+        raise ValueError(f"{field} {size} exceeds maximum {_MAX_TENSOR_PACK_BYTES} bytes")
+    return size
 
 
 async def _await_blocking_io(function: Any, *args: Any) -> Any:
