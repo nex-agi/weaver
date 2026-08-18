@@ -137,6 +137,9 @@ def test_datum_from_raw():
 def test_lora_config_serializes_explicit_alpha_only_when_set():
     default_payload = LoraConfig(rank=32).to_payload()
     assert "lora_alpha" not in default_payload
+    assert default_payload["train_unembed"] is False
+    assert default_payload["train_mlp"] is True
+    assert default_payload["train_attn"] is True
 
     configured_payload = LoraConfig(rank=32, lora_alpha=64).to_payload()
     assert configured_payload["lora_alpha"] == 64

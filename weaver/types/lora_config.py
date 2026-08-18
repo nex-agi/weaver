@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass(slots=True)
@@ -30,22 +29,33 @@ class LoraConfig:
     rank: int
     """LoRA rank (dimension of low-rank matrices)"""
 
-    seed: Optional[int] = None
+    seed: int | None = None
     """Seed used for initialization of LoRA weights.
 
     Useful if you need deterministic or reproducible initialization of weights.
     """
 
-    train_unembed: bool = True
-    """Whether to add LoRA to the unembedding layer"""
+    train_unembed: bool = False
+    """Whether to add LoRA to the unembedding layer.
+
+    This is disabled by default because unembedding-layer adapters are not
+    supported by every trainer/export/serving stack. Set it explicitly only
+    when the selected supported model advertises end-to-end support.
+    """
 
     train_mlp: bool = True
-    """Whether to add LoRAs to the MLP layers (including MoE layers)"""
+    """Whether to add LoRAs to the MLP layers (including MoE layers).
+
+    Backend support for excluding this target group is model dependent.
+    """
 
     train_attn: bool = True
-    """Whether to add LoRAs to the attention layers"""
+    """Whether to add LoRAs to the attention layers.
 
-    lora_alpha: Optional[int] = None
+    Backend support for excluding this target group is model dependent.
+    """
+
+    lora_alpha: int | None = None
     """Optional LoRA scaling numerator.
 
     The effective LoRA scale is ``lora_alpha / rank``. When omitted, the
