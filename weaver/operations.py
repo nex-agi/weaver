@@ -99,8 +99,18 @@ def _operation_poll_delays() -> Iterator[float]:
 
 class WeaverOperationError(RuntimeError):
     def __init__(self, payload: Dict[str, Any]):
-        message = lookup_case_insensitive(payload, "error") or "operation_failed"
-        super().__init__(f"Operation failed: {message}")
+        self.code = str(
+            lookup_case_insensitive(payload, "error_code")
+            or lookup_case_insensitive(payload, "error")
+            or "operation_failed"
+        )
+        reason = lookup_case_insensitive(payload, "error_message")
+        self.message = str(reason) if reason else None
+        self.details = lookup_case_insensitive(payload, "error_details")
+        rendered = f"Operation failed: {self.code}"
+        if self.message:
+            rendered += f": {self.message}"
+        super().__init__(rendered)
         self.payload = payload
 
 
@@ -153,6 +163,7 @@ class OperationHandle(_OperationHandleMixin):
         transient_error_count = 0
         max_transient_errors = _operation_poll_transient_retries()
         if self.done():
+            self._raise_if_failed()
             return self._cached
         for delay in _operation_poll_delays():
             time.sleep(delay)
@@ -227,6 +238,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
         transient_error_count = 0
         max_transient_errors = _operation_poll_transient_retries()
         if self.done():
+            self._raise_if_failed()
             return self._cached
         for delay in _operation_poll_delays():
             await asyncio.sleep(delay)
