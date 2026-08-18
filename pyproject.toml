@@ -38,7 +38,7 @@ dependencies = [
   "socksio>=1.0.0",
   "pydantic>=2.6,<3",
   "torch>=2.3,<3",
-  "transformers>=4.40,<5",
+  "transformers",
   "typing-extensions>=4.8,<5",
   "click>=8.1,<9",
   "rich>=13.0",
