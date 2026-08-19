@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import math
-import tempfile
 import time
 from datetime import datetime, timezone
 from functools import cached_property
@@ -40,13 +39,7 @@ from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .operations import OperationHandle, build_operation_handle
 from .service_client import ServiceClient
-from .tensor_transport import (
-    PreparedOperationBody,
-    materialize_http_tensors,
-    result_tensor_pack_metadata,
-    result_tensor_pack_operation_id,
-    result_uses_http_tensor_pack,
-)
+from .tensor_transport import PreparedOperationBody
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.deployment import Deployment
@@ -154,30 +147,6 @@ class TrainingClient:
         return self._service.enqueue_operation(
             path, prepared.body, tensor_pack=prepared.tensor_pack
         )
-
-    def materialize_result_tensors(self, result: Mapping[str, Any]) -> Dict[str, Any]:
-        """Download every tensor referenced by an HTTP-binary result.
-
-        Args:
-            result: Completed operation result returned by this client.
-        Returns:
-            A copy with tensor references replaced by tensors.
-        Raises:
-            ValueError: If the result metadata or tensor pack is invalid.
-        """
-        if not isinstance(result.get("tensor_pack"), Mapping):
-            return dict(result)
-        metadata = result_tensor_pack_metadata(result)
-        with tempfile.TemporaryFile(mode="w+b") as tensor_pack:
-            self._service.http.download_tensor_pack(
-                result_tensor_pack_operation_id(result),
-                tensor_pack,
-                size_bytes=metadata.size_bytes,
-                sha256=metadata.sha256,
-                codec=metadata.codec,
-                decoded_size_bytes=metadata.decoded_size_bytes,
-            )
-            return dict(materialize_http_tensors(result, tensor_pack))
 
     @overload
     def forward(
@@ -339,9 +308,6 @@ class TrainingClient:
             wait=False,
         )
         fwd_result = fwd_handle.result()
-
-        if result_uses_http_tensor_pack(fwd_result):
-            fwd_result = self.materialize_result_tensors(fwd_result)
         logprob_tensors = parse_logprob_tensors(fwd_result, data)
 
         try:

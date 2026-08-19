@@ -19,18 +19,25 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
+import threading
 import time
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Mapping, Optional
 
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
-from .tensor_transport import bind_result_tensor_pack_operation
+from .tensor_transport import (
+    materialize_http_tensor_payloads,
+    result_tensor_pack_metadata,
+    result_uses_http_tensor_pack,
+)
 
 if TYPE_CHECKING:
     from ._async_http import AsyncAPIClient
 
 logger = logging.getLogger(__name__)
+_RESPONSE_UNSET = object()
 
 _TRANSIENT_OPERATION_POLL_ERROR_FRAGMENTS = (
     "unexpected eof",
@@ -120,6 +127,7 @@ class _OperationHandleMixin:
 
     operation_id: str
     _cached: Dict[str, Any]
+    _response_cache: Any
 
     @property
     def status(self) -> Optional[str]:
@@ -128,9 +136,17 @@ class _OperationHandleMixin:
 
     @property
     def response(self) -> Any:
-        return bind_result_tensor_pack_operation(
-            lookup_case_insensitive(self._cached, "response"), self.operation_id
-        )
+        if self._response_cache is not _RESPONSE_UNSET:
+            return self._response_cache
+        return lookup_case_insensitive(self._cached, "response")
+
+    def _cache_response(self, response: Any) -> None:
+        self._response_cache = response
+        for key in self._cached:
+            if key.lower() == "response":
+                self._cached[key] = response
+                return
+        self._cached["response"] = response
 
     @property
     def error(self) -> Optional[str]:
@@ -151,6 +167,10 @@ class OperationHandle(_OperationHandleMixin):
     client: APIClient
     operation_id: str
     _cached: Dict[str, Any]
+    _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _response_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def from_payload(cls, client: APIClient, payload: Dict[str, Any]) -> "OperationHandle":
@@ -162,11 +182,38 @@ class OperationHandle(_OperationHandleMixin):
         self._cached = self.client.get(path)
         return self._cached
 
+    def _materialize_response(self) -> None:
+        if self._response_cache is not _RESPONSE_UNSET:
+            self._cache_response(self._response_cache)
+            return
+        response = lookup_case_insensitive(self._cached, "response")
+        if not isinstance(response, Mapping) or not result_uses_http_tensor_pack(response):
+            self._cache_response(response)
+            return
+        with self._response_lock:
+            if self._response_cache is not _RESPONSE_UNSET:
+                self._cache_response(self._response_cache)
+                return
+            metadata = result_tensor_pack_metadata(response)
+            with tempfile.TemporaryFile(mode="w+b") as tensor_pack:
+                self.client.download_tensor_pack(
+                    self.operation_id,
+                    tensor_pack,
+                    size_bytes=metadata.size_bytes,
+                    sha256=metadata.sha256,
+                    codec=metadata.codec,
+                    decoded_size_bytes=metadata.decoded_size_bytes,
+                )
+                materialized = dict(materialize_http_tensor_payloads(response, tensor_pack))
+            materialized.pop("tensor_pack", None)
+            self._cache_response(materialized)
+
     def wait(self) -> Dict[str, Any]:
         transient_error_count = 0
         max_transient_errors = _operation_poll_transient_retries()
         if self.done():
             self._raise_if_failed()
+            self._materialize_response()
             return self._cached
         for delay in _operation_poll_delays():
             time.sleep(delay)
@@ -192,6 +239,7 @@ class OperationHandle(_OperationHandleMixin):
         if not self.done():
             raise WeaverAPIError(504, "timeout", "Operation polling timed out", True)
         self._raise_if_failed()
+        self._materialize_response()
         return self._cached
 
     def result(self) -> Any:
@@ -224,6 +272,10 @@ class AsyncOperationHandle(_OperationHandleMixin):
     client: "AsyncAPIClient"
     operation_id: str
     _cached: Dict[str, Any]
+    _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _response_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def from_payload(
@@ -237,11 +289,47 @@ class AsyncOperationHandle(_OperationHandleMixin):
         self._cached = await self.client.get(path)
         return self._cached
 
+    async def _materialize_response(self) -> None:
+        if self._response_cache is not _RESPONSE_UNSET:
+            self._cache_response(self._response_cache)
+            return
+        response = lookup_case_insensitive(self._cached, "response")
+        if not isinstance(response, Mapping) or not result_uses_http_tensor_pack(response):
+            self._cache_response(response)
+            return
+        async with self._response_lock:
+            if self._response_cache is not _RESPONSE_UNSET:
+                self._cache_response(self._response_cache)
+                return
+            from ._async_http import _await_blocking_io, _open_temporary_file
+
+            metadata = result_tensor_pack_metadata(response)
+            tensor_pack = await _open_temporary_file()
+            try:
+                await self.client.download_tensor_pack(
+                    self.operation_id,
+                    tensor_pack,
+                    size_bytes=metadata.size_bytes,
+                    sha256=metadata.sha256,
+                    codec=metadata.codec,
+                    decoded_size_bytes=metadata.decoded_size_bytes,
+                )
+                materialized = dict(
+                    await _await_blocking_io(
+                        materialize_http_tensor_payloads, response, tensor_pack
+                    )
+                )
+            finally:
+                await _await_blocking_io(tensor_pack.close)
+            materialized.pop("tensor_pack", None)
+            self._cache_response(materialized)
+
     async def wait(self) -> Dict[str, Any]:
         transient_error_count = 0
         max_transient_errors = _operation_poll_transient_retries()
         if self.done():
             self._raise_if_failed()
+            await self._materialize_response()
             return self._cached
         for delay in _operation_poll_delays():
             await asyncio.sleep(delay)
@@ -267,6 +355,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
         if not self.done():
             raise WeaverAPIError(504, "timeout", "Operation polling timed out", True)
         self._raise_if_failed()
+        await self._materialize_response()
         return self._cached
 
     async def result(self) -> Any:

@@ -44,6 +44,7 @@ _STREAM_CHUNK_BYTES = 8 * 1024 * 1024
 _MAX_TENSOR_PACK_BYTES = 8 << 30
 _ZSTD_LEVEL = 3
 _ZSTD_THREADS = 4
+_ZSTD_FRAME_MAGIC = b"\x28\xb5\x2f\xfd"
 _TORCH_TO_NAME: dict[torch.dtype, str] = {
     torch.int64: "int64",
     torch.int32: "int32",
@@ -345,29 +346,6 @@ def result_uses_http_tensor_pack(payload: Mapping[str, Any]) -> bool:
     return isinstance(payload.get("tensor_pack"), Mapping)
 
 
-def bind_result_tensor_pack_operation(payload: Any, operation_id: str) -> Any:
-    """Attach the operation needed to retrieve a referenced result pack."""
-
-    if not isinstance(payload, Mapping):
-        return payload
-    metadata = payload.get("tensor_pack")
-    if not isinstance(metadata, Mapping):
-        return payload
-    bound = dict(payload)
-    bound["tensor_pack"] = {**metadata, "operation_id": operation_id}
-    return bound
-
-
-def result_tensor_pack_operation_id(payload: Mapping[str, Any]) -> str:
-    """Return the operation identifier bound to an HTTP result pack."""
-
-    metadata = payload.get("tensor_pack")
-    operation_id = metadata.get("operation_id") if isinstance(metadata, Mapping) else None
-    if not isinstance(operation_id, str) or not operation_id:
-        raise ValueError("HTTP tensor result is missing tensor_pack.operation_id")
-    return operation_id
-
-
 def result_tensor_pack_metadata(payload: Mapping[str, Any]) -> TensorPackMetadata:
     """Parse the required size and digest for an HTTP result pack."""
 
@@ -407,22 +385,23 @@ def decompress_zstd_tensor_pack(
     destination: BinaryIO,
     decoded_size_bytes: int,
 ) -> None:
-    """Decode bounded concatenated Zstandard frames into ``destination``."""
+    """Decode exactly one bounded Zstandard frame into ``destination``."""
 
     expected_size = _bounded_tensor_pack_size(decoded_size_bytes, "tensor_pack.decoded_size_bytes")
+    _validate_single_zstd_frame(source)
     source.seek(0)
     destination.seek(0)
     destination.truncate(0)
     decoded = 0
     reader = zstandard.ZstdDecompressor().stream_reader(
         source,
-        read_across_frames=True,
+        read_across_frames=False,
         closefd=False,
     )
     try:
         while True:
-            # Reading one byte past the declared combined size detects
-            # expansion without allowing an unbounded allocation.
+            # Reading one byte past the declared size detects expansion
+            # without allowing an unbounded allocation.
             read_size = min(_STREAM_CHUNK_BYTES, expected_size - decoded + 1)
             try:
                 output = reader.read(read_size)
@@ -450,6 +429,56 @@ def decompress_zstd_tensor_pack(
     destination.seek(0)
 
 
+def _validate_single_zstd_frame(source: BinaryIO) -> None:
+    """Reject truncated frames and any bytes following the first frame."""
+
+    original_position = source.tell()
+    try:
+        source.seek(0, os.SEEK_END)
+        wire_size = source.tell()
+        source.seek(0)
+
+        def read_exact(size: int) -> bytes:
+            data = source.read(size)
+            if len(data) != size:
+                raise ValueError("zstd tensor pack is truncated")
+            return data
+
+        if read_exact(4) != _ZSTD_FRAME_MAGIC:
+            raise ValueError("zstd tensor pack has an invalid frame header")
+        descriptor = read_exact(1)[0]
+        if descriptor & 0x08:
+            raise ValueError("zstd tensor pack has an invalid frame header")
+
+        single_segment = bool(descriptor & 0x20)
+        content_size_flag = descriptor >> 6
+        dictionary_id_size = (0, 1, 2, 4)[descriptor & 0x03]
+        content_size = (1 if single_segment else 0, 2, 4, 8)[content_size_flag]
+        header_suffix = (0 if single_segment else 1) + dictionary_id_size + content_size
+        read_exact(header_suffix)
+
+        while True:
+            block_header = int.from_bytes(read_exact(3), "little")
+            last_block = bool(block_header & 0x01)
+            block_type = (block_header >> 1) & 0x03
+            block_size = block_header >> 3
+            if block_type == 3:
+                raise ValueError("zstd tensor pack has an invalid block header")
+            encoded_size = 1 if block_type == 1 else block_size
+            if encoded_size > wire_size - source.tell():
+                raise ValueError("zstd tensor pack is truncated")
+            source.seek(encoded_size, os.SEEK_CUR)
+            if last_block:
+                break
+
+        if descriptor & 0x04:
+            read_exact(4)
+        if source.tell() != wire_size:
+            raise ValueError("zstd tensor pack must contain exactly one frame")
+    finally:
+        source.seek(original_position)
+
+
 def materialize_http_tensor(reference: Mapping[str, Any], pack: BinaryIO) -> torch.Tensor:
     descriptor = reference.get(TENSOR_KEY)
     if not isinstance(descriptor, Mapping):
@@ -457,15 +486,23 @@ def materialize_http_tensor(reference: Mapping[str, Any], pack: BinaryIO) -> tor
     return _materialize_raw_tensor_slice(descriptor, pack, name="$tensor")
 
 
-def materialize_http_tensors(value: Any, pack: BinaryIO) -> Any:
-    """Return a copy with every nested HTTP tensor reference materialized."""
+def materialize_http_tensor_payloads(value: Any, pack: BinaryIO) -> Any:
+    """Reconstruct legacy inline tensor payloads from nested references."""
 
     if isinstance(value, Mapping):
         if TENSOR_KEY in value:
-            return materialize_http_tensor(value, pack)
-        return {key: materialize_http_tensors(item, pack) for key, item in value.items()}
+            descriptor = value.get(TENSOR_KEY)
+            if not isinstance(descriptor, Mapping):
+                raise ValueError("$tensor must contain an object descriptor")
+            tensor = _materialize_raw_tensor_slice(descriptor, pack, name="$tensor")
+            return {
+                "data": tensor.tolist(),
+                "dtype": descriptor.get("dtype"),
+                "shape": list(tensor.shape),
+            }
+        return {key: materialize_http_tensor_payloads(item, pack) for key, item in value.items()}
     if isinstance(value, list):
-        return [materialize_http_tensors(item, pack) for item in value]
+        return [materialize_http_tensor_payloads(item, pack) for item in value]
     return value
 
 

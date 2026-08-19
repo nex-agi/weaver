@@ -375,23 +375,38 @@ def test_zstd_result_metadata_and_exact_decompression():
     assert destination.read() == decoded
 
 
-def test_zstd_decompression_accepts_bounded_concatenated_frames():
-    compressor = zstandard.ZstdCompressor()
-    wire = compressor.compress(b"abc") + compressor.compress(b"def")
+def test_zstd_decompression_accepts_one_streaming_frame():
+    decoded = b"streaming tensor pack" * 100
+    wire_file = io.BytesIO()
+    compressor = zstandard.ZstdCompressor(write_checksum=True).stream_writer(
+        wire_file, closefd=False
+    )
+    compressor.write(decoded)
+    compressor.close()
     destination = io.BytesIO()
 
-    decompress_zstd_tensor_pack(io.BytesIO(wire), destination, 6)
+    decompress_zstd_tensor_pack(wire_file, destination, len(decoded))
 
-    assert destination.read() == b"abcdef"
+    assert destination.read() == decoded
 
 
-def test_operation_results_bind_binary_pack_without_changing_inline_results():
+def test_zstd_decompression_rejects_concatenated_frames():
+    compressor = zstandard.ZstdCompressor()
+    wire = compressor.compress(b"abc") + compressor.compress(b"def")
+
+    with pytest.raises(ValueError, match="exactly one frame"):
+        decompress_zstd_tensor_pack(io.BytesIO(wire), io.BytesIO(), 6)
+
+
+@pytest.mark.parametrize("codec", ["raw", "zstd"])
+def test_operation_results_transparently_materialize_and_cache_binary_pack(codec):
     values = np.asarray([-0.2, -0.4], dtype="<f4")
-    binary = _http_logprob_result(values)
-    inline = {"result": {"loss_fn_outputs": [{"logprobs": {"data": [-0.2]}}]}}
+    binary = _http_logprob_result(values, codec=codec)
+    inline = _inline_logprob_result(values)
+    client = _SyncTensorPackClient(values.tobytes(), codec)
 
     binary_handle = OperationHandle(
-        client=SimpleNamespace(),
+        client=client,
         operation_id="op-1",
         _cached={"status": "done", "response": binary},
     )
@@ -401,9 +416,12 @@ def test_operation_results_bind_binary_pack_without_changing_inline_results():
         _cached={"status": "done", "response": inline},
     )
 
-    bound = binary_handle.result()
-    assert bound["tensor_pack"]["operation_id"] == "op-1"
-    assert "operation_id" not in binary["tensor_pack"]
+    waited = binary_handle.wait()
+    assert waited["response"] == inline
+    assert binary_handle.response == inline
+    assert binary_handle.result() == inline
+    assert "tensor_pack" not in binary_handle.result()
+    assert client.calls == 1
     assert inline_handle.result() is inline
 
 
@@ -416,19 +434,60 @@ def test_result_tensor_pack_detection_does_not_scan_inline_outputs():
     assert result_uses_http_tensor_pack({"tensor_pack": {"size_bytes": 1}})
 
 
-def test_async_operation_result_binds_binary_pack():
+@pytest.mark.parametrize("codec", ["raw", "zstd"])
+def test_async_operation_result_transparently_materializes_and_caches_pack(codec):
     async def exercise() -> None:
         values = np.asarray([-0.2, -0.4], dtype="<f4")
-        result = _http_logprob_result(values)
+        result = _http_logprob_result(values, codec=codec)
+        client = _AsyncTensorPackClient(values.tobytes(), codec)
         handle = AsyncOperationHandle(
-            client=SimpleNamespace(),
+            client=client,
             operation_id="op-1",
             _cached={"status": "done", "response": result},
         )
 
-        bound = await handle.result()
+        waited = await handle.wait()
+        expected = _inline_logprob_result(values)
+        assert waited["response"] == expected
+        assert handle.response == expected
+        assert await handle.result() == expected
+        assert "tensor_pack" not in await handle.result()
+        assert client.calls == 1
 
-        assert bound["tensor_pack"]["operation_id"] == "op-1"
+    asyncio.run(exercise())
+
+
+def test_operation_wait_all_materializes_binary_results():
+    values = np.asarray([-0.2, -0.4], dtype="<f4")
+    clients = [_SyncTensorPackClient(values.tobytes(), "raw") for _ in range(2)]
+    handles = [
+        OperationHandle(
+            client=client,
+            operation_id="op-1",
+            _cached={"status": "done", "response": _http_logprob_result(values)},
+        )
+        for client in clients
+    ]
+
+    assert OperationHandle.wait_all(handles) == [_inline_logprob_result(values)] * 2
+    assert [client.calls for client in clients] == [1, 1]
+
+
+def test_async_operation_wait_all_materializes_binary_results():
+    async def exercise() -> None:
+        values = np.asarray([-0.2, -0.4], dtype="<f4")
+        clients = [_AsyncTensorPackClient(values.tobytes(), "raw") for _ in range(2)]
+        handles = [
+            AsyncOperationHandle(
+                client=client,
+                operation_id="op-1",
+                _cached={"status": "done", "response": _http_logprob_result(values)},
+            )
+            for client in clients
+        ]
+
+        assert await AsyncOperationHandle.wait_all(handles) == [_inline_logprob_result(values)] * 2
+        assert [client.calls for client in clients] == [1, 1]
 
     asyncio.run(exercise())
 
@@ -442,7 +501,7 @@ def test_async_operation_result_binds_binary_pack():
         (
             zstandard.ZstdCompressor().compress(b"0123456789") + b"trailing",
             10,
-            "trailing compressed data",
+            "exactly one frame",
         ),
     ],
 )
@@ -666,7 +725,25 @@ def test_async_http_client_streams_multipart_and_result_pack():
     asyncio.run(exercise())
 
 
-def _http_logprob_result(values: np.ndarray) -> dict:
+def _inline_logprob_result(values: np.ndarray) -> dict:
+    return {
+        "result": {
+            "loss_fn_outputs": [
+                {
+                    "logprobs": {
+                        "data": values.tolist(),
+                        "dtype": "float32",
+                        "shape": list(values.shape),
+                    }
+                }
+            ]
+        }
+    }
+
+
+def _http_logprob_result(values: np.ndarray, *, codec: str = "raw") -> dict:
+    decoded = values.tobytes()
+    wire = zstandard.ZstdCompressor().compress(decoded) if codec == "zstd" else decoded
     return {
         "result": {
             "loss_fn_outputs": [
@@ -685,10 +762,37 @@ def _http_logprob_result(values: np.ndarray) -> dict:
             ]
         },
         "tensor_pack": {
-            "size_bytes": values.nbytes,
-            "sha256": hashlib.sha256(values.tobytes()).hexdigest(),
+            "size_bytes": len(wire),
+            "sha256": hashlib.sha256(wire).hexdigest(),
+            "codec": codec,
+            "decoded_size_bytes": len(decoded),
         },
     }
+
+
+class _SyncTensorPackClient:
+    def __init__(self, decoded: bytes, codec: str) -> None:
+        self.decoded = decoded
+        self.codec = codec
+        self.wire = zstandard.ZstdCompressor().compress(decoded) if codec == "zstd" else decoded
+        self.calls = 0
+
+    def download_tensor_pack(self, operation_id, destination, **metadata):
+        assert operation_id == "op-1"
+        assert metadata == {
+            "size_bytes": len(self.wire),
+            "sha256": hashlib.sha256(self.wire).hexdigest(),
+            "codec": self.codec,
+            "decoded_size_bytes": len(self.decoded),
+        }
+        self.calls += 1
+        destination.write(self.decoded)
+        destination.seek(0)
+
+
+class _AsyncTensorPackClient(_SyncTensorPackClient):
+    async def download_tensor_pack(self, operation_id, destination, **metadata):
+        super().download_tensor_pack(operation_id, destination, **metadata)
 
 
 def _nested_http_tensor_result() -> tuple[dict, bytes]:
@@ -696,64 +800,42 @@ def _nested_http_tensor_result() -> tuple[dict, bytes]:
     result = _http_logprob_result(values)
     reference = result["result"]["loss_fn_outputs"][0].pop("logprobs")
     result["result"]["loss_fn_outputs"][0]["custom"] = {"nested": [reference, reference]}
-    result["tensor_pack"]["operation_id"] = "op-1"
     return result, values.tobytes()
 
 
-def _write_test_tensor_pack(pack, operation_id, destination, **metadata):
-    assert operation_id == "op-1"
-    assert metadata == {
-        "size_bytes": len(pack),
-        "sha256": hashlib.sha256(pack).hexdigest(),
-        "codec": "raw",
-        "decoded_size_bytes": len(pack),
-    }
-    destination.write(pack)
-    destination.seek(0)
-
-
-def test_sync_client_materializes_every_nested_result_tensor():
+def test_sync_operation_materializes_every_nested_result_tensor():
     result, pack = _nested_http_tensor_result()
-    download_client = SimpleNamespace(
-        download_tensor_pack=lambda operation_id, destination, **metadata: (
-            _write_test_tensor_pack(pack, operation_id, destination, **metadata)
-        )
-    )
-    client = TrainingClient(
-        service=SimpleNamespace(http=download_client),
-        model_id="model-1",
-        base_model="base",
-        session_id="session-1",
+    download_client = _SyncTensorPackClient(pack, "raw")
+    handle = OperationHandle(
+        client=download_client,
+        operation_id="op-1",
+        _cached={"status": "done", "response": result},
     )
 
-    materialized = client.materialize_result_tensors(result)
+    materialized = handle.result()
 
     output = materialized["result"]["loss_fn_outputs"][0]
-    expected = torch.tensor([0.25, 0.5], dtype=torch.float32)
-    assert all(torch.equal(tensor, expected) for tensor in output["custom"]["nested"])
+    expected = {"data": [0.25, 0.5], "dtype": "float32", "shape": [2]}
+    assert output["custom"]["nested"] == [expected, expected]
+    assert "tensor_pack" not in materialized
     assert TENSOR_KEY in result["result"]["loss_fn_outputs"][0]["custom"]["nested"][0]
 
 
-def test_async_client_materializes_every_nested_result_tensor():
+def test_async_operation_materializes_every_nested_result_tensor():
     async def exercise() -> None:
         result, pack = _nested_http_tensor_result()
-
-        class DownloadClient:
-            async def download_tensor_pack(self, operation_id, destination, **metadata):
-                _write_test_tensor_pack(pack, operation_id, destination, **metadata)
-
-        client = AsyncTrainingClient(
-            service=SimpleNamespace(http=DownloadClient()),
-            model_id="model-1",
-            base_model="base",
-            session_id="session-1",
+        handle = AsyncOperationHandle(
+            client=_AsyncTensorPackClient(pack, "raw"),
+            operation_id="op-1",
+            _cached={"status": "done", "response": result},
         )
 
-        materialized = await client.materialize_result_tensors(result)
+        materialized = await handle.result()
 
         output = materialized["result"]["loss_fn_outputs"][0]
-        expected = torch.tensor([0.25, 0.5], dtype=torch.float32)
-        assert all(torch.equal(tensor, expected) for tensor in output["custom"]["nested"])
+        expected = {"data": [0.25, 0.5], "dtype": "float32", "shape": [2]}
+        assert output["custom"]["nested"] == [expected, expected]
+        assert "tensor_pack" not in materialized
 
     asyncio.run(exercise())
 
