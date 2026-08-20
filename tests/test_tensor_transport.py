@@ -21,6 +21,7 @@ import hashlib
 import io
 import json
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from email.parser import BytesParser
 from email.policy import default as email_policy
 from types import MethodType, SimpleNamespace
@@ -545,6 +546,147 @@ def test_async_operation_refresh_materializes_binary_transition(codec):
         assert client.calls == 1
 
     asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_operation_refresh_coordinates_with_inflight_materialization(changed):
+    first_values = np.asarray([-0.2, -0.4], dtype="<f4")
+    refreshed_values = np.asarray([-0.6, -0.8], dtype="<f4") if changed else first_values
+    first_response = _http_logprob_result(first_values)
+    refreshed_response = _http_logprob_result(refreshed_values)
+    packs = {
+        first_response["tensor_pack"]["sha256"]: first_values.tobytes(),
+        refreshed_response["tensor_pack"]["sha256"]: refreshed_values.tobytes(),
+    }
+    download_started = threading.Event()
+    allow_download = threading.Event()
+    refresh_started = threading.Event()
+    allow_refresh = threading.Event()
+    refresh_returning = threading.Event()
+
+    class CoordinatedClient:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, path):
+            assert path == "/api/v1/operations/op-1"
+            refresh_started.set()
+            if not changed:
+                assert allow_refresh.wait(timeout=5)
+            refresh_returning.set()
+            return {"status": "done", "response": refreshed_response}
+
+        def download_tensor_pack(self, operation_id, destination, **metadata):
+            assert operation_id == "op-1"
+            decoded = packs[metadata["sha256"]]
+            assert metadata["size_bytes"] == len(decoded)
+            assert metadata["decoded_size_bytes"] == len(decoded)
+            assert metadata["codec"] == "raw"
+            self.calls.append(metadata["sha256"])
+            if len(self.calls) == 1:
+                download_started.set()
+                assert allow_download.wait(timeout=5)
+            destination.write(decoded)
+            destination.seek(0)
+
+    client = CoordinatedClient()
+    handle = OperationHandle(
+        client=client,
+        operation_id="op-1",
+        _cached={"status": "done", "response": first_response},
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        result_future = pool.submit(handle.result)
+        assert download_started.wait(timeout=5)
+        refresh_future = pool.submit(handle.refresh)
+        assert refresh_started.wait(timeout=5)
+        if changed:
+            assert refresh_returning.wait(timeout=5)
+            allow_download.set()
+        else:
+            allow_download.set()
+            result_future.result(timeout=5)
+            allow_refresh.set()
+            assert refresh_returning.wait(timeout=5)
+        result_future.result(timeout=5)
+        refreshed_payload = refresh_future.result(timeout=5)
+
+    expected = _inline_logprob_result(refreshed_values)
+    assert refreshed_payload["response"] == expected
+    assert handle.response == expected
+    assert len(client.calls) == (2 if changed else 1)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_async_operation_refresh_coordinates_with_inflight_materialization(changed):
+    async def exercise() -> None:
+        first_values = np.asarray([-0.2, -0.4], dtype="<f4")
+        refreshed_values = np.asarray([-0.6, -0.8], dtype="<f4") if changed else first_values
+        first_response = _http_logprob_result(first_values)
+        refreshed_response = _http_logprob_result(refreshed_values)
+        packs = {
+            first_response["tensor_pack"]["sha256"]: first_values.tobytes(),
+            refreshed_response["tensor_pack"]["sha256"]: refreshed_values.tobytes(),
+        }
+        download_started = asyncio.Event()
+        allow_download = asyncio.Event()
+        refresh_started = asyncio.Event()
+        allow_refresh = asyncio.Event()
+        refresh_returning = asyncio.Event()
+
+        class CoordinatedClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get(self, path):
+                assert path == "/api/v1/operations/op-1"
+                refresh_started.set()
+                if not changed:
+                    await allow_refresh.wait()
+                refresh_returning.set()
+                return {"status": "done", "response": refreshed_response}
+
+            async def download_tensor_pack(self, operation_id, destination, **metadata):
+                assert operation_id == "op-1"
+                decoded = packs[metadata["sha256"]]
+                assert metadata["size_bytes"] == len(decoded)
+                assert metadata["decoded_size_bytes"] == len(decoded)
+                assert metadata["codec"] == "raw"
+                self.calls.append(metadata["sha256"])
+                if len(self.calls) == 1:
+                    download_started.set()
+                    await allow_download.wait()
+                destination.write(decoded)
+                destination.seek(0)
+
+        client = CoordinatedClient()
+        handle = AsyncOperationHandle(
+            client=client,
+            operation_id="op-1",
+            _cached={"status": "done", "response": first_response},
+        )
+        result_task = asyncio.create_task(handle.result())
+        await download_started.wait()
+        refresh_task = asyncio.create_task(handle.refresh())
+        await refresh_started.wait()
+        if changed:
+            await refresh_returning.wait()
+            allow_download.set()
+        else:
+            allow_download.set()
+            await result_task
+            allow_refresh.set()
+            await refresh_returning.wait()
+        await result_task
+        refreshed_payload = await refresh_task
+
+        expected = _inline_logprob_result(refreshed_values)
+        assert refreshed_payload["response"] == expected
+        assert handle.response == expected
+        assert len(client.calls) == (2 if changed else 1)
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=10))
 
 
 def test_operation_wait_all_materializes_binary_results():

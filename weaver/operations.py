@@ -128,6 +128,7 @@ class _OperationHandleMixin:
     operation_id: str
     _cached: Dict[str, Any]
     _response_cache: Any
+    _response_source: Any
 
     @property
     def status(self) -> Optional[str]:
@@ -147,6 +148,25 @@ class _OperationHandleMixin:
                 self._cached[key] = response
                 return
         self._cached["response"] = response
+
+    def _install_refreshed_payload(self, payload: Dict[str, Any]) -> bool:
+        response = lookup_case_insensitive(payload, "response")
+        status = lookup_case_insensitive(payload, "status")
+        reuse_cache = (
+            str(status).lower() == "done"
+            and self._response_cache is not _RESPONSE_UNSET
+            and self._response_source is not _RESPONSE_UNSET
+            and isinstance(response, Mapping)
+            and result_uses_http_tensor_pack(response)
+            and response == self._response_source
+        )
+        self._cached = payload
+        if reuse_cache:
+            self._cache_response(self._response_cache)
+            return True
+        self._response_cache = _RESPONSE_UNSET
+        self._response_source = _RESPONSE_UNSET
+        return False
 
     @property
     def error(self) -> Optional[str]:
@@ -168,6 +188,7 @@ class OperationHandle(_OperationHandleMixin):
     operation_id: str
     _cached: Dict[str, Any]
     _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _response_source: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
     _response_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -179,36 +200,38 @@ class OperationHandle(_OperationHandleMixin):
 
     def refresh(self) -> Dict[str, Any]:
         path = f"/api/v1/operations/{self.operation_id}"
-        self._cached = self.client.get(path)
-        self._response_cache = _RESPONSE_UNSET
-        if self.status == "done":
-            self._materialize_response()
-        return self._cached
+        payload = self.client.get(path)
+        with self._response_lock:
+            reused_cache = self._install_refreshed_payload(payload)
+            if self.status == "done" and not reused_cache:
+                self._materialize_response_locked()
+            return self._cached
 
     def _materialize_response(self) -> None:
+        with self._response_lock:
+            self._materialize_response_locked()
+
+    def _materialize_response_locked(self) -> None:
         if self._response_cache is not _RESPONSE_UNSET:
             self._cache_response(self._response_cache)
             return
         response = lookup_case_insensitive(self._cached, "response")
         if not isinstance(response, Mapping) or not result_uses_http_tensor_pack(response):
             return
-        with self._response_lock:
-            if self._response_cache is not _RESPONSE_UNSET:
-                self._cache_response(self._response_cache)
-                return
-            metadata = result_tensor_pack_metadata(response)
-            with tempfile.TemporaryFile(mode="w+b") as tensor_pack:
-                self.client.download_tensor_pack(
-                    self.operation_id,
-                    tensor_pack,
-                    size_bytes=metadata.size_bytes,
-                    sha256=metadata.sha256,
-                    codec=metadata.codec,
-                    decoded_size_bytes=metadata.decoded_size_bytes,
-                )
-                materialized = dict(materialize_http_tensor_payloads(response, tensor_pack))
-            materialized.pop("tensor_pack", None)
-            self._cache_response(materialized)
+        metadata = result_tensor_pack_metadata(response)
+        with tempfile.TemporaryFile(mode="w+b") as tensor_pack:
+            self.client.download_tensor_pack(
+                self.operation_id,
+                tensor_pack,
+                size_bytes=metadata.size_bytes,
+                sha256=metadata.sha256,
+                codec=metadata.codec,
+                decoded_size_bytes=metadata.decoded_size_bytes,
+            )
+            materialized = dict(materialize_http_tensor_payloads(response, tensor_pack))
+        materialized.pop("tensor_pack", None)
+        self._response_source = response
+        self._cache_response(materialized)
 
     def wait(self) -> Dict[str, Any]:
         transient_error_count = 0
@@ -275,6 +298,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
     operation_id: str
     _cached: Dict[str, Any]
     _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _response_source: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
     _response_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, init=False, repr=False, compare=False
     )
@@ -288,45 +312,45 @@ class AsyncOperationHandle(_OperationHandleMixin):
 
     async def refresh(self) -> Dict[str, Any]:
         path = f"/api/v1/operations/{self.operation_id}"
-        self._cached = await self.client.get(path)
-        self._response_cache = _RESPONSE_UNSET
-        if self.status == "done":
-            await self._materialize_response()
-        return self._cached
+        payload = await self.client.get(path)
+        async with self._response_lock:
+            reused_cache = self._install_refreshed_payload(payload)
+            if self.status == "done" and not reused_cache:
+                await self._materialize_response_locked()
+            return self._cached
 
     async def _materialize_response(self) -> None:
+        async with self._response_lock:
+            await self._materialize_response_locked()
+
+    async def _materialize_response_locked(self) -> None:
         if self._response_cache is not _RESPONSE_UNSET:
             self._cache_response(self._response_cache)
             return
         response = lookup_case_insensitive(self._cached, "response")
         if not isinstance(response, Mapping) or not result_uses_http_tensor_pack(response):
             return
-        async with self._response_lock:
-            if self._response_cache is not _RESPONSE_UNSET:
-                self._cache_response(self._response_cache)
-                return
-            from ._async_http import _await_blocking_io, _open_temporary_file
+        from ._async_http import _await_blocking_io, _open_temporary_file
 
-            metadata = result_tensor_pack_metadata(response)
-            tensor_pack = await _open_temporary_file()
-            try:
-                await self.client.download_tensor_pack(
-                    self.operation_id,
-                    tensor_pack,
-                    size_bytes=metadata.size_bytes,
-                    sha256=metadata.sha256,
-                    codec=metadata.codec,
-                    decoded_size_bytes=metadata.decoded_size_bytes,
-                )
-                materialized = dict(
-                    await _await_blocking_io(
-                        materialize_http_tensor_payloads, response, tensor_pack
-                    )
-                )
-            finally:
-                await _await_blocking_io(tensor_pack.close)
-            materialized.pop("tensor_pack", None)
-            self._cache_response(materialized)
+        metadata = result_tensor_pack_metadata(response)
+        tensor_pack = await _open_temporary_file()
+        try:
+            await self.client.download_tensor_pack(
+                self.operation_id,
+                tensor_pack,
+                size_bytes=metadata.size_bytes,
+                sha256=metadata.sha256,
+                codec=metadata.codec,
+                decoded_size_bytes=metadata.decoded_size_bytes,
+            )
+            materialized = dict(
+                await _await_blocking_io(materialize_http_tensor_payloads, response, tensor_pack)
+            )
+        finally:
+            await _await_blocking_io(tensor_pack.close)
+        materialized.pop("tensor_pack", None)
+        self._response_source = response
+        self._cache_response(materialized)
 
     async def wait(self) -> Dict[str, Any]:
         transient_error_count = 0
