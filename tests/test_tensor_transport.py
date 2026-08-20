@@ -457,6 +457,96 @@ def test_async_operation_result_transparently_materializes_and_caches_pack(codec
     asyncio.run(exercise())
 
 
+def test_operation_refresh_replaces_inline_result_without_stale_cache():
+    class RefreshClient:
+        def get(self, path):
+            assert path == "/api/v1/operations/op-1"
+            return {"status": "done", "response": {"value": 2}}
+
+    handle = OperationHandle(
+        client=RefreshClient(),
+        operation_id="op-1",
+        _cached={"status": "done", "response": {"value": 1}},
+    )
+
+    assert handle.result() == {"value": 1}
+    assert handle.refresh()["response"] == {"value": 2}
+    assert handle.response == {"value": 2}
+    assert handle.result() == {"value": 2}
+
+
+def test_async_operation_refresh_replaces_inline_result_without_stale_cache():
+    async def exercise() -> None:
+        class RefreshClient:
+            async def get(self, path):
+                assert path == "/api/v1/operations/op-1"
+                return {"status": "done", "response": {"value": 2}}
+
+        handle = AsyncOperationHandle(
+            client=RefreshClient(),
+            operation_id="op-1",
+            _cached={"status": "done", "response": {"value": 1}},
+        )
+
+        assert await handle.result() == {"value": 1}
+        assert (await handle.refresh())["response"] == {"value": 2}
+        assert handle.response == {"value": 2}
+        assert await handle.result() == {"value": 2}
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("codec", ["raw", "zstd"])
+def test_operation_refresh_materializes_binary_transition(codec):
+    values = np.asarray([-0.2, -0.4], dtype="<f4")
+    result = _http_logprob_result(values, codec=codec)
+
+    class RefreshClient(_SyncTensorPackClient):
+        def get(self, path):
+            assert path == "/api/v1/operations/op-1"
+            return {"status": "done", "response": result}
+
+    client = RefreshClient(values.tobytes(), codec)
+    handle = OperationHandle(
+        client=client,
+        operation_id="op-1",
+        _cached={"status": "processing"},
+    )
+
+    expected = _inline_logprob_result(values)
+    assert handle.refresh()["response"] == expected
+    assert handle.response == expected
+    assert handle.result() == expected
+    assert client.calls == 1
+
+
+@pytest.mark.parametrize("codec", ["raw", "zstd"])
+def test_async_operation_refresh_materializes_binary_transition(codec):
+    async def exercise() -> None:
+        values = np.asarray([-0.2, -0.4], dtype="<f4")
+        result = _http_logprob_result(values, codec=codec)
+
+        class RefreshClient(_AsyncTensorPackClient):
+            async def get(self, path):
+                assert path == "/api/v1/operations/op-1"
+                return {"status": "done", "response": result}
+
+        client = RefreshClient(values.tobytes(), codec)
+        handle = AsyncOperationHandle(
+            client=client,
+            operation_id="op-1",
+            _cached={"status": "processing"},
+        )
+
+        expected = _inline_logprob_result(values)
+        assert (await handle.refresh())["response"] == expected
+        assert handle.response == expected
+        assert await handle.result() == expected
+        assert client.calls == 1
+
+    asyncio.run(exercise())
+
+
 def test_operation_wait_all_materializes_binary_results():
     values = np.asarray([-0.2, -0.4], dtype="<f4")
     clients = [_SyncTensorPackClient(values.tobytes(), "raw") for _ in range(2)]

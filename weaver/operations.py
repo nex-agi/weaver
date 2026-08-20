@@ -180,6 +180,9 @@ class OperationHandle(_OperationHandleMixin):
     def refresh(self) -> Dict[str, Any]:
         path = f"/api/v1/operations/{self.operation_id}"
         self._cached = self.client.get(path)
+        self._response_cache = _RESPONSE_UNSET
+        if self.status == "done":
+            self._materialize_response()
         return self._cached
 
     def _materialize_response(self) -> None:
@@ -188,7 +191,6 @@ class OperationHandle(_OperationHandleMixin):
             return
         response = lookup_case_insensitive(self._cached, "response")
         if not isinstance(response, Mapping) or not result_uses_http_tensor_pack(response):
-            self._cache_response(response)
             return
         with self._response_lock:
             if self._response_cache is not _RESPONSE_UNSET:
@@ -287,6 +289,9 @@ class AsyncOperationHandle(_OperationHandleMixin):
     async def refresh(self) -> Dict[str, Any]:
         path = f"/api/v1/operations/{self.operation_id}"
         self._cached = await self.client.get(path)
+        self._response_cache = _RESPONSE_UNSET
+        if self.status == "done":
+            await self._materialize_response()
         return self._cached
 
     async def _materialize_response(self) -> None:
@@ -295,7 +300,6 @@ class AsyncOperationHandle(_OperationHandleMixin):
             return
         response = lookup_case_insensitive(self._cached, "response")
         if not isinstance(response, Mapping) or not result_uses_http_tensor_pack(response):
-            self._cache_response(response)
             return
         async with self._response_lock:
             if self._response_cache is not _RESPONSE_UNSET:
