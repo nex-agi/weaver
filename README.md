@@ -28,9 +28,50 @@ the server keeps its stable personal-organization/default-project fallback.
 
 ### Training tensor transport
 
-`WEAVER_TENSOR_TRANSPORT` accepts `default` (inline JSON) or `http-binary`.
-HTTP packs use Zstandard compression by default; set
-`WEAVER_TENSOR_COMPRESSION=raw` to disable compression.
+Training tensors use inline JSON by default, preserving the behavior of existing
+clients. To opt into compressed binary transport, configure the service client:
+
+```python
+from weaver import ServiceClient
+
+with ServiceClient(
+    tensor_transport="http-binary",
+    tensor_compression="zstd",  # Optional: Zstandard is the binary-pack default.
+) as client:
+    ...
+```
+
+`AsyncServiceClient` accepts the same options. The runnable Pig Latin examples expose
+the same settings as command-line options:
+
+```bash
+python examples/pig_latin.py \
+  --tensor-transport http-binary \
+  --tensor-compression zstd
+```
+
+All clients also honor environment variables, so the same example can be configured
+without command-line options:
+
+```bash
+WEAVER_TENSOR_TRANSPORT=http-binary \
+WEAVER_TENSOR_COMPRESSION=zstd \
+python examples/pig_latin.py
+```
+
+| Transport | Compression | Behavior |
+| --- | --- | --- |
+| `default` | Ignored | Legacy inline JSON (the default) |
+| `http-binary` | `raw` | Binary tensor packs without compression |
+| `http-binary` | `zstd` | Zstandard-compressed binary tensor packs |
+
+`tensor_compression` (or `WEAVER_TENSOR_COMPRESSION`) only takes effect with
+`http-binary`. For `cross_entropy` requests, the SDK moves eligible dense input tensors
+into the binary pack; control metadata and other values remain JSON. When an operation
+returns output tensors, the SDK downloads and materializes them back into the legacy
+public response shape automatically. `Datum` construction, training calls, and result
+handling therefore do not need to change. Keep the `default` transport when connecting
+to an older Weaver server/trainer deployment that does not support binary tensor packs.
 
 ## Quickstart
 

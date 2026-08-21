@@ -34,10 +34,13 @@ calling ``asyncio.run``. See the "Event loop model" section in
 ``AsyncServiceClient`` for the full integration contract.
 
 Run with:  ``python examples/pig_latin_async.py``  (needs ``WEAVER_API_KEY``).
+Add ``--tensor-transport http-binary`` to use binary tensor packs; Zstandard
+compression is the default and ``--tensor-compression raw`` disables it.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import os
 from typing import Any, Dict, List
@@ -103,9 +106,33 @@ def _loss_per_token(fwdbwd_result: Dict[str, Any], examples: List[types.Datum]) 
     return float(-torch.dot(logprobs, weights) / weights.sum())
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line tensor transport options."""
+
+    parser = argparse.ArgumentParser(description="Run the async Pig Latin example.")
+    parser.add_argument(
+        "--tensor-transport",
+        choices=("default", "http-binary"),
+        default=None,
+        help="defaults to WEAVER_TENSOR_TRANSPORT or default",
+    )
+    parser.add_argument(
+        "--tensor-compression",
+        choices=("raw", "zstd"),
+        default=None,
+        help="compression for http-binary; defaults to WEAVER_TENSOR_COMPRESSION or zstd",
+    )
+    return parser.parse_args()
+
+
 async def main() -> None:
+    args = parse_args()
     base_model = os.getenv("WEAVER_BASE_MODEL", "Qwen/Qwen3-8B")
-    async with AsyncServiceClient(api_key=os.getenv("WEAVER_API_KEY")) as service_client:
+    async with AsyncServiceClient(
+        api_key=os.getenv("WEAVER_API_KEY"),
+        tensor_transport=args.tensor_transport,
+        tensor_compression=args.tensor_compression,
+    ) as service_client:
         training_client = await service_client.create_model(base_model=base_model)
         print(f"Model ID: {training_client.model_id}")
         tokenizer = training_client.get_tokenizer()
