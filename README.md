@@ -41,8 +41,17 @@ with ServiceClient(
     ...
 ```
 
-`AsyncServiceClient` accepts the same options. You can also configure an existing
-script, such as the Pig Latin example, without changing its source:
+`AsyncServiceClient` accepts the same options. The runnable Pig Latin examples expose
+the same settings as command-line options:
+
+```bash
+python examples/pig_latin.py \
+  --tensor-transport http-binary \
+  --tensor-compression zstd
+```
+
+All clients also honor environment variables, so the same example can be configured
+without command-line options:
 
 ```bash
 WEAVER_TENSOR_TRANSPORT=http-binary \

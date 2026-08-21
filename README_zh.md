@@ -37,7 +37,15 @@ with ServiceClient(
     ...
 ```
 
-`AsyncServiceClient` 支持相同的参数。也可以通过环境变量配置已有脚本，例如无需修改 Pig Latin 示例源码即可运行：
+`AsyncServiceClient` 支持相同的参数。可运行的 Pig Latin 示例也提供了对应的命令行参数：
+
+```bash
+python examples/pig_latin.py \
+  --tensor-transport http-binary \
+  --tensor-compression zstd
+```
+
+所有 client 同样支持环境变量，因此也可以不传命令行参数来配置同一个示例：
 
 ```bash
 WEAVER_TENSOR_TRANSPORT=http-binary \

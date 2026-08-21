@@ -11,10 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pig Latin fine-tuning walkthrough using the Weaver SDK."""
+"""Pig Latin fine-tuning walkthrough using the Weaver SDK.
+
+Run with ``--tensor-transport http-binary`` to use binary tensor packs. Zstandard
+compression is enabled by default for binary packs; select ``--tensor-compression raw``
+to disable it.
+"""
 
 from __future__ import annotations
 
+import argparse
 import os
 from typing import Any, Dict, List
 
@@ -74,10 +80,32 @@ def _extract_logprobs(output: Dict[str, Any]) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.float32)
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse command-line tensor transport options."""
+
+    parser = argparse.ArgumentParser(description="Run the Pig Latin fine-tuning example.")
+    parser.add_argument(
+        "--tensor-transport",
+        choices=("default", "http-binary"),
+        default=None,
+        help="defaults to WEAVER_TENSOR_TRANSPORT or default",
+    )
+    parser.add_argument(
+        "--tensor-compression",
+        choices=("raw", "zstd"),
+        default=None,
+        help="compression for http-binary; defaults to WEAVER_TENSOR_COMPRESSION or zstd",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     base_model = "Qwen/Qwen3-8B"
     with ServiceClient(
         api_key=os.getenv("WEAVER_API_KEY"),
+        tensor_transport=args.tensor_transport,
+        tensor_compression=args.tensor_compression,
     ) as service_client:
         training_client = service_client.create_model(base_model=base_model)
         print(f"Model ID: {training_client.model_id}")
