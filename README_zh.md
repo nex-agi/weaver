@@ -23,6 +23,36 @@ pip install nex-weaver
 
 规范 UUID 的优先级更高。组织和项目均为空时，服务端继续使用稳定的个人组织和默认项目回退逻辑。
 
+### 训练张量传输
+
+训练张量默认使用 inline JSON，以保持现有客户端的行为不变。要启用压缩的二进制传输，配置 service client：
+
+```python
+from weaver import ServiceClient
+
+with ServiceClient(
+    tensor_transport="http-binary",
+    tensor_compression="zstd",  # 可省略：二进制 tensor pack 默认使用 Zstandard。
+) as client:
+    ...
+```
+
+`AsyncServiceClient` 支持相同的参数。也可以通过环境变量配置已有脚本，例如无需修改 Pig Latin 示例源码即可运行：
+
+```bash
+WEAVER_TENSOR_TRANSPORT=http-binary \
+WEAVER_TENSOR_COMPRESSION=zstd \
+python examples/pig_latin.py
+```
+
+| Transport | Compression | 行为 |
+| --- | --- | --- |
+| `default` | 忽略 | 兼容旧行为的 inline JSON（默认值） |
+| `http-binary` | `raw` | 不压缩的二进制 tensor pack |
+| `http-binary` | `zstd` | 使用 Zstandard 压缩的二进制 tensor pack |
+
+`tensor_compression`（或 `WEAVER_TENSOR_COMPRESSION`）仅在 transport 为 `http-binary` 时生效。SDK 会自动打包上传张量，并将结果张量还原成原有的公开返回结构，因此无需修改 `Datum` 构造、训练调用或结果处理代码。连接到不支持二进制 tensor pack 的旧版 Weaver server/trainer 部署时，请继续使用 `default` transport。
+
 ## 快速开始
 
 ```python

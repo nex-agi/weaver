@@ -28,9 +28,39 @@ the server keeps its stable personal-organization/default-project fallback.
 
 ### Training tensor transport
 
-`WEAVER_TENSOR_TRANSPORT` accepts `default` (inline JSON) or `http-binary`.
-HTTP packs use Zstandard compression by default; set
-`WEAVER_TENSOR_COMPRESSION=raw` to disable compression.
+Training tensors use inline JSON by default, preserving the behavior of existing
+clients. To opt into compressed binary transport, configure the service client:
+
+```python
+from weaver import ServiceClient
+
+with ServiceClient(
+    tensor_transport="http-binary",
+    tensor_compression="zstd",  # Optional: Zstandard is the binary-pack default.
+) as client:
+    ...
+```
+
+`AsyncServiceClient` accepts the same options. You can also configure an existing
+script, such as the Pig Latin example, without changing its source:
+
+```bash
+WEAVER_TENSOR_TRANSPORT=http-binary \
+WEAVER_TENSOR_COMPRESSION=zstd \
+python examples/pig_latin.py
+```
+
+| Transport | Compression | Behavior |
+| --- | --- | --- |
+| `default` | Ignored | Legacy inline JSON (the default) |
+| `http-binary` | `raw` | Binary tensor packs without compression |
+| `http-binary` | `zstd` | Zstandard-compressed binary tensor packs |
+
+`tensor_compression` (or `WEAVER_TENSOR_COMPRESSION`) only takes effect with
+`http-binary`. The SDK packs uploads and materializes result tensors back into the
+legacy public response shape automatically, so `Datum` construction, training calls,
+and result handling do not need to change. Keep the `default` transport when connecting
+to an older Weaver server/trainer deployment that does not support binary tensor packs.
 
 ## Quickstart
 
