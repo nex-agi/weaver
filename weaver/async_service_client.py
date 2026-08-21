@@ -129,8 +129,9 @@ from ._safeio import (
     supports_dir_fd,
 )
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
-from .config import WeaverConfig
+from .config import TensorCompression, TensorTransport, WeaverConfig
 from .operations import AsyncOperationHandle, build_async_operation_handle
+from .tensor_transport import TensorPack
 from .types import LoraConfig
 from .types.deployment import Deployment
 from .types.weights_artifact import WeightsArtifact
@@ -191,6 +192,8 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         project: Optional[str] = None,
         user_metadata: Optional[Dict[str, Any]] = None,
         heartbeat_interval: float = 30.0,
+        tensor_transport: TensorTransport | None = None,
+        tensor_compression: TensorCompression | None = None,
     ) -> None:
         """Initialize AsyncServiceClient.
 
@@ -207,8 +210,17 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             project: Optional project UUID, organization-local slug, or display name
             user_metadata: Metadata attached when a new session is created
             heartbeat_interval: Interval in seconds for session heartbeat
+            tensor_transport: Training tensor transport. Defaults to
+                ``WEAVER_TENSOR_TRANSPORT`` or ``"default"``.
+            tensor_compression: HTTP tensor-pack compression. Defaults to
+                ``WEAVER_TENSOR_COMPRESSION`` or ``"zstd"``.
         """
-        self._config = WeaverConfig.from_env(base_url=base_url, api_key=api_key)
+        self._config = WeaverConfig.from_env(
+            base_url=base_url,
+            api_key=api_key,
+            tensor_transport=tensor_transport,
+            tensor_compression=tensor_compression,
+        )
         self._default_tags = list(default_tags or ["weaver-sdk"])
         self._session_id = session_id
         self._session_name = name.strip() if name and name.strip() else None
@@ -242,6 +254,18 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         if self._http is None:
             raise RuntimeError("AsyncServiceClient is not connected")
         return self._http
+
+    @property
+    def tensor_transport(self) -> TensorTransport:
+        """Configured transport for dense training tensors."""
+
+        return self._config.tensor_transport
+
+    @property
+    def tensor_compression(self) -> TensorCompression:
+        """Configured HTTP tensor-pack compression."""
+
+        return self._config.tensor_compression
 
     async def connect(self, *, ensure_session: bool = True) -> None:
         """Connect, optionally without creating or fetching a Session."""
@@ -620,10 +644,21 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             tokenizer_path=tokenizer_path,
         )
 
-    async def enqueue_operation(self, path: str, payload: Dict[str, Any]) -> AsyncOperationHandle:
-        # max_retries=1: operations like save_state are non-idempotent POSTs —
-        # retrying after a timeout would create duplicate server-side operations.
-        response = await self.http.post(path, json=payload, max_retries=1)
+    async def enqueue_operation(
+        self,
+        path: str,
+        payload: Dict[str, Any],
+        *,
+        tensor_pack: TensorPack | None = None,
+    ) -> AsyncOperationHandle:
+        if tensor_pack is None:
+            response = await self.http.post(path, json=payload, max_retries=1)
+        else:
+            response = await self.http.post_tensor_multipart(
+                path,
+                request=payload,
+                tensor_pack=tensor_pack,
+            )
         return build_async_operation_handle(self.http, response)
 
     async def _supported_model_scope_params(self) -> Dict[str, str]:

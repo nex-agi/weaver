@@ -26,6 +26,12 @@ Configuration can be provided via keyword arguments or environment variables:
 Canonical IDs take precedence. When no organization or project is configured,
 the server keeps its stable personal-organization/default-project fallback.
 
+### Training tensor transport
+
+`WEAVER_TENSOR_TRANSPORT` accepts `default` (inline JSON) or `http-binary`.
+HTTP packs use Zstandard compression by default; set
+`WEAVER_TENSOR_COMPRESSION=raw` to disable compression.
+
 ## Quickstart
 
 ```python

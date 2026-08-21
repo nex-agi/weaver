@@ -27,6 +27,8 @@ from weaver.types import Datum, LogprobsParams, ModelInput
 def _make_training_client() -> TrainingClient:
     service = MagicMock()
     service.next_operation_seq.return_value = 1
+    service.tensor_transport = "default"
+    service.tensor_compression = "raw"
     return TrainingClient(
         service=service,
         model_id="model-123",
@@ -97,10 +99,12 @@ def test_forward_backward_custom_uses_forward_and_reuses_loss_fn_config() -> Non
         *,
         loss_fn_config: dict[str, float] | None = None,
         wait: bool = True,
-    ) -> dict[str, Any]:
+    ) -> Any:
         calls.append({"loss_fn": loss_fn, "loss_fn_config": loss_fn_config})
         if loss_fn == "forward_logprob":
-            return {"result": {"loss_fn_outputs": [{"logprobs": [1.0]}]}}
+            handle = MagicMock()
+            handle.result.return_value = {"result": {"loss_fn_outputs": [{"logprobs": [1.0]}]}}
+            return handle
         return {"result": {}}
 
     def fake_forward_backward(

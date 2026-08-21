@@ -18,9 +18,30 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional, cast
 
 _DEFAULT_BASE_URL = "https://weaver-console.nex-agi.cn"
+
+TensorTransport = Literal["default", "http-binary"]
+_TENSOR_TRANSPORTS = {"default", "http-binary"}
+TensorCompression = Literal["raw", "zstd"]
+_TENSOR_COMPRESSIONS = {"raw", "zstd"}
+
+
+def _tensor_transport(value: str | None) -> TensorTransport:
+    resolved = value or "default"
+    if resolved not in _TENSOR_TRANSPORTS:
+        supported = ", ".join(sorted(_TENSOR_TRANSPORTS))
+        raise ValueError(f"Unsupported tensor transport {resolved!r}. Supported: {supported}")
+    return cast(TensorTransport, resolved)
+
+
+def _tensor_compression(value: str | None) -> TensorCompression:
+    resolved = value or "zstd"
+    if resolved not in _TENSOR_COMPRESSIONS:
+        supported = ", ".join(sorted(_TENSOR_COMPRESSIONS))
+        raise ValueError(f"Unsupported tensor compression {resolved!r}. Supported: {supported}")
+    return cast(TensorCompression, resolved)
 
 
 @dataclass(slots=True)
@@ -29,6 +50,12 @@ class WeaverConfig:
 
     base_url: str = _DEFAULT_BASE_URL
     api_key: str | None = None
+    tensor_transport: TensorTransport = "default"
+    tensor_compression: TensorCompression = "zstd"
+
+    def __post_init__(self) -> None:
+        self.tensor_transport = _tensor_transport(self.tensor_transport)
+        self.tensor_compression = _tensor_compression(self.tensor_compression)
 
     @classmethod
     def from_env(
@@ -36,6 +63,8 @@ class WeaverConfig:
         *,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        tensor_transport: TensorTransport | None = None,
+        tensor_compression: TensorCompression | None = None,
     ) -> "WeaverConfig":
         """Load configuration from kwargs with env fallbacks.
 
@@ -46,6 +75,12 @@ class WeaverConfig:
         return cls(
             base_url=base_url or os.getenv("WEAVER_BASE_URL") or _DEFAULT_BASE_URL,
             api_key=api_key or os.getenv("WEAVER_API_KEY"),
+            tensor_transport=_tensor_transport(
+                tensor_transport or os.getenv("WEAVER_TENSOR_TRANSPORT")
+            ),
+            tensor_compression=_tensor_compression(
+                tensor_compression or os.getenv("WEAVER_TENSOR_COMPRESSION")
+            ),
         )
 
     def require_auth(self) -> None:
