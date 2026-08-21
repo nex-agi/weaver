@@ -59,7 +59,7 @@ python examples/pig_latin.py
 | `http-binary` | `raw` | 不压缩的二进制 tensor pack |
 | `http-binary` | `zstd` | 使用 Zstandard 压缩的二进制 tensor pack |
 
-`tensor_compression`（或 `WEAVER_TENSOR_COMPRESSION`）仅在 transport 为 `http-binary` 时生效。SDK 会自动打包上传张量，并将结果张量还原成原有的公开返回结构，因此无需修改 `Datum` 构造、训练调用或结果处理代码。连接到不支持二进制 tensor pack 的旧版 Weaver server/trainer 部署时，请继续使用 `default` transport。
+`tensor_compression`（或 `WEAVER_TENSOR_COMPRESSION`）仅在 transport 为 `http-binary` 时生效。对于 `cross_entropy` 请求，SDK 只会将符合条件的稠密输入张量移入二进制 tensor pack；控制元数据和其他值仍使用 JSON。操作返回输出张量时，SDK 会自动下载并将其还原成原有的公开返回结构。因此无需修改 `Datum` 构造、训练调用或结果处理代码。连接到不支持二进制 tensor pack 的旧版 Weaver server/trainer 部署时，请继续使用 `default` transport。
 
 ## 快速开始
 

@@ -66,9 +66,11 @@ python examples/pig_latin.py
 | `http-binary` | `zstd` | Zstandard-compressed binary tensor packs |
 
 `tensor_compression` (or `WEAVER_TENSOR_COMPRESSION`) only takes effect with
-`http-binary`. The SDK packs uploads and materializes result tensors back into the
-legacy public response shape automatically, so `Datum` construction, training calls,
-and result handling do not need to change. Keep the `default` transport when connecting
+`http-binary`. For `cross_entropy` requests, the SDK moves eligible dense input tensors
+into the binary pack; control metadata and other values remain JSON. When an operation
+returns output tensors, the SDK downloads and materializes them back into the legacy
+public response shape automatically. `Datum` construction, training calls, and result
+handling therefore do not need to change. Keep the `default` transport when connecting
 to an older Weaver server/trainer deployment that does not support binary tensor packs.
 
 ## Quickstart
