@@ -17,6 +17,7 @@
 import torch
 
 from weaver.types.datum import Datum
+from weaver.types.lora_config import LoraConfig
 from weaver.types.model_input import ModelInput
 from weaver.types.tensor import TensorData, tensor_payload
 
@@ -131,3 +132,25 @@ def test_datum_from_raw():
     datum = Datum.from_raw(model_input=model_input, loss_fn_inputs={"labels": labels})
     assert isinstance(datum, Datum)
     assert "labels" in datum.loss_fn_inputs
+
+
+def test_lora_config_serializes_explicit_alpha_only_when_set():
+    default_payload = LoraConfig(rank=32).to_payload()
+    assert "lora_alpha" not in default_payload
+    assert default_payload["train_unembed"] is False
+    assert default_payload["train_mlp"] is True
+    assert default_payload["train_attn"] is True
+
+    configured_payload = LoraConfig(rank=32, lora_alpha=64).to_payload()
+    assert configured_payload["lora_alpha"] == 64
+    assert configured_payload["rank"] == 32
+
+
+def test_lora_config_positional_arguments_remain_backward_compatible():
+    config = LoraConfig(16, 42, False, True, False)
+    assert config.rank == 16
+    assert config.seed == 42
+    assert config.train_unembed is False
+    assert config.train_mlp is True
+    assert config.train_attn is False
+    assert config.lora_alpha is None
