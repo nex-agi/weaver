@@ -46,6 +46,8 @@ the same settings as command-line options:
 
 ```bash
 python examples/pig_latin.py \
+  --base-model Qwen/Qwen3.5-0.8B:262144 \
+  --lora-rank 16 \
   --tensor-transport http-binary \
   --tensor-compression zstd
 ```
@@ -111,6 +113,32 @@ weaver scope resolve --organization research --project alignment
 
 Organization slugs are globally unique. Project slugs and names are unique inside
 their organization; an ambiguous display name is rejected instead of guessed.
+
+### Supported models and training modes
+
+The backwards-compatible call still returns model names. Request details when choosing
+between the independently priced LoRA and Full-FT modes:
+
+```python
+models = client.list_supported_models(detailed=True)
+for model in models:
+    for mode in model.training_modes:
+        print(model.name, mode.display_name, mode.prices)
+```
+
+`training_modes` contains only modes that the model explicitly supports and
+that have all four effective prices. A missing Full-FT quote means Full-FT is
+not supported; the SDK never fabricates a 10× display price.
+
+The CLI uses one compact row per mode with `Train`, `Input`, `Cached input`, and
+`Output` columns. Filter to one mode, emit names only, or request stable JSON when needed:
+
+```bash
+weaver list supported-models
+weaver list supported-models --mode full-ft
+weaver list supported-models --format names
+weaver list supported-models --format json
+```
 
 ## Usage
 

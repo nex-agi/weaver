@@ -23,8 +23,15 @@ def main():
     with ServiceClient(
         api_key=os.getenv("WEAVER_API_KEY"),
     ) as client:
-        models = client.list_supported_models()
-        print(models)
+        models = client.list_supported_models(detailed=True)
+        for model in models:
+            prices = {
+                mode.display_name: {
+                    kind: str(price.unit_price_usd) for kind, price in mode.prices.items()
+                }
+                for mode in model.training_modes
+            }
+            print(model.name, prices)
 
 
 if __name__ == "__main__":
