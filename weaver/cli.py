@@ -630,9 +630,7 @@ def list_supported_models_cmd(
                 click.echo(model.name)
         elif output_format == "json":
             selected_mode = None if mode == "all" else mode
-            format_json_output(
-                [model.to_dict(mode=selected_mode) for model in selected_models]
-            )
+            format_json_output([model.to_dict(mode=selected_mode) for model in selected_models])
         else:
             console.print(create_supported_models_table(selected_models, mode))
             console.print(f"\n{len(selected_models)} supported models")
