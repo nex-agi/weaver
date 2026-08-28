@@ -50,6 +50,7 @@ from .router_replay import (
 )
 from .sampling import SamplingParams
 from .sampling_control import PauseMode, coerce_pause_mode
+from .supported_model import SupportedModel, SupportedModelPrice, SupportedTrainingMode
 from .tensor import TensorData
 from .weights_artifact import WeightsArtifact
 
@@ -67,6 +68,9 @@ __all__ = [
     "ModelInputChunk",
     "PauseMode",
     "SamplingParams",
+    "SupportedModel",
+    "SupportedModelPrice",
+    "SupportedTrainingMode",
     "TensorData",
     "WeightsArtifact",
     "coerce_pause_mode",

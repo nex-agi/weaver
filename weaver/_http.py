@@ -760,7 +760,13 @@ class APIClient:
                             path,
                             str(e),
                         )
-                        raise
+                        transport_error = WeaverAPIError(
+                            503,
+                            "transport_unavailable",
+                            f"{method} {path} failed after {connection_error_count} connection attempts",
+                            True,
+                        )
+                        raise transport_error from e
 
                     delay = min(
                         INITIAL_RETRY_DELAY * (2 ** (connection_error_count - 1)),

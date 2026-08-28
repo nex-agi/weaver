@@ -87,6 +87,7 @@ from .operations import OperationHandle, build_operation_handle
 from .tensor_transport import TensorPack
 from .types import LoraConfig
 from .types.deployment import Deployment
+from .types.supported_model import SupportedModel
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
@@ -661,8 +662,60 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                 break
         return records
 
-    def list_supported_models(self) -> List[str]:
-        """Return usable model names exposed to the authenticated role."""
+    def _list_model_catalog_records(self) -> List[Dict[str, Any]]:
+        """Traverse the user-facing, organization-priced model catalog."""
+
+        records: List[Dict[str, Any]] = []
+        limit = 100
+        offset = 0
+        scope = self._supported_model_scope_params()
+        while True:
+            params: Dict[str, Any] = {"limit": limit, "offset": offset, **scope}
+            payload = self.http.get("/api/v1/model-catalog", params=params)
+            if not isinstance(payload, dict):
+                break
+            items = payload.get("items")
+            if not isinstance(items, list):
+                break
+            records.extend(item for item in items if isinstance(item, dict))
+            pagination = payload.get("pagination")
+            if not isinstance(pagination, dict):
+                break
+            try:
+                total_count = int(str(pagination.get("total_count")))
+            except (TypeError, ValueError):
+                break
+            offset += len(items)
+            if not items or offset >= total_count:
+                break
+        return records
+
+    def list_supported_model_details(self) -> List[SupportedModel]:
+        """Return usable models with four explicit prices per LoRA/Full-FT mode."""
+
+        models = [SupportedModel.from_payload(item) for item in self._list_model_catalog_records()]
+        return [
+            model
+            for model in models
+            if model.name and model.status.lower() in {"healthy", "available"}
+        ]
+
+    @overload
+    def list_supported_models(self, *, detailed: Literal[False] = False) -> List[str]: ...
+
+    @overload
+    def list_supported_models(self, *, detailed: Literal[True]) -> List[SupportedModel]: ...
+
+    def list_supported_models(self, *, detailed: bool = False) -> List[str] | List[SupportedModel]:
+        """Return usable supported models.
+
+        The default remains a list of names for backwards compatibility. Pass
+        ``detailed=True`` to receive typed catalog records where LoRA and
+        Full-FT are separate modes with independent train/input/cache/output prices.
+        """
+
+        if detailed:
+            return self.list_supported_model_details()
 
         names: List[str] = []
         for item in self._list_supported_model_records():

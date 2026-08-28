@@ -85,6 +85,17 @@ def parse_args() -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(description="Run the Pig Latin fine-tuning example.")
     parser.add_argument(
+        "--base-model",
+        default=os.getenv("WEAVER_BASE_MODEL", "Qwen/Qwen3-8B"),
+        help="supported base model; defaults to WEAVER_BASE_MODEL or Qwen/Qwen3-8B",
+    )
+    parser.add_argument(
+        "--lora-rank",
+        type=int,
+        default=int(os.getenv("WEAVER_LORA_RANK", "16")),
+        help="LoRA rank; defaults to WEAVER_LORA_RANK or 16",
+    )
+    parser.add_argument(
         "--tensor-transport",
         choices=("default", "http-binary"),
         default=None,
@@ -101,13 +112,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    base_model = "Qwen/Qwen3-8B"
+    base_model = args.base_model
     with ServiceClient(
         api_key=os.getenv("WEAVER_API_KEY"),
         tensor_transport=args.tensor_transport,
         tensor_compression=args.tensor_compression,
     ) as service_client:
-        training_client = service_client.create_model(base_model=base_model)
+        training_client = service_client.create_model(
+            base_model=base_model,
+            lora_config=types.LoraConfig(rank=args.lora_rank),
+        )
         print(f"Model ID: {training_client.model_id}")
         tokenizer = training_client.get_tokenizer()
 

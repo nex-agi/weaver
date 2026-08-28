@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from weaver._http import APIClient, _is_connection_error
+from weaver._http import APIClient, WeaverAPIError, _is_connection_error
 from weaver.config import WeaverConfig
 
 
@@ -173,9 +173,11 @@ class TestConnectionErrorRetry:
         client._client.headers = {}
         client._client.request.side_effect = OSError(9, "Bad file descriptor")
 
-        with pytest.raises(OSError, match="Bad file descriptor"):
+        with pytest.raises(WeaverAPIError, match="transport_unavailable") as exc_info:
             client.post("/api/v1/models/m1/operations", json={}, max_retries=1)
 
+        assert exc_info.value.retryable is True
+        assert isinstance(exc_info.value.__cause__, OSError)
         assert client._client.request.call_count == DEFAULT_CONNECTION_RETRIES
 
     def test_non_connection_error_not_retried_with_max_retries_1(self, client):

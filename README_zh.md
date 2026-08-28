@@ -90,6 +90,29 @@ weaver scope resolve --organization research --project alignment
 
 组织 slug 全局唯一；项目 slug 和名称在组织内唯一。展示名称存在歧义时会明确报错，不会猜测选择。
 
+### 支持的模型与训练模式
+
+为保持兼容，原调用仍返回模型名称；选择 LoRA 或 Full-FT 时可以请求包含两种独立价格的详情：
+
+```python
+models = client.list_supported_models(detailed=True)
+for model in models:
+    for mode in model.training_modes:
+        print(model.name, mode.display_name, mode.prices)
+```
+
+`training_modes` 只包含模型明确支持且四项有效价格齐全的模式。缺少 Full-FT
+报价就表示不支持 Full-FT；SDK 不会自行展示 10× 的估算价格。
+
+CLI 默认让每种模式占一行，并紧凑展示训练、输入、缓存输入、输出四列价格；也可以只看一种模式、只输出名称，或输出稳定 JSON：
+
+```bash
+weaver list supported-models
+weaver list supported-models --mode full-ft
+weaver list supported-models --format names
+weaver list supported-models --format json
+```
+
 ## 使用方法
 
 参见 [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb)，通过 Pig Latin 翻译任务交互式演示完整的 SDK 工作流——涵盖数据准备、LoRA / 全量微调、采样推理和 checkpoint 管理。

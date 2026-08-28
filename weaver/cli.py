@@ -37,6 +37,7 @@ from ._http import WeaverAPIError
 from .operations import build_operation_handle
 from .service_client import ServiceClient
 from .types.deployment import Deployment
+from .types.supported_model import SupportedModel, SupportedModelPrice
 
 console = Console()
 
@@ -194,6 +195,48 @@ def create_models_table(items: List[Dict[str, Any]]) -> Table:
             format_date(item.get("created_at")),
         )
 
+    return table
+
+
+def format_supported_model_price(price: SupportedModelPrice | None) -> str:
+    """Format an exact catalog price for narrow terminal output."""
+
+    if price is None:
+        return "[dim]Not priced[/dim]"
+    if price.unit == "million_tokens":
+        return f"${price.unit_price_usd}"
+    return f"${price.unit_price_usd} / {price.unit}"
+
+
+def create_supported_models_table(items: List[SupportedModel], mode: str = "all") -> Table:
+    """Render one compact row for each explicitly supported model mode."""
+
+    normalized_mode = mode.replace("-", "_")
+    table = Table(title="Supported Models · USD per 1M tokens", box=box.ROUNDED)
+    table.add_column("Model", style="green")
+    table.add_column("Mode", style="cyan", no_wrap=True)
+    table.add_column("Train", justify="right", no_wrap=True)
+    table.add_column("Input", justify="right", no_wrap=True)
+    table.add_column("Cached input", justify="right", no_wrap=True)
+    table.add_column("Output", justify="right", no_wrap=True)
+    for model in items:
+        modes = [
+            item
+            for item in model.training_modes
+            if normalized_mode == "all" or item.mode == normalized_mode
+        ]
+        for index, training_mode in enumerate(modes):
+            table.add_row(
+                model.name if index == 0 else "",
+                training_mode.display_name,
+                format_supported_model_price(training_mode.price_for("training_tokens")),
+                format_supported_model_price(training_mode.price_for("sampling_prefill_tokens")),
+                format_supported_model_price(
+                    training_mode.price_for("sampling_cached_prefill_tokens")
+                ),
+                format_supported_model_price(training_mode.price_for("sampling_output_tokens")),
+                end_section=index == len(modes) - 1,
+            )
     return table
 
 
@@ -532,6 +575,69 @@ def projects_list_cmd(
     """List projects in an organization."""
 
     _run_list_projects(org_id, org_reference, output_format, base_url, api_key)
+
+
+@list.command("supported-models")
+@click.option(
+    "--mode",
+    type=click.Choice(["all", "lora", "full-ft"]),
+    default="all",
+    show_default=True,
+    help="Show both training modes or only one mode",
+)
+@click.option(
+    "--format",
+    "-f",
+    "output_format",
+    type=click.Choice(["table", "json", "names"]),
+    default="table",
+    show_default=True,
+    help="Table for humans, JSON for scripts, or one model name per line",
+)
+@click.option(
+    "--organization-id",
+    "--org-id",
+    envvar="WEAVER_ORGANIZATION_ID",
+    help="Organization whose effective catalog prices should be shown",
+)
+@click.option("--base-url", envvar="WEAVER_BASE_URL", help="Weaver server base URL")
+@click.option("--api-key", envvar="WEAVER_API_KEY", help="Weaver API key")
+def list_supported_models_cmd(
+    mode: str,
+    output_format: str,
+    organization_id: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> None:
+    """List usable models with separate LoRA and Full-FT choices."""
+
+    client = ServiceClient(
+        base_url=base_url,
+        api_key=api_key,
+        organization_id=organization_id,
+    )
+    try:
+        client.connect(ensure_session=False)
+        models = client.list_supported_model_details()
+        normalized_mode = mode.replace("-", "_")
+        selected_models = (
+            models
+            if normalized_mode == "all"
+            else [model for model in models if model.training_mode(normalized_mode) is not None]
+        )
+        if output_format == "names":
+            for model in selected_models:
+                click.echo(model.name)
+        elif output_format == "json":
+            selected_mode = None if mode == "all" else mode
+            format_json_output([model.to_dict(mode=selected_mode) for model in selected_models])
+        else:
+            console.print(create_supported_models_table(selected_models, mode))
+            console.print(f"\n{len(selected_models)} supported models")
+    except Exception as e:
+        handle_error(e)
+    finally:
+        client.close()
 
 
 @scope_group.command("resolve")

@@ -31,6 +31,11 @@ from .async_training_client import AsyncTrainingClient  # noqa: F401
 from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
 from .types.deployment import Deployment  # noqa: F401
+from .types.supported_model import (  # noqa: F401
+    SupportedModel,
+    SupportedModelPrice,
+    SupportedTrainingMode,
+)
 from .types.weights_artifact import WeightsArtifact  # noqa: F401
 
 __all__ = [
@@ -43,6 +48,9 @@ __all__ = [
     "WeaverAPIError",
     "WeightsArtifact",
     "Deployment",
+    "SupportedModel",
+    "SupportedModelPrice",
+    "SupportedTrainingMode",
     "types",
     "__version__",
 ]
