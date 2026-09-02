@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 import unicodedata
 from dataclasses import dataclass, field
 from numbers import Integral, Real
@@ -373,6 +374,16 @@ def _redacted_token_values(value: Any, field_name: str, expected: int) -> tuple[
     return tuple(int(token) for token in values)
 
 
+def _finite_float(value: Any, field_name: str) -> float:
+    try:
+        normalized = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must contain numeric values") from exc
+    if not math.isfinite(normalized):
+        raise ValueError(f"{field_name} must contain only finite numeric values")
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class SampleRefOutput:
     """Validated, position-aligned output for a managed sample."""
@@ -422,10 +433,7 @@ class SampleRefOutput:
             values = _one_dimensional_values(raw_value, field_name)
             if len(values) != input_token_count:
                 raise ValueError(f"{field_name} length must equal input_token_count")
-            try:
-                aligned[field_name] = tuple(float(value) for value in values)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{field_name} must contain numeric values") from exc
+            aligned[field_name] = tuple(_finite_float(value, field_name) for value in values)
 
         reserved = {
             "kind",
@@ -446,7 +454,7 @@ class SampleRefOutput:
                 and isinstance(raw_value, Real)
                 and not isinstance(raw_value, bool)
             ):
-                derived_outputs[field_name] = float(raw_value)
+                derived_outputs[field_name] = _finite_float(raw_value, field_name)
                 continue
             if _is_token_identity_field(field_name):
                 redacted_token_outputs[field_name] = _redacted_token_values(
@@ -454,7 +462,7 @@ class SampleRefOutput:
                 )
                 continue
             if isinstance(raw_value, Real) and not isinstance(raw_value, bool):
-                derived_outputs[field_name] = float(raw_value)
+                derived_outputs[field_name] = _finite_float(raw_value, field_name)
                 continue
             try:
                 values = _one_dimensional_values(raw_value, field_name)
@@ -464,6 +472,8 @@ class SampleRefOutput:
                 # Unknown non-numeric control metadata remains in the legacy raw
                 # result but is not promoted into this public typed view.
                 continue
+            if not all(math.isfinite(value) for value in numeric_values):
+                raise ValueError(f"{field_name} must contain only finite numeric values")
             if len(numeric_values) != input_token_count:
                 raise ValueError(f"{field_name} length must equal input_token_count")
             derived_outputs[field_name] = numeric_values

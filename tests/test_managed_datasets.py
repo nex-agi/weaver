@@ -404,6 +404,16 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     with pytest.raises(ValueError, match="logprobs length"):
         SampleRefOutput.from_payload(wrong_length)
 
+    for field_name, value in (
+        ("logprobs", [float("nan"), -0.7]),
+        ("loss", float("inf")),
+        ("entropy", [0.1, float("-inf")]),
+    ):
+        non_finite = _sample_output(datum)
+        non_finite[field_name] = value
+        with pytest.raises(ValueError, match="finite numeric"):
+            SampleRefOutput.from_payload(non_finite)
+
     with_extra = _sample_output(datum)
     with_extra["entropy"] = [0.1, 0.2]
     with_extra["per_token_kl"] = [0.01, 0.02]
