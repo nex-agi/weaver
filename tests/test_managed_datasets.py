@@ -144,20 +144,10 @@ def test_legacy_datum_wire_shape_is_unchanged_and_new_id_is_optional():
     assert identified.to_payload()["datum_id"] == "local-1"
 
 
-@pytest.mark.parametrize("field", ["target_tokens", "loss_mask", "weights"])
+@pytest.mark.parametrize("field", ["target_tokens", "loss_mask", "weights", "sampling_mask"])
 def test_sample_ref_rejects_server_owned_inputs(field):
     with pytest.raises(ValueError, match="server-owned"):
         Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, loss_fn_inputs={field: [1]})
-
-
-def test_sample_ref_keeps_client_owned_sampling_mask():
-    datum = Datum.from_sample_ref(
-        dataset="d",
-        version="v1",
-        sample_idx=0,
-        loss_fn_inputs={"sampling_mask": [[1, 2], [3]]},
-    )
-    assert datum.to_payload()["loss_fn_inputs"]["sampling_mask"] == [[1, 2], [3]]
 
 
 def test_sample_ref_serializes_inline_tensor_data_like_an_ordinary_datum():

@@ -151,6 +151,8 @@ sample 覆盖。`input_token_count` 是 autoregressive shift 后的有效训练�
 token 上限），可用于 client 侧整样本 packing。`SampleRef` 不能用于 sampling。若操作需要返回 token 形状字段，受保护
 位置只会返回仅用于响应的 `-8` 占位符，同时保持真实长度；不要把 `-8` 再传入
 `ModelInput` 或 `target_tokens`。
+`SampleRef` 同样不接受 client 提供的 `sampling_mask`，否则候选 token 的命中结果可能被
+用来探测隐藏 target。
 
 ## 使用方法
 

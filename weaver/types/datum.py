@@ -26,7 +26,7 @@ from .managed_dataset import WEAVER_REDACTED_TOKEN_ID, SampleRef, _datum_id
 from .model_input import ModelInput
 from .tensor import TensorData, tensor_payload
 
-_SAMPLE_REF_PROTECTED_INPUTS = frozenset({"target_tokens", "loss_mask", "weights"})
+_SAMPLE_REF_PROTECTED_INPUTS = frozenset({"target_tokens", "loss_mask", "weights", "sampling_mask"})
 
 
 @dataclass(slots=True)

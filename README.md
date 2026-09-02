@@ -181,6 +181,8 @@ is sufficient for client-side whole-sample packing.
 Managed references cannot be passed to sampling. If an operation returns a token-shaped
 field, every protected token position is the response-only `-8` sentinel and the true
 length is preserved; never feed `-8` back into `ModelInput` or `target_tokens`.
+Client-provided `sampling_mask` is also rejected for a `SampleRef`, because probing
+candidate membership could reveal its hidden target tokens.
 
 ## Usage
 
