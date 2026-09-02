@@ -161,6 +161,7 @@ class TrainingClient:
             payload = self._service.http.post(
                 f"/api/v1/models/{self.model_id}/managed-dataset-sample-lengths",
                 json={"items": [ref.to_payload() for ref in chunk]},
+                max_retries=1,
             )
             parsed = parse_sample_ref_lengths(chunk, payload)
             for item in parsed:

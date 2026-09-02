@@ -314,6 +314,7 @@ def test_sync_model_bound_lengths_preserve_and_validate_order():
     client._service._http.post.assert_called_once_with(
         "/api/v1/models/model-1/managed-dataset-sample-lengths",
         json={"items": [ref.to_payload() for ref in refs]},
+        max_retries=1,
     )
 
 
@@ -373,11 +374,15 @@ def test_async_model_bound_lengths_has_the_same_contract():
             "items": [{**ref.to_payload(), "input_token_count": 9}]
         }
         resolved = await client.resolve_sample_ref_lengths([ref])
-        return resolved, client._service._http.post
+        return resolved, ref, client._service._http.post
 
-    resolved, post = asyncio.run(run())
+    resolved, ref, post = asyncio.run(run())
     assert resolved[0].input_token_count == 9
-    post.assert_awaited_once()
+    post.assert_awaited_once_with(
+        "/api/v1/models/model-1/managed-dataset-sample-lengths",
+        json={"items": [ref.to_payload()]},
+        max_retries=1,
+    )
 
 
 def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths():
