@@ -702,15 +702,22 @@ class APIClient:
 
             except WeaverAPIError as e:
                 # Retry server-declared retryable errors for idempotent methods
-                # only (e.g. GET operation polling surviving a transient read);
-                # POST stays fatal to avoid duplicating non-idempotent work.
+                # and for 503 responses. A retryable 503 means the server did
+                # not accept the request, so operation POSTs are safe to repeat.
                 last_exception = e
                 span.record_exception(e)
                 request_attempt += 1
+                retryable_503 = e.status_code == httpx.codes.SERVICE_UNAVAILABLE
+                if retryable_503:
+                    effective_max_retries = max(effective_max_retries, self._max_retries)
                 is_last_attempt = request_attempt >= effective_max_retries
                 idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
 
-                if (not e.retryable) or (not idempotent_method) or is_last_attempt:
+                if (
+                    (not e.retryable)
+                    or (not idempotent_method and not retryable_503)
+                    or is_last_attempt
+                ):
                     span.set_status(Status(StatusCode.ERROR, "API error"))
                     raise
 
