@@ -45,6 +45,11 @@ USER_AGENT: str = f"weaver-sdk/{__version__}"  # type: ignore[has-type]
 DEFAULT_TIMEOUT = httpx.Timeout(timeout=60, connect=5.0)
 DEFAULT_MAX_RETRIES = 10
 DEFAULT_CONNECTION_RETRIES = 3
+# ``server_draining`` is a pre-admission response: the server guarantees that
+# it did not create the requested operation. Give load-balancer deregistration
+# its own retry budget even when an operation POST deliberately sets
+# ``max_retries=1`` to reject ambiguous retries.
+DEFAULT_SERVER_DRAINING_RETRIES = 10
 DEFAULT_CONNECTION_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=20)
 TENSOR_PACK_CHUNK_BYTES = 8 * 1024 * 1024
 
@@ -224,9 +229,37 @@ def apply_request_span_attributes(
             logger.debug("API request trace_id: %s", trace_id)
 
 
-def compute_retry_delay(attempt: int) -> float:
-    """Exponential backoff delay for retry *attempt* (1-based)."""
-    return min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+def compute_retry_delay(attempt: int, retry_after: str | None = None) -> float:
+    """Exponential backoff delay for retry *attempt* (1-based).
+
+    A numeric ``Retry-After`` is a lower bound, not a replacement for backoff:
+    keeping the larger value avoids immediately re-forming a thundering herd
+    when many workers hit the same draining replica.
+    """
+    delay = min(INITIAL_RETRY_DELAY * (2 ** (attempt - 1)), MAX_RETRY_DELAY)
+    if retry_after is None:
+        return delay
+    try:
+        requested_delay = float(retry_after)
+    except (TypeError, ValueError):
+        return delay
+    if requested_delay < 0 or requested_delay == float("inf"):
+        return delay
+    return max(delay, requested_delay)
+
+
+def _is_server_draining(error: WeaverAPIError) -> bool:
+    """Return whether the server rejected a request before admission.
+
+    Matching status, structured code and the retryable bit keeps this exception
+    narrow: arbitrary retryable POST failures remain fatal because their commit
+    outcome may be ambiguous.
+    """
+    return (
+        error.status_code == httpx.codes.SERVICE_UNAVAILABLE
+        and error.code == "server_draining"
+        and error.retryable
+    )
 
 
 class DownloadURLExpiredError(RuntimeError):
@@ -654,7 +687,9 @@ class APIClient:
         Connection-level errors (stale sockets, refused connections) are retried
         up to ``DEFAULT_CONNECTION_RETRIES`` times regardless of *max_retries*
         because the request never reached the server and is therefore safe to
-        retry even for non-idempotent methods.
+        retry even for non-idempotent methods. The pre-admission
+        ``503 server_draining`` response also has an independent retry budget:
+        it guarantees that no operation was created, so retrying a POST is safe.
 
         Args:
             span: OpenTelemetry span for tracing.
@@ -669,6 +704,7 @@ class APIClient:
         last_exception: Exception | None = None
         request_attempt = 0
         connection_error_count = 0
+        server_draining_retry_count = 0
 
         while request_attempt < effective_max_retries:
             try:
@@ -701,11 +737,33 @@ class APIClient:
                 self._raise_error(response)
 
             except WeaverAPIError as e:
-                # Retry server-declared retryable errors for idempotent methods
-                # only (e.g. GET operation polling surviving a transient read);
-                # POST stays fatal to avoid duplicating non-idempotent work.
                 last_exception = e
                 span.record_exception(e)
+
+                # This exact response is returned before an operation is
+                # persisted. It is therefore safe to retry even for POST and
+                # even when the caller uses max_retries=1 to reject ambiguous
+                # operation retries. Every other POST error remains fatal.
+                if _is_server_draining(e):
+                    if server_draining_retry_count >= DEFAULT_SERVER_DRAINING_RETRIES:
+                        span.set_status(Status(StatusCode.ERROR, "Server remained draining"))
+                        raise
+                    server_draining_retry_count += 1
+                    delay = compute_retry_delay(server_draining_retry_count, e.retry_after)
+                    logger.debug(
+                        "Server draining (retry %d/%d): %s %s; retrying in %.1fs",
+                        server_draining_retry_count,
+                        DEFAULT_SERVER_DRAINING_RETRIES,
+                        method,
+                        path,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                # Retry other server-declared retryable errors for idempotent
+                # methods only (e.g. GET operation polling surviving a transient
+                # read). POST stays fatal because its commit may be ambiguous.
                 request_attempt += 1
                 is_last_attempt = request_attempt >= effective_max_retries
                 idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
@@ -724,8 +782,7 @@ class APIClient:
                     e.code,
                     e.message,
                 )
-                delay = min(INITIAL_RETRY_DELAY * (2 ** (request_attempt - 1)), MAX_RETRY_DELAY)
-                time.sleep(delay)
+                time.sleep(compute_retry_delay(request_attempt, e.retry_after))
 
             except Exception as e:  # pylint: disable=broad-except
                 last_exception = e
