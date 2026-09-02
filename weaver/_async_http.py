@@ -394,7 +394,7 @@ class AsyncAPIClient:
         Connection-level errors are retried up to ``DEFAULT_CONNECTION_RETRIES``
         regardless of *max_retries* (the request never reached the server, so it
         is safe even for non-idempotent methods). Server-declared retryable
-        errors are retried only for idempotent methods.
+        errors are retried for idempotent methods and 503 responses.
         """
         effective_max_retries = max_retries if max_retries is not None else self._max_retries
         last_exception: Exception | None = None
@@ -429,10 +429,17 @@ class AsyncAPIClient:
                 last_exception = e
                 span.record_exception(e)
                 request_attempt += 1
+                retryable_503 = e.status_code == httpx.codes.SERVICE_UNAVAILABLE
+                if retryable_503:
+                    effective_max_retries = max(effective_max_retries, self._max_retries)
                 is_last_attempt = request_attempt >= effective_max_retries
                 idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
 
-                if (not e.retryable) or (not idempotent_method) or is_last_attempt:
+                if (
+                    (not e.retryable)
+                    or (not idempotent_method and not retryable_503)
+                    or is_last_attempt
+                ):
                     span.set_status(Status(StatusCode.ERROR, "API error"))
                     raise
 
