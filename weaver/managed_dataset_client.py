@@ -19,7 +19,12 @@ from __future__ import annotations
 from typing import Any, Mapping
 from urllib.parse import quote
 
-from .types.managed_dataset import ManagedDatasetInfo, ManagedDatasetPage
+from .types.managed_dataset import (
+    ManagedDatasetInfo,
+    ManagedDatasetPage,
+    _dataset_name,
+    _dataset_version,
+)
 
 
 def _page_params(
@@ -41,7 +46,7 @@ def _page_params(
         ("compatible_model", compatible_model),
     ):
         if value is not None:
-            normalized = value.strip()
+            normalized = _dataset_name(value, "name") if key == "name" else value.strip()
             if not normalized:
                 raise ValueError(f"{key} must not be blank")
             params[key] = normalized
@@ -49,12 +54,8 @@ def _page_params(
 
 
 def _catalog_path(name: str, version: str) -> str:
-    normalized_name = name.strip()
-    normalized_version = version.strip()
-    if not normalized_name:
-        raise ValueError("name must not be blank")
-    if not normalized_version:
-        raise ValueError("version must not be blank")
+    normalized_name = _dataset_name(name, "name")
+    normalized_version = _dataset_version(version)
     return (
         f"/api/v1/managed-datasets/{quote(normalized_name, safe='')}"
         f"/versions/{quote(normalized_version, safe='')}"

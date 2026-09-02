@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 from typing import Any, Dict, Mapping, Sequence
 from uuid import uuid4
 
@@ -47,6 +48,15 @@ class Datum:
 
         normalized: Dict[str, Any] = {}
         for key, value in self.loss_fn_inputs.items():
+            if self.sample_ref is not None:
+                scalar = _managed_numeric_scalar(value)
+                if scalar is not None:
+                    # Managed loss inputs may carry safe per-datum coefficients
+                    # as JSON numbers.  Keep those scalar on the wire: a 0-D
+                    # TensorData wrapper is neither an aligned sequence nor the
+                    # scalar shape understood by the server/trainer protocol.
+                    normalized[key] = scalar
+                    continue
             # Handle TensorData objects (from tensor_payload)
             if isinstance(value, TensorData):
                 normalized[key] = value.to_tensor()
@@ -86,12 +96,16 @@ class Datum:
         common: dict[str, object] = {
             "loss_fn_inputs": {
                 name: (
-                    values.to_dict()
-                    if isinstance(values, TensorData)
+                    _sample_ref_loss_input_payload(values)
+                    if self.sample_ref is not None
                     else (
-                        tensor_payload(values).to_dict()
-                        if isinstance(values, torch.Tensor)
-                        else values
+                        values.to_dict()
+                        if isinstance(values, TensorData)
+                        else (
+                            tensor_payload(values).to_dict()
+                            if isinstance(values, torch.Tensor)
+                            else values
+                        )
                     )
                 )
                 for name, values in self.loss_fn_inputs.items()
@@ -219,3 +233,38 @@ def _is_jagged_sequence(value: Any) -> bool:
         elif saw_nested:
             return True
     return saw_nested and len(set(nested_lengths)) > 1
+
+
+def _managed_numeric_scalar(value: Any) -> int | float | None:
+    """Normalize a managed per-datum numeric scalar for inline JSON."""
+
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, Integral):
+        return int(value)
+    if isinstance(value, Real):
+        return float(value)
+    if isinstance(value, TensorData):
+        value = value.to_tensor()
+    if isinstance(value, torch.Tensor) and value.ndim == 0 and value.dtype != torch.bool:
+        scalar = value.detach().cpu().item()
+        if isinstance(scalar, Integral):
+            return int(scalar)
+        if isinstance(scalar, Real):
+            return float(scalar)
+    return None
+
+
+def _sample_ref_loss_input_payload(value: Any) -> object:
+    """Serialize the managed scalar-or-exact-1-D loss-input wire union."""
+
+    scalar = _managed_numeric_scalar(value)
+    if scalar is not None:
+        return scalar
+    if not isinstance(value, torch.Tensor) or value.ndim != 1:
+        raise ValueError(
+            "sample-ref loss inputs must be numeric scalars or one-dimensional tensors"
+        )
+    payload = tensor_payload(value).to_dict()
+    payload["shape"] = list(value.shape)
+    return payload

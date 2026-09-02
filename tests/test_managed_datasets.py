@@ -92,7 +92,7 @@ def _async_training_client() -> AsyncTrainingClient:
 
 def test_sample_ref_validation_and_payload():
     datum = Datum.from_sample_ref(
-        dataset=" hq-math ", version=" 2026-08 ", sample_idx=3, datum_id=" d-3 "
+        dataset="hq-math", version="2026-08", sample_idx=3, datum_id=" d-3 "
     )
 
     assert datum.sample_ref == SampleRef("hq-math", "2026-08", 3)
@@ -108,6 +108,13 @@ def test_sample_ref_validation_and_payload():
     for kwargs in (
         {"dataset": "", "version": "v1", "sample_idx": 0},
         {"dataset": "d", "version": " ", "sample_idx": 0},
+        {"dataset": " d", "version": "v1", "sample_idx": 0},
+        {"dataset": "d", "version": "v1/part", "sample_idx": 0},
+        {"dataset": "d\\part", "version": "v1", "sample_idx": 0},
+        {"dataset": ".", "version": "v1", "sample_idx": 0},
+        {"dataset": "d", "version": "..", "sample_idx": 0},
+        {"dataset": "d\npart", "version": "v1", "sample_idx": 0},
+        {"dataset": "d", "version": "v" * 129, "sample_idx": 0},
         {"dataset": "d", "version": "v1", "sample_idx": -1},
         {"dataset": "d", "version": "v1", "sample_idx": True},
     ):
@@ -162,7 +169,51 @@ def test_sample_ref_serializes_inline_tensor_data_like_an_ordinary_datum():
     assert datum.to_payload()["loss_fn_inputs"]["advantages"] == {
         "data": [0.25, -0.5],
         "dtype": "float32",
+        "shape": [2],
     }
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (0.25, 0.25),
+        (3, 3),
+        (torch.tensor(0.5), 0.5),
+        (TensorData.from_array(torch.tensor(2.0)), 2.0),
+    ],
+)
+def test_sample_ref_serializes_numeric_scalars_as_inline_json(value, expected):
+    datum = Datum.from_sample_ref(
+        dataset="d",
+        version="v1",
+        sample_idx=0,
+        datum_id="managed-0",
+        loss_fn_inputs={"coefficient": value},
+    )
+
+    assert datum.to_payload()["loss_fn_inputs"]["coefficient"] == expected
+
+
+def test_token_datum_numeric_scalar_normalization_is_unchanged():
+    datum = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]),
+        loss_fn_inputs={"coefficient": 0.25},
+    )
+
+    assert isinstance(datum.loss_fn_inputs["coefficient"], torch.Tensor)
+    assert datum.loss_fn_inputs["coefficient"].ndim == 0
+
+
+def test_sample_ref_rejects_non_vector_non_scalar_loss_input():
+    datum = Datum.from_sample_ref(
+        dataset="d",
+        version="v1",
+        sample_idx=0,
+        loss_fn_inputs={"coefficient": [[1.0, 2.0]]},
+    )
+
+    with pytest.raises(ValueError, match="numeric scalars or one-dimensional"):
+        datum.to_payload()
 
 
 def test_negative_tokens_cannot_reenter_model_or_targets_but_minus_100_remains_ignore_index():
@@ -214,17 +265,18 @@ def test_sync_catalog_returns_only_typed_safe_fields_and_pagination():
     )
 
 
-def test_catalog_get_quotes_public_path_segments():
+def test_catalog_get_quotes_safe_public_path_segments():
     service = ServiceClient()
     service._http = MagicMock()
     service._http.get.return_value = _dataset_payload()
 
-    info = service.datasets.get(name="hq math", version="2026/08")
+    info = service.datasets.get(name="hq math", version="2026-08")
 
     assert info.sample_count == 120_000
-    service._http.get.assert_called_once_with(
-        "/api/v1/managed-datasets/hq%20math/versions/2026%2F08"
-    )
+    service._http.get.assert_called_once_with("/api/v1/managed-datasets/hq%20math/versions/2026-08")
+
+    with pytest.raises(ValueError, match="safe path segment"):
+        service.datasets.get(name="hq math", version="2026/08")
 
 
 def test_async_catalog_has_the_same_contract():
@@ -288,6 +340,31 @@ def test_model_bound_lengths_reject_reordering_and_inconsistent_duplicates():
         client.resolve_sample_ref_lengths([duplicate, duplicate])
 
 
+def test_model_bound_lengths_chunk_server_limit_and_preserve_cross_chunk_duplicates(
+    monkeypatch,
+):
+    monkeypatch.setattr("weaver.training_client.MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS", 2)
+    client = _training_client()
+    duplicate = SampleRef("d", "v1", 1)
+    refs = [duplicate, SampleRef("d", "v1", 2), duplicate]
+
+    def response(*_args, **kwargs):
+        return {
+            "items": [
+                {**item, "input_token_count": 10 + item["sample_idx"]}
+                for item in kwargs["json"]["items"]
+            ]
+        }
+
+    client._service._http.post.side_effect = response
+
+    lengths = client.resolve_sample_ref_lengths(refs)
+
+    assert [item.sample_ref for item in lengths] == refs
+    assert [item.input_token_count for item in lengths] == [11, 12, 11]
+    assert client._service._http.post.call_count == 2
+
+
 def test_async_model_bound_lengths_has_the_same_contract():
     async def run():
         client = _async_training_client()
@@ -331,10 +408,17 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     assert parsed.get_derived_output("per_token_kl") == (0.01, 0.02)
     assert parsed.get_derived_output("token_losses") == (0.7, 0.8)
 
+    redacted_extra = _sample_output(datum)
+    redacted_extra["output-tokens"] = [-8, -8]
+    redacted_extra["prompt_tokens"] = 2
+    parsed_redacted = SampleRefOutput.from_payload(redacted_extra)
+    assert parsed_redacted.redacted_token_outputs["output-tokens"] == (-8, -8)
+    assert parsed_redacted.get_derived_output("prompt_tokens") == 2.0
+
     for identity_field in ("token_ids", "teacher_tokens", "teacher_labels"):
         identity_leak = _sample_output(datum)
         identity_leak[identity_field] = [1, 2]
-        with pytest.raises(ValueError, match="token-bearing"):
+        with pytest.raises(ValueError, match="only the -8 sentinel"):
             SampleRefOutput.from_payload(identity_leak)
 
     too_long_id = _sample_output(datum)

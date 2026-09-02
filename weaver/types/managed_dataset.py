@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from typing import Any, Iterator, Mapping, Sequence, overload
@@ -26,6 +27,9 @@ from .tensor import TensorData
 
 WEAVER_REDACTED_TOKEN_ID = -8
 MAX_DATUM_ID_LENGTH = 255
+MAX_DATASET_NAME_LENGTH = 160
+MAX_DATASET_VERSION_LENGTH = 128
+MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS = 4096
 
 
 def _required_name(value: Any, field_name: str) -> str:
@@ -41,24 +45,68 @@ def _datum_id(value: Any) -> str:
     return normalized
 
 
+def _dataset_path_segment(value: Any, field_name: str, max_length: int) -> str:
+    """Validate a managed-dataset identifier as one URL path segment."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{field_name} must be a non-empty string")
+    if value != value.strip():
+        raise ValueError(f"{field_name} must not contain leading or trailing whitespace")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field_name} must be valid UTF-8") from exc
+    if len(value) > max_length:
+        raise ValueError(f"{field_name} must be at most {max_length} characters")
+    if value in {".", ".."} or "/" in value or "\\" in value:
+        raise ValueError(f"{field_name} must be a single safe path segment")
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise ValueError(f"{field_name} must not contain control characters")
+    return value
+
+
+def _dataset_name(value: Any, field_name: str = "dataset") -> str:
+    return _dataset_path_segment(value, field_name, MAX_DATASET_NAME_LENGTH)
+
+
+def _dataset_version(value: Any) -> str:
+    return _dataset_path_segment(value, "version", MAX_DATASET_VERSION_LENGTH)
+
+
 _TOKEN_IDENTITY_FIELDS = frozenset(
     {
+        "token",
+        "token_id",
         "tokens",
         "token_ids",
+        "input_token",
+        "input_id",
         "input_tokens",
         "input_token_ids",
+        "output_token",
+        "output_id",
         "output_tokens",
         "output_token_ids",
+        "target_token",
+        "target_id",
         "target_tokens",
         "target_token_ids",
+        "prompt_token",
+        "prompt_id",
         "prompt_tokens",
         "prompt_token_ids",
+        "completion_token",
         "completion_tokens",
         "completion_token_ids",
+        "generated_token",
+        "generated_id",
         "generated_tokens",
         "generated_token_ids",
+        "sampled_token",
         "sampled_tokens",
         "sampled_token_ids",
+        "label",
+        "labels",
         "model_input",
         "messages",
         "raw_messages",
@@ -86,10 +134,30 @@ def _is_token_identity_field(field_name: str) -> bool:
     the word "token".
     """
 
-    normalized = field_name.strip().lower().replace("-", "_")
+    normalized = _canonical_output_field(field_name)
     return normalized in _TOKEN_IDENTITY_FIELDS or normalized.endswith(
-        ("_token_ids", "_tokens", "_labels")
+        ("_token_ids", "_tokens", "_labels", "_token", "_label")
     )
+
+
+def _canonical_output_field(field_name: str) -> str:
+    return field_name.strip().lower().replace("-", "_")
+
+
+def _is_token_count_field(field_name: str) -> bool:
+    normalized = _canonical_output_field(field_name)
+    if normalized in {
+        "tokens",
+        "prompt_tokens",
+        "training_tokens",
+        "generated_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "token_count",
+        "tokens_count",
+    }:
+        return True
+    return normalized.endswith(("_token_count", "_tokens_count"))
 
 
 def _nonnegative_int(value: Any, field_name: str) -> int:
@@ -117,8 +185,8 @@ class SampleRef:
     sample_idx: int
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "dataset", _required_name(self.dataset, "dataset"))
-        object.__setattr__(self, "version", _required_name(self.version, "version"))
+        object.__setattr__(self, "dataset", _dataset_name(self.dataset))
+        object.__setattr__(self, "version", _dataset_version(self.version))
         object.__setattr__(self, "sample_idx", _nonnegative_int(self.sample_idx, "sample_idx"))
 
     def to_payload(self) -> dict[str, object]:
@@ -131,8 +199,8 @@ class SampleRef:
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "SampleRef":
         return cls(
-            dataset=_required_name(payload.get("dataset"), "dataset"),
-            version=_required_name(payload.get("version"), "version"),
+            dataset=_dataset_name(payload.get("dataset")),
+            version=_dataset_version(payload.get("version")),
             sample_idx=_nonnegative_int(payload.get("sample_idx"), "sample_idx"),
         )
 
@@ -208,8 +276,8 @@ class ManagedDatasetInfo:
         ):
             raise ValueError("recommended_ratio must be numeric or null")
         return cls(
-            name=_required_name(payload.get("name"), "name"),
-            version=_required_name(payload.get("version"), "version"),
+            name=_dataset_name(payload.get("name"), "name"),
+            version=_dataset_version(payload.get("version")),
             description=str(payload.get("description") or ""),
             sample_count=_nonnegative_int(payload.get("sample_count"), "sample_count"),
             recommended_ratio=float(raw_ratio) if raw_ratio is not None else None,
@@ -291,6 +359,20 @@ def _one_dimensional_values(value: Any, field_name: str) -> list[Any]:
     return values
 
 
+def _redacted_token_values(value: Any, field_name: str, expected: int) -> tuple[int, ...]:
+    values = _one_dimensional_values(value, field_name)
+    if len(values) != expected:
+        raise ValueError(f"{field_name} length must equal input_token_count")
+    if any(
+        isinstance(token, bool)
+        or not isinstance(token, Integral)
+        or int(token) != WEAVER_REDACTED_TOKEN_ID
+        for token in values
+    ):
+        raise ValueError(f"managed {field_name} may contain only the -8 sentinel")
+    return tuple(int(token) for token in values)
+
+
 @dataclass(frozen=True, slots=True)
 class SampleRefOutput:
     """Validated, position-aligned output for a managed sample."""
@@ -301,6 +383,7 @@ class SampleRefOutput:
     target_tokens: tuple[int, ...] | None = None
     logprobs: tuple[float, ...] | None = None
     elementwise_loss: tuple[float, ...] | None = None
+    redacted_token_outputs: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
     derived_outputs: Mapping[str, float | tuple[float, ...]] = field(default_factory=dict)
 
     @property
@@ -326,17 +409,9 @@ class SampleRefOutput:
 
         target_tokens: tuple[int, ...] | None = None
         if payload.get("target_tokens") is not None:
-            raw_targets = _one_dimensional_values(payload["target_tokens"], "target_tokens")
-            if len(raw_targets) != input_token_count:
-                raise ValueError("target_tokens length must equal input_token_count")
-            if any(
-                isinstance(token, bool)
-                or not isinstance(token, Integral)
-                or int(token) != WEAVER_REDACTED_TOKEN_ID
-                for token in raw_targets
-            ):
-                raise ValueError("managed target_tokens may contain only the -8 sentinel")
-            target_tokens = tuple(int(token) for token in raw_targets)
+            target_tokens = _redacted_token_values(
+                payload["target_tokens"], "target_tokens", input_token_count
+            )
 
         aligned: dict[str, tuple[float, ...] | None] = {}
         for field_name in ("logprobs", "elementwise_loss"):
@@ -361,14 +436,23 @@ class SampleRefOutput:
             "logprobs",
             "elementwise_loss",
         }
+        redacted_token_outputs: dict[str, tuple[int, ...]] = {}
         derived_outputs: dict[str, float | tuple[float, ...]] = {}
         for field_name, raw_value in payload.items():
             if field_name in reserved:
                 continue
+            if (
+                _is_token_count_field(field_name)
+                and isinstance(raw_value, Real)
+                and not isinstance(raw_value, bool)
+            ):
+                derived_outputs[field_name] = float(raw_value)
+                continue
             if _is_token_identity_field(field_name):
-                raise ValueError(
-                    f"managed output contains forbidden token-bearing field {field_name!r}"
+                redacted_token_outputs[field_name] = _redacted_token_values(
+                    raw_value, field_name, input_token_count
                 )
+                continue
             if isinstance(raw_value, Real) and not isinstance(raw_value, bool):
                 derived_outputs[field_name] = float(raw_value)
                 continue
@@ -391,5 +475,6 @@ class SampleRefOutput:
             target_tokens=target_tokens,
             logprobs=aligned["logprobs"],
             elementwise_loss=aligned["elementwise_loss"],
+            redacted_token_outputs=redacted_token_outputs,
             derived_outputs=derived_outputs,
         )

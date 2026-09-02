@@ -52,7 +52,12 @@ from .tensor_transport import PreparedOperationBody
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.deployment import Deployment
-from .types.managed_dataset import SampleRef, SampleRefLength, parse_sample_ref_lengths
+from .types.managed_dataset import (
+    MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS,
+    SampleRef,
+    SampleRefLength,
+    parse_sample_ref_lengths,
+)
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
@@ -167,11 +172,21 @@ class AsyncTrainingClient:
             return []
         if not all(isinstance(ref, SampleRef) for ref in requested):
             raise TypeError("refs must contain only SampleRef values")
-        payload = await self._service.http.post(
-            f"/api/v1/models/{self.model_id}/managed-dataset-sample-lengths",
-            json={"items": [ref.to_payload() for ref in requested]},
-        )
-        return parse_sample_ref_lengths(requested, payload)
+        resolved: List[SampleRefLength] = []
+        known_counts: Dict[SampleRef, int] = {}
+        for start in range(0, len(requested), MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS):
+            chunk = requested[start : start + MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS]
+            payload = await self._service.http.post(
+                f"/api/v1/models/{self.model_id}/managed-dataset-sample-lengths",
+                json={"items": [ref.to_payload() for ref in chunk]},
+            )
+            parsed = parse_sample_ref_lengths(chunk, payload)
+            for item in parsed:
+                previous = known_counts.setdefault(item.sample_ref, item.input_token_count)
+                if previous != item.input_token_count:
+                    raise ValueError("duplicate SampleRef entries returned inconsistent lengths")
+            resolved.extend(parsed)
+        return resolved
 
     async def _enqueue_prepared(
         self, path: str, prepared: PreparedOperationBody
