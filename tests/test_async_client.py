@@ -46,21 +46,6 @@ def _ok_response(payload):
     return resp
 
 
-def _error_response(code, *, retryable=True, retry_after=None):
-    resp = MagicMock()
-    resp.is_success = False
-    resp.status_code = 503
-    resp.content = b'{"error":"temporary"}'
-    resp.text = "temporary"
-    resp.headers = {"Retry-After": retry_after} if retry_after is not None else {}
-    resp.json.return_value = {
-        "error": code,
-        "message": "service temporarily unavailable",
-        "retryable": retryable,
-    }
-    return resp
-
-
 # ---------------------------------------------------------------------------
 # AsyncAPIClient retry behaviour (mirrors tests/test_http_retry.py)
 # ---------------------------------------------------------------------------
@@ -126,47 +111,6 @@ class TestAsyncRetry:
             assert client._client.request.call_count == 2
 
         asyncio.run(run())
-
-    def test_post_retries_server_draining_with_max_retries_1(self, config, monkeypatch):
-        sleep = AsyncMock()
-        monkeypatch.setattr(_async_http.asyncio, "sleep", sleep)
-
-        async def run():
-            client = AsyncAPIClient(config, max_retries=3)
-            client._client = MagicMock()
-            client._client.headers = {"Idempotency-Key": "sample-1"}
-            client._client.request = AsyncMock(
-                side_effect=[
-                    _error_response("server_draining", retry_after="1"),
-                    _ok_response({"id": "op-1"}),
-                ]
-            )
-            result = await client.post(
-                "/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1
-            )
-            assert result == {"id": "op-1"}
-            assert client._client.request.call_count == 2
-            for request_call in client._client.request.call_args_list:
-                assert request_call.kwargs["headers"]["Idempotency-Key"] == "sample-1"
-
-        asyncio.run(run())
-        sleep.assert_awaited_once_with(1.0)
-
-    def test_other_retryable_post_error_remains_fatal(self, config, monkeypatch):
-        sleep = AsyncMock()
-        monkeypatch.setattr(_async_http.asyncio, "sleep", sleep)
-
-        async def run():
-            client = AsyncAPIClient(config, max_retries=3)
-            client._client = MagicMock()
-            client._client.headers = {}
-            client._client.request = AsyncMock(return_value=_error_response("metering_unavailable"))
-            with pytest.raises(RuntimeError, match="metering_unavailable"):
-                await client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
-            assert client._client.request.call_count == 1
-
-        asyncio.run(run())
-        sleep.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

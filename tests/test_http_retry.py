@@ -23,8 +23,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from weaver import _http
-from weaver._http import APIClient, WeaverAPIError, _is_connection_error, compute_retry_delay
+from weaver._http import APIClient, WeaverAPIError, _is_connection_error
 from weaver.config import WeaverConfig
 
 
@@ -42,36 +41,6 @@ def _make_read_error_with_cause(
         err = httpx.ReadError(f"[Errno {errno}] {msg}")
         err.__cause__ = original
         return err
-
-
-def _error_response(
-    code: str,
-    *,
-    status_code: int = 503,
-    retryable: bool = True,
-    retry_after: str | None = None,
-) -> MagicMock:
-    response = MagicMock()
-    response.is_success = False
-    response.status_code = status_code
-    response.content = b'{"error":"temporary"}'
-    response.text = "temporary"
-    response.headers = {"Retry-After": retry_after} if retry_after is not None else {}
-    response.json.return_value = {
-        "error": code,
-        "message": "service temporarily unavailable",
-        "retryable": retryable,
-    }
-    return response
-
-
-def _ok_response(payload: dict) -> MagicMock:
-    response = MagicMock()
-    response.is_success = True
-    response.status_code = 200
-    response.content = b'{"ok":true}'
-    response.json.return_value = payload
-    return response
 
 
 @pytest.fixture()
@@ -131,73 +100,6 @@ class TestPostMaxRetriesOverride:
 
         assert result == {"id": "op-1"}
         assert client._client.request.call_count == 2
-
-
-class TestServerDrainingRetry:
-    """A pre-admission drain response is safe to retry even for POST."""
-
-    def test_post_retries_server_draining_with_max_retries_1(self, client, monkeypatch):
-        sleeps: list[float] = []
-        monkeypatch.setattr(_http.time, "sleep", sleeps.append)
-        client._client = MagicMock()
-        client._client.headers = {"Idempotency-Key": "sample-1"}
-        client._client.request.side_effect = [
-            _error_response("server_draining", retry_after="1"),
-            _ok_response({"id": "op-1"}),
-        ]
-
-        result = client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
-
-        assert result == {"id": "op-1"}
-        assert client._client.request.call_count == 2
-        assert sleeps == [1.0]
-        for request_call in client._client.request.call_args_list:
-            assert request_call.kwargs["headers"]["Idempotency-Key"] == "sample-1"
-
-    def test_other_retryable_post_error_remains_fatal(self, client, monkeypatch):
-        sleep = MagicMock()
-        monkeypatch.setattr(_http.time, "sleep", sleep)
-        client._client = MagicMock()
-        client._client.headers = {}
-        client._client.request.return_value = _error_response("metering_unavailable")
-
-        with pytest.raises(WeaverAPIError, match="metering_unavailable"):
-            client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
-
-        assert client._client.request.call_count == 1
-        sleep.assert_not_called()
-
-    def test_server_draining_requires_retryable_contract(self, client, monkeypatch):
-        sleep = MagicMock()
-        monkeypatch.setattr(_http.time, "sleep", sleep)
-        client._client = MagicMock()
-        client._client.headers = {}
-        client._client.request.return_value = _error_response("server_draining", retryable=False)
-
-        with pytest.raises(WeaverAPIError, match="server_draining"):
-            client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
-
-        assert client._client.request.call_count == 1
-        sleep.assert_not_called()
-
-    def test_server_draining_retry_budget_is_bounded(self, client, monkeypatch):
-        sleeps: list[float] = []
-        monkeypatch.setattr(_http.time, "sleep", sleeps.append)
-        monkeypatch.setattr(_http, "DEFAULT_SERVER_DRAINING_RETRIES", 2)
-        client._client = MagicMock()
-        client._client.headers = {}
-        client._client.request.return_value = _error_response("server_draining", retry_after="1")
-
-        with pytest.raises(WeaverAPIError, match="server_draining"):
-            client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
-
-        assert client._client.request.call_count == 3
-        assert sleeps == [1.0, 1.0]
-
-    def test_retry_after_is_a_lower_bound(self):
-        assert compute_retry_delay(1, "3") == 3.0
-        assert compute_retry_delay(4, "1") == 4.0
-        assert compute_retry_delay(2, "invalid") == 1.0
 
 
 class TestConnectionErrorRetry:

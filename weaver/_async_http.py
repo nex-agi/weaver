@@ -38,7 +38,6 @@ from ._http import (
     DEFAULT_CONNECTION_LIMITS,
     DEFAULT_CONNECTION_RETRIES,
     DEFAULT_MAX_RETRIES,
-    DEFAULT_SERVER_DRAINING_RETRIES,
     DEFAULT_TIMEOUT,
     DOWNLOAD_CHUNK_SIZE,
     DOWNLOAD_TIMEOUT,
@@ -47,7 +46,6 @@ from ._http import (
     DownloadURLExpiredError,
     WeaverAPIError,
     _is_connection_error,
-    _is_server_draining,
     _validate_tensor_pack_download,
     _validate_tensor_pack_response_length,
     _validate_tensor_pack_response_metadata,
@@ -396,15 +394,12 @@ class AsyncAPIClient:
         Connection-level errors are retried up to ``DEFAULT_CONNECTION_RETRIES``
         regardless of *max_retries* (the request never reached the server, so it
         is safe even for non-idempotent methods). Server-declared retryable
-        errors are retried only for idempotent methods, except the pre-admission
-        ``503 server_draining`` response, which is safe for operation POSTs and
-        has its own bounded retry budget.
+        errors are retried only for idempotent methods.
         """
         effective_max_retries = max_retries if max_retries is not None else self._max_retries
         last_exception: Exception | None = None
         request_attempt = 0
         connection_error_count = 0
-        server_draining_retry_count = 0
 
         while request_attempt < effective_max_retries:
             try:
@@ -433,24 +428,6 @@ class AsyncAPIClient:
             except WeaverAPIError as e:
                 last_exception = e
                 span.record_exception(e)
-
-                if _is_server_draining(e):
-                    if server_draining_retry_count >= DEFAULT_SERVER_DRAINING_RETRIES:
-                        span.set_status(Status(StatusCode.ERROR, "Server remained draining"))
-                        raise
-                    server_draining_retry_count += 1
-                    delay = compute_retry_delay(server_draining_retry_count, e.retry_after)
-                    logger.debug(
-                        "Server draining (retry %d/%d): %s %s; retrying in %.1fs",
-                        server_draining_retry_count,
-                        DEFAULT_SERVER_DRAINING_RETRIES,
-                        method,
-                        path,
-                        delay,
-                    )
-                    await asyncio.sleep(delay)
-                    continue
-
                 request_attempt += 1
                 is_last_attempt = request_attempt >= effective_max_retries
                 idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
@@ -469,7 +446,7 @@ class AsyncAPIClient:
                     e.code,
                     e.message,
                 )
-                await asyncio.sleep(compute_retry_delay(request_attempt, e.retry_after))
+                await asyncio.sleep(compute_retry_delay(request_attempt))
 
             except Exception as e:  # pylint: disable=broad-except
                 last_exception = e
