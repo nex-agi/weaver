@@ -87,7 +87,9 @@ def _is_token_identity_field(field_name: str) -> bool:
     """
 
     normalized = field_name.strip().lower().replace("-", "_")
-    return normalized in _TOKEN_IDENTITY_FIELDS or normalized.endswith("_token_ids")
+    return normalized in _TOKEN_IDENTITY_FIELDS or normalized.endswith(
+        ("_token_ids", "_tokens", "_labels")
+    )
 
 
 def _nonnegative_int(value: Any, field_name: str) -> int:

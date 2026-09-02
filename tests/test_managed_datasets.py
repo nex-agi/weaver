@@ -341,10 +341,11 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     assert parsed.get_derived_output("per_token_kl") == (0.01, 0.02)
     assert parsed.get_derived_output("token_losses") == (0.7, 0.8)
 
-    identity_leak = _sample_output(datum)
-    identity_leak["token_ids"] = [1, 2]
-    with pytest.raises(ValueError, match="token-bearing"):
-        SampleRefOutput.from_payload(identity_leak)
+    for identity_field in ("token_ids", "teacher_tokens", "teacher_labels"):
+        identity_leak = _sample_output(datum)
+        identity_leak[identity_field] = [1, 2]
+        with pytest.raises(ValueError, match="token-bearing"):
+            SampleRefOutput.from_payload(identity_leak)
 
     too_long_id = _sample_output(datum)
     too_long_id["datum_id"] = "x" * 256
