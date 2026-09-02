@@ -35,6 +35,7 @@ import zstandard
 
 from .config import TensorCompression, TensorTransport
 from .types import Datum
+from .types.datum import validate_sample_ref_loss_inputs
 from .types.tensor import TensorData, tensor_payload
 
 TENSOR_KEY = "$tensor"
@@ -226,13 +227,21 @@ def serialize_training_data(
 ) -> SerializedTrainingData:
     """Serialize datums, optimizing dense cross-entropy tensors only."""
 
+    validate_sample_ref_loss_inputs(data, loss_fn)
     if loss_fn != "cross_entropy" or transport == "default":
+        return SerializedTrainingData([datum.to_payload() for datum in data])
+
+    if all(datum.is_sample_ref for datum in data):
         return SerializedTrainingData([datum.to_payload() for datum in data])
 
     writer = _PackWriter(compression=compression)
     try:
         payload: list[dict[str, Any]] = []
         for datum in data:
+            if datum.is_sample_ref:
+                payload.append(datum.to_payload())
+                continue
+            assert datum.model_input is not None
             chunks: list[dict[str, Any]] = []
             for chunk in datum.model_input.chunks:
                 tokens = torch.as_tensor(chunk.tokens, dtype=torch.int64)
@@ -256,6 +265,8 @@ def serialize_training_data(
                 "model_input": {"chunks": chunks},
                 "loss_fn_inputs": loss_inputs,
             }
+            if datum.datum_id is not None:
+                datum_payload["datum_id"] = datum.datum_id
             if datum.metadata:
                 datum_payload["metadata"] = dict(datum.metadata)
             payload.append(datum_payload)

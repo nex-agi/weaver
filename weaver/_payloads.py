@@ -20,7 +20,9 @@ from typing import TYPE_CHECKING, Any, BinaryIO, Dict, List, Mapping, Sequence
 
 from .config import TensorCompression, TensorTransport
 from .tensor_transport import PreparedOperationBody, serialize_training_data
+from .training_outputs import align_training_outputs
 from .types import Datum
+from .types.managed_dataset import SampleRefOutput
 
 if TYPE_CHECKING:
     import torch
@@ -158,6 +160,9 @@ def forward_payload(
     loss_fn_config: Mapping[str, Any] | None,
     request_metadata: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
+    from .types.datum import validate_sample_ref_loss_inputs
+
+    validate_sample_ref_loss_inputs(data, loss_fn)
     payload: Dict[str, Any] = {
         "model_id": model_id,
         "seq_id": seq_id,
@@ -179,6 +184,9 @@ def forward_backward_payload(
     loss_fn_config: Mapping[str, Any] | None,
     request_metadata: Dict[str, Any] | None,
 ) -> Dict[str, Any]:
+    from .types.datum import validate_sample_ref_loss_inputs
+
+    validate_sample_ref_loss_inputs(data, loss_fn)
     payload: Dict[str, Any] = {
         "model_id": model_id,
         "seq_id": seq_id,
@@ -200,17 +208,23 @@ def parse_logprob_tensors(
     """Extract per-datum logprob tensors (``requires_grad=True``) from a forward result."""
     import torch
 
-    outputs = fwd_result.get("result", {}).get("loss_fn_outputs", [])
+    parsed_result: Mapping[str, Any] = fwd_result
+    if tensor_pack is not None:
+        from .tensor_transport import materialize_http_tensor_payloads
+
+        parsed_result = materialize_http_tensor_payloads(fwd_result, tensor_pack)
+    outputs = align_training_outputs(data, parsed_result)
     if not outputs:
         raise ValueError("Forward pass returned no loss_fn_outputs")
-    if len(outputs) != len(data):
-        raise ValueError(f"Expected {len(data)} loss_fn_outputs, got {len(outputs)}")
 
     logprob_tensors: List[torch.Tensor] = []
     for output in outputs:
-        lp = output.get("logprobs")
-        if lp is None:
-            lp = output.get("Logprobs")
+        if isinstance(output, SampleRefOutput):
+            lp: Any = output.logprobs
+        else:
+            lp = output.get("logprobs")
+            if lp is None:
+                lp = output.get("Logprobs")
         if isinstance(lp, dict) and "$tensor" in lp:
             if tensor_pack is None:
                 raise ValueError("HTTP tensor logprobs require the operation tensor pack")
@@ -234,9 +248,25 @@ def build_surrogate_data(
     for i, (datum, logprob_tensor) in enumerate(zip(data, logprob_tensors)):
         if logprob_tensor.grad is None:
             raise ValueError(f"logprob_tensors[{i}] has no gradient after backward")
+        if logprob_tensor.grad.shape != logprob_tensor.shape:
+            raise ValueError(
+                f"logprob_tensors[{i}] gradient shape must match its target-position shape"
+            )
+
+        if datum.is_sample_ref:
+            surrogate_data.append(
+                Datum(
+                    sample_ref=datum.sample_ref,
+                    datum_id=datum.datum_id,
+                    loss_fn_inputs={"surrogate_weights": logprob_tensor.grad.detach().tolist()},
+                    metadata=dict(datum.metadata),
+                )
+            )
+            continue
 
         raw_targets = datum.loss_fn_inputs.get("target_tokens")
         if raw_targets is None:
+            assert datum.model_input is not None
             resolved_targets: List[Any] = datum.model_input.to_ints()
         elif hasattr(raw_targets, "tolist"):
             resolved_targets = raw_targets.tolist()
@@ -246,7 +276,5 @@ def build_surrogate_data(
         loss_fn_inputs: Dict[str, Any] = dict(datum.loss_fn_inputs)
         loss_fn_inputs["target_tokens"] = resolved_targets
         loss_fn_inputs["surrogate_weights"] = logprob_tensor.grad.detach().tolist()
-        surrogate_data.append(
-            Datum.from_raw(model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs)
-        )
+        surrogate_data.append(datum.with_loss_fn_inputs(loss_fn_inputs))
     return surrogate_data

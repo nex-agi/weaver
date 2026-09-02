@@ -14,6 +14,10 @@
 
 """Training client built on top of the Weaver ServiceClient."""
 
+# The public client intentionally keeps its synchronous operation surface in
+# one module; managed-dataset helpers push it slightly over pylint's size limit.
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import logging
@@ -43,6 +47,7 @@ from .tensor_transport import PreparedOperationBody
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.deployment import Deployment
+from .types.managed_dataset import SampleRef, SampleRefLength, parse_sample_ref_lengths
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
@@ -130,6 +135,25 @@ class TrainingClient:
 
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
+
+    def resolve_sample_ref_lengths(self, refs: Sequence[SampleRef]) -> List[SampleRefLength]:
+        """Resolve safe, model-bound input lengths for whole-sample batching.
+
+        Rendering, tokenization, truncation, and autoregressive shifting use
+        the policy pinned when this training model was created. No tokenizer,
+        template, or per-call maximum-length override is accepted here.
+        """
+
+        requested = list(refs)
+        if not requested:
+            return []
+        if not all(isinstance(ref, SampleRef) for ref in requested):
+            raise TypeError("refs must contain only SampleRef values")
+        payload = self._service.http.post(
+            f"/api/v1/models/{self.model_id}/managed-dataset-sample-lengths",
+            json={"items": [ref.to_payload() for ref in requested]},
+        )
+        return parse_sample_ref_lengths(requested, payload)
 
     def _serialize_data(self, data: Sequence[Datum]) -> Sequence[Dict[str, Any]]:
         return serialize_data(data)

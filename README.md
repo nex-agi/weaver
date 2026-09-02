@@ -140,6 +140,48 @@ weaver list supported-models --format names
 weaver list supported-models --format json
 ```
 
+### Managed datasets
+
+Managed datasets expose authorized catalog metadata and stable sample references, never
+their source messages or real token IDs. Select an explicit dataset `name` and `version`,
+then ask the model-bound training client for effective lengths before packing whole
+samples:
+
+```python
+from weaver import ServiceClient
+from weaver.types import Datum, SampleRef
+
+with ServiceClient() as service:
+    service.ensure_session()
+    for dataset in service.datasets.list(compatible_model="Qwen/Qwen3-8B"):
+        print(dataset.name, dataset.version, dataset.sample_count)
+
+    ref = SampleRef(dataset="hq-math", version="2026-08", sample_idx=42)
+    trainer = service.create_model(
+        base_model="Qwen/Qwen3-8B",
+        training_max_sequence_length=4096,
+    )
+    length = trainer.resolve_sample_ref_lengths([ref])[0].input_token_count
+    print(length)
+
+    datum = Datum.from_sample_ref(
+        dataset=ref.dataset,
+        version=ref.version,
+        sample_idx=ref.sample_idx,
+        datum_id="batch-7-item-3",
+        loss_fn_inputs={"advantages": [1.0] * length},
+    )
+    result = trainer.forward_backward([datum], "cross_entropy")
+```
+
+The model fixes the tokenizer, chat template, and complete pre-shift token limit; clients
+cannot override them per reference. `input_token_count` is the resulting autoregressive
+training length after shifting (and is smaller than the pinned full-token limit), which
+is sufficient for client-side whole-sample packing.
+Managed references cannot be passed to sampling. If an operation returns a token-shaped
+field, every protected token position is the response-only `-8` sentinel and the true
+length is preserved; never feed `-8` back into `ModelInput` or `target_tokens`.
+
 ## Usage
 
 See [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb) for an interactive

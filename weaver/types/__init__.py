@@ -19,6 +19,14 @@ from .datum import Datum
 from .deployment import Deployment
 from .logprobs import LogprobsParams
 from .lora_config import LoraConfig
+from .managed_dataset import (
+    WEAVER_REDACTED_TOKEN_ID,
+    ManagedDatasetInfo,
+    ManagedDatasetPage,
+    SampleRef,
+    SampleRefLength,
+    SampleRefOutput,
+)
 from .model_input import ModelInput, ModelInputChunk
 from .optim import AdamParams
 
@@ -64,14 +72,20 @@ __all__ = [
     "Deployment",
     "LoraConfig",
     "LogprobsParams",
+    "ManagedDatasetInfo",
+    "ManagedDatasetPage",
     "ModelInput",
     "ModelInputChunk",
     "PauseMode",
     "SamplingParams",
+    "SampleRef",
+    "SampleRefLength",
+    "SampleRefOutput",
     "SupportedModel",
     "SupportedModelPrice",
     "SupportedTrainingMode",
     "TensorData",
+    "WEAVER_REDACTED_TOKEN_ID",
     "WeightsArtifact",
     "coerce_pause_mode",
 ]

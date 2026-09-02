@@ -113,6 +113,45 @@ weaver list supported-models --format names
 weaver list supported-models --format json
 ```
 
+### 托管数据集
+
+托管数据集只暴露当前调用方有权使用的目录 metadata 和稳定的样本引用，不暴露原始
+messages 或真实 token ID。用户明确选择 dataset `name` 和 `version`，并在整样本 packing
+前通过绑定模型的 training client 查询有效长度：
+
+```python
+from weaver import ServiceClient
+from weaver.types import Datum, SampleRef
+
+with ServiceClient() as service:
+    service.ensure_session()
+    for dataset in service.datasets.list(compatible_model="Qwen/Qwen3-8B"):
+        print(dataset.name, dataset.version, dataset.sample_count)
+
+    ref = SampleRef(dataset="hq-math", version="2026-08", sample_idx=42)
+    trainer = service.create_model(
+        base_model="Qwen/Qwen3-8B",
+        training_max_sequence_length=4096,
+    )
+    length = trainer.resolve_sample_ref_lengths([ref])[0].input_token_count
+    print(length)
+
+    datum = Datum.from_sample_ref(
+        dataset=ref.dataset,
+        version=ref.version,
+        sample_idx=ref.sample_idx,
+        datum_id="batch-7-item-3",
+        loss_fn_inputs={"advantages": [1.0] * length},
+    )
+    result = trainer.forward_backward([datum], "cross_entropy")
+```
+
+模型创建时会固定 tokenizer、chat template 和完整的 shift 前 token 上限，client 不能按
+sample 覆盖。`input_token_count` 是 autoregressive shift 后的有效训练长度（小于固定的完整
+token 上限），可用于 client 侧整样本 packing。`SampleRef` 不能用于 sampling。若操作需要返回 token 形状字段，受保护
+位置只会返回仅用于响应的 `-8` 占位符，同时保持真实长度；不要把 `-8` 再传入
+`ModelInput` 或 `target_tokens`。
+
 ## 使用方法
 
 参见 [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb)，通过 Pig Latin 翻译任务交互式演示完整的 SDK 工作流——涵盖数据准备、LoRA / 全量微调、采样推理和 checkpoint 管理。

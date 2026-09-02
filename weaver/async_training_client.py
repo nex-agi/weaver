@@ -30,17 +30,7 @@ import asyncio
 import logging
 import math
 from datetime import datetime, timezone
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Mapping,
-    Sequence,
-    Tuple,
-    overload,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, Tuple, overload
 
 from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
 from ._async_http import _await_blocking_io
@@ -62,6 +52,7 @@ from .tensor_transport import PreparedOperationBody
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.deployment import Deployment
+from .types.managed_dataset import SampleRef, SampleRefLength, parse_sample_ref_lengths
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
@@ -167,6 +158,20 @@ class AsyncTrainingClient:
 
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
+
+    async def resolve_sample_ref_lengths(self, refs: Sequence[SampleRef]) -> List[SampleRefLength]:
+        """Resolve safe, model-bound input lengths for whole-sample batching."""
+
+        requested = list(refs)
+        if not requested:
+            return []
+        if not all(isinstance(ref, SampleRef) for ref in requested):
+            raise TypeError("refs must contain only SampleRef values")
+        payload = await self._service.http.post(
+            f"/api/v1/models/{self.model_id}/managed-dataset-sample-lengths",
+            json={"items": [ref.to_payload() for ref in requested]},
+        )
+        return parse_sample_ref_lengths(requested, payload)
 
     async def _enqueue_prepared(
         self, path: str, prepared: PreparedOperationBody
