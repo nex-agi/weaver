@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from numbers import Integral, Real
 from typing import Any, Dict, Mapping, Sequence
@@ -219,6 +221,68 @@ def validate_sample_ref_loss_inputs(data: Sequence[Datum], loss_fn: str) -> None
             raise ValueError(
                 f"datum {index}: sample-ref Datum cannot provide server-owned inputs: {rendered}"
             )
+
+
+def normalize_mixed_datum_ids(data: Sequence[Datum]) -> list[Datum]:
+    """Return occurrence-addressable datums for an identified training batch.
+
+    The sole legacy case is an all-token batch in which every ``datum_id`` is
+    absent; it retains its historical wire shape. Once a batch contains either
+    a SampleRef or any explicit id, the server requires every occurrence to
+    carry a unique ``datum_id`` so outputs can be correlated after packing and
+    DP reordering. Token datums without an explicit id receive a deterministic
+    id derived only from the batch's already-public ids and their wire
+    position; token contents never contribute to the identifier.
+
+    A copy is made for each missing-id token occurrence. This matters when the
+    same :class:`Datum` object appears more than once in a batch: occurrences
+    must remain distinct without mutating the caller's shared object.
+    """
+
+    normalized = list(data)
+    if not any(datum.is_sample_ref or datum.datum_id is not None for datum in normalized):
+        return normalized
+
+    used_ids: set[str] = set()
+    public_id_parts: list[tuple[int, str]] = []
+    for index, datum in enumerate(normalized):
+        if datum.datum_id is None:
+            if datum.is_sample_ref:
+                raise ValueError(f"datum {index}: sample-ref Datum requires datum_id")
+            continue
+        datum_id = _datum_id(datum.datum_id)
+        if datum_id in used_ids:
+            raise ValueError(f"datum {index}: duplicate datum_id {datum_id!r}")
+        used_ids.add(datum_id)
+        public_id_parts.append((index, datum_id))
+
+    # JSON string escaping and array boundaries make this unambiguous even
+    # though the public datum_id validator intentionally permits control
+    # characters. ``ensure_ascii`` also keeps the bytes stable for arbitrary
+    # Unicode IDs without ever incorporating token content.
+    batch_anchor = json.dumps(public_id_parts, ensure_ascii=True, separators=(",", ":"))
+    for index, datum in enumerate(normalized):
+        if datum.datum_id is not None:
+            continue
+        attempt = 0
+        while True:
+            digest = hashlib.sha256(
+                (
+                    "weaver-mixed-datum-occurrence-v1\0" f"{batch_anchor}\0{index}\0{attempt}"
+                ).encode()
+            ).hexdigest()
+            datum_id = f"d-mixed-{digest}"
+            if datum_id not in used_ids:
+                break
+            attempt += 1
+        used_ids.add(datum_id)
+        normalized[index] = Datum(
+            model_input=datum.model_input,
+            loss_fn_inputs=dict(datum.loss_fn_inputs),
+            metadata=dict(datum.metadata),
+            datum_id=datum_id,
+        )
+    return normalized
 
 
 def _is_jagged_sequence(value: Any) -> bool:

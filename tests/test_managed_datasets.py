@@ -33,6 +33,7 @@ from weaver._payloads import (
     build_surrogate_data,
     parse_logprob_tensors,
     prepare_forward_backward_operation,
+    prepare_forward_operation,
 )
 from weaver.async_training_client import AsyncTrainingClient
 from weaver.training_client import TrainingClient
@@ -153,6 +154,187 @@ def test_legacy_datum_wire_shape_is_unchanged_and_new_id_is_optional():
     assert set(legacy.to_payload()) == {"model_input", "loss_fn_inputs"}
     assert "kind" not in identified.to_payload()
     assert identified.to_payload()["datum_id"] == "local-1"
+
+
+@pytest.mark.parametrize(
+    ("prepare", "input_key", "transport"),
+    [
+        (prepare_forward_operation, "forward_input", "default"),
+        (prepare_forward_operation, "forward_input", "http-binary"),
+        (prepare_forward_backward_operation, "forward_backward_input", "default"),
+        (prepare_forward_backward_operation, "forward_backward_input", "http-binary"),
+    ],
+)
+def test_natural_mixed_batch_assigns_stable_local_occurrence_ids(prepare, input_key, transport):
+    local = Datum.from_raw(
+        model_input=ModelInput.from_ints([1, 2]),
+        loss_fn_inputs={"target_tokens": [2, 3], "custom_signal": [0.25, 0.5]},
+        metadata={"source": "local"},
+    )
+    managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2)
+
+    def wire_data():
+        prepared = prepare(
+            model_id="model-1",
+            seq_id=7,
+            data=[local, managed],
+            loss_fn="cross_entropy",
+            loss_fn_config=None,
+            request_metadata=None,
+            tensor_transport=transport,
+        )
+        try:
+            return prepared.body["payload"][input_key]["data"]
+        finally:
+            prepared.close()
+
+    first = wire_data()
+    second = wire_data()
+
+    assert local.datum_id is None
+    assert first[0]["datum_id"].startswith("d-mixed-")
+    assert first[0]["datum_id"] == second[0]["datum_id"]
+    assert first[1]["datum_id"] == managed.datum_id
+    if transport == "default":
+        assert first[0]["loss_fn_inputs"]["target_tokens"]["data"] == [2, 3]
+    else:
+        assert "$tensor" in first[0]["loss_fn_inputs"]["target_tokens"]
+    assert first[0]["loss_fn_inputs"]["custom_signal"]["data"] == [0.25, 0.5]
+    assert first[0]["metadata"] == {"source": "local"}
+
+
+def test_mixed_batch_preserves_explicit_ids_and_distinguishes_repeated_object_occurrences():
+    repeated = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]),
+        loss_fn_inputs={"target_tokens": [2]},
+    )
+    identified = Datum.from_raw(
+        model_input=ModelInput.from_ints([3]),
+        loss_fn_inputs={"target_tokens": [4]},
+        datum_id="local-explicit",
+    )
+    managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2)
+
+    prepared = prepare_forward_backward_operation(
+        model_id="model-1",
+        seq_id=7,
+        data=[repeated, identified, managed, repeated],
+        loss_fn="cross_entropy",
+        loss_fn_config=None,
+        request_metadata=None,
+        tensor_transport="default",
+    )
+    try:
+        wire = prepared.body["payload"]["forward_backward_input"]["data"]
+    finally:
+        prepared.close()
+
+    assert wire[1]["datum_id"] == "local-explicit"
+    assert wire[2]["datum_id"] == managed.datum_id
+    assert wire[0]["datum_id"] != wire[3]["datum_id"]
+    assert len({datum["datum_id"] for datum in wire}) == len(wire)
+
+
+@pytest.mark.parametrize(
+    ("prepare", "input_key", "transport"),
+    [
+        (prepare_forward_operation, "forward_input", "default"),
+        (prepare_forward_operation, "forward_input", "http-binary"),
+        (prepare_forward_backward_operation, "forward_backward_input", "default"),
+        (prepare_forward_backward_operation, "forward_backward_input", "http-binary"),
+    ],
+)
+def test_token_only_batch_retains_legacy_missing_id_wire_shape(prepare, input_key, transport):
+    local = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]), loss_fn_inputs={"target_tokens": [2]}
+    )
+
+    prepared = prepare(
+        model_id="model-1",
+        seq_id=7,
+        data=[local, local],
+        loss_fn="cross_entropy",
+        loss_fn_config=None,
+        request_metadata=None,
+        tensor_transport=transport,
+    )
+    try:
+        wire = prepared.body["payload"][input_key]["data"]
+    finally:
+        prepared.close()
+
+    assert all("datum_id" not in datum for datum in wire)
+
+
+@pytest.mark.parametrize(
+    ("prepare", "input_key"),
+    [
+        (prepare_forward_operation, "forward_input"),
+        (prepare_forward_backward_operation, "forward_backward_input"),
+    ],
+)
+def test_token_only_partially_identified_batch_assigns_missing_occurrence_ids(prepare, input_key):
+    missing = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]), loss_fn_inputs={"target_tokens": [2]}
+    )
+    identified = Datum.from_raw(
+        model_input=ModelInput.from_ints([3]),
+        loss_fn_inputs={"target_tokens": [4]},
+        datum_id="local-explicit",
+    )
+
+    def wire_data():
+        prepared = prepare(
+            model_id="model-1",
+            seq_id=7,
+            data=[missing, identified],
+            loss_fn="cross_entropy",
+            loss_fn_config=None,
+            request_metadata=None,
+            tensor_transport="default",
+        )
+        try:
+            return prepared.body["payload"][input_key]["data"]
+        finally:
+            prepared.close()
+
+    first = wire_data()
+    second = wire_data()
+
+    assert missing.datum_id is None
+    assert first[0]["datum_id"].startswith("d-mixed-")
+    assert first[0]["datum_id"] == second[0]["datum_id"]
+    assert first[1]["datum_id"] == "local-explicit"
+
+
+def test_generated_occurrence_id_anchor_is_unambiguous_for_control_char_ids():
+    def local(datum_id=None):
+        return Datum.from_raw(
+            model_input=ModelInput.from_ints([1]),
+            loss_fn_inputs={"target_tokens": [2]},
+            datum_id=datum_id,
+        )
+
+    def generated_id(data):
+        prepared = prepare_forward_backward_operation(
+            model_id="model-1",
+            seq_id=7,
+            data=data,
+            loss_fn="cross_entropy",
+            loss_fn_config=None,
+            request_metadata=None,
+            tensor_transport="default",
+        )
+        try:
+            return prepared.body["payload"]["forward_backward_input"]["data"][2]["datum_id"]
+        finally:
+            prepared.close()
+
+    # Delimiter joining encoded both explicit-ID sets as ``0:a\x1f1:b``.
+    delimiter_in_id = generated_id([local("a\x1f1:b"), local(), local()])
+    separate_ids = generated_id([local("a"), local("b"), local()])
+
+    assert delimiter_in_id != separate_ids
 
 
 @pytest.mark.parametrize("field", ["target_tokens", "loss_mask", "weights", "sampling_mask"])
@@ -512,21 +694,63 @@ def test_mixed_output_alignment_and_safe_reattachment_preserve_datum_kinds():
     )
 
 
-def test_mixed_output_alignment_requires_ids_on_every_occurrence():
+def test_mixed_output_alignment_uses_generated_local_occurrence_id():
     local = Datum.from_raw(
         model_input=ModelInput.from_ints([1]), loss_fn_inputs={"target_tokens": [2]}
     )
     managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2)
+    prepared = prepare_forward_backward_operation(
+        model_id="model-1",
+        seq_id=7,
+        data=[local, managed],
+        loss_fn="cross_entropy",
+        loss_fn_config=None,
+        request_metadata=None,
+        tensor_transport="default",
+    )
+    try:
+        wire = prepared.body["payload"]["forward_backward_input"]["data"]
+    finally:
+        prepared.close()
     result = {
         "result": {
             "loss_fn_outputs": [
-                {"logprobs": [0.0]},
+                {"datum_id": wire[0]["datum_id"], "logprobs": [0.0]},
                 _sample_output(managed, count=1),
             ]
         }
     }
-    with pytest.raises(ValueError, match="requires datum_id"):
-        align_training_outputs([local, managed], result)
+
+    aligned = align_training_outputs([local, managed], result)
+    attached = attach_loss_fn_outputs([local, managed], result)
+
+    assert aligned[0]["datum_id"] == wire[0]["datum_id"]
+    assert attached[0].datum_id == wire[0]["datum_id"]
+    assert attached[0].loss_fn_inputs["old_logprobs"].tolist() == [0.0]
+
+
+def test_token_only_identified_batch_rejects_duplicate_explicit_ids_before_submission():
+    first = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]),
+        loss_fn_inputs={"target_tokens": [2]},
+        datum_id="duplicate",
+    )
+    second = Datum.from_raw(
+        model_input=ModelInput.from_ints([3]),
+        loss_fn_inputs={"target_tokens": [4]},
+        datum_id="duplicate",
+    )
+
+    with pytest.raises(ValueError, match="duplicate datum_id"):
+        prepare_forward_backward_operation(
+            model_id="model-1",
+            seq_id=7,
+            data=[first, second],
+            loss_fn="cross_entropy",
+            loss_fn_config=None,
+            request_metadata=None,
+            tensor_transport="default",
+        )
 
 
 def test_custom_surrogate_preserves_sample_ref_without_synthesizing_targets():

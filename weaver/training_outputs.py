@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Sequence
 
-from .types.datum import Datum
+from .types.datum import Datum, normalize_mixed_datum_ids
 from .types.managed_dataset import (
     SampleRefOutput,
     _datum_id,
@@ -53,24 +53,25 @@ def align_training_outputs(
     handles materialize HTTP-binary tensors before this parser runs.
     """
 
+    normalized_data = normalize_mixed_datum_ids(data)
     outputs = _loss_fn_outputs(result)
-    if len(outputs) != len(data):
-        raise ValueError(f"Expected {len(data)} loss_fn_outputs, got {len(outputs)}")
+    if len(outputs) != len(normalized_data):
+        raise ValueError(f"Expected {len(normalized_data)} loss_fn_outputs, got {len(outputs)}")
 
-    if all(datum.datum_id is None and not datum.is_sample_ref for datum in data):
+    if all(datum.datum_id is None and not datum.is_sample_ref for datum in normalized_data):
         legacy_outputs: list[AlignedTrainingOutput] = list(outputs)
         return legacy_outputs
-    if any(datum.datum_id is None for datum in data):
+    if any(datum.datum_id is None for datum in normalized_data):
         raise ValueError("mixed/new-style output alignment requires datum_id on every datum")
 
-    input_ids = [datum.datum_id for datum in data]
+    input_ids = [datum.datum_id for datum in normalized_data]
     assert all(datum_id is not None for datum_id in input_ids)
     if len(set(input_ids)) != len(input_ids):
         raise ValueError("input datum_id values must be unique")
 
     output_ids: list[str] = []
     aligned: list[AlignedTrainingOutput] = []
-    for index, (datum, payload) in enumerate(zip(data, outputs)):
+    for index, (datum, payload) in enumerate(zip(normalized_data, outputs)):
         try:
             output_id = _datum_id(payload.get("datum_id"))
         except ValueError as exc:
@@ -118,9 +119,10 @@ def attach_loss_fn_outputs(
     ):
         raise ValueError("token-bearing or server-owned fields cannot be attached as loss inputs")
 
-    aligned = align_training_outputs(data, result)
+    normalized_data = normalize_mixed_datum_ids(data)
+    aligned = align_training_outputs(normalized_data, result)
     copied: list[Datum] = []
-    for index, (datum, output) in enumerate(zip(data, aligned)):
+    for index, (datum, output) in enumerate(zip(normalized_data, aligned)):
         updates: dict[str, Any] = {}
         for output_name, input_name in selected.items():
             value: Any

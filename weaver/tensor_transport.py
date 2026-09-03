@@ -35,7 +35,7 @@ import zstandard
 
 from .config import TensorCompression, TensorTransport
 from .types import Datum
-from .types.datum import validate_sample_ref_loss_inputs
+from .types.datum import normalize_mixed_datum_ids, validate_sample_ref_loss_inputs
 from .types.tensor import TensorData, tensor_payload
 
 TENSOR_KEY = "$tensor"
@@ -227,17 +227,18 @@ def serialize_training_data(
 ) -> SerializedTrainingData:
     """Serialize datums, optimizing dense cross-entropy tensors only."""
 
-    validate_sample_ref_loss_inputs(data, loss_fn)
+    normalized_data = normalize_mixed_datum_ids(data)
+    validate_sample_ref_loss_inputs(normalized_data, loss_fn)
     if loss_fn != "cross_entropy" or transport == "default":
-        return SerializedTrainingData([datum.to_payload() for datum in data])
+        return SerializedTrainingData([datum.to_payload() for datum in normalized_data])
 
-    if all(datum.is_sample_ref for datum in data):
-        return SerializedTrainingData([datum.to_payload() for datum in data])
+    if all(datum.is_sample_ref for datum in normalized_data):
+        return SerializedTrainingData([datum.to_payload() for datum in normalized_data])
 
     writer = _PackWriter(compression=compression)
     try:
         payload: list[dict[str, Any]] = []
-        for datum in data:
+        for datum in normalized_data:
             if datum.is_sample_ref:
                 payload.append(datum.to_payload())
                 continue

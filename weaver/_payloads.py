@@ -60,7 +60,9 @@ def build_request_metadata(
 
 
 def serialize_data(data: Sequence[Datum]) -> List[Dict[str, Any]]:
-    return [datum.to_payload() for datum in data]
+    from .types.datum import normalize_mixed_datum_ids
+
+    return [datum.to_payload() for datum in normalize_mixed_datum_ids(data)]
 
 
 def _prepare_training_operation(
