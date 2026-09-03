@@ -374,7 +374,7 @@ def test_public_sample_ref_supports_sampling_mask_but_protected_preflight_reject
     client._service._http.get.return_value = _dataset_payload(
         name="open", version="v1", content_visibility="protected"
     )
-    with pytest.raises(ValueError, match="empty loss_fn_inputs"):
+    with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
         client.forward_backward([datum], "cross_entropy")
 
     client._managed_dataset_visibility_cache.clear()
@@ -1060,11 +1060,45 @@ def test_sync_training_client_only_preflights_public_only_sample_ref_operations(
     client._service._http.get.return_value = _dataset_payload(
         name="secret", version="v2", content_visibility="protected"
     )
-    with pytest.raises(ValueError, match="empty loss_fn_inputs"):
+    with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
         client.forward_backward([protected_with_inputs], "cross_entropy")
 
+    protected_with_metadata = Datum.from_sample_ref(
+        dataset="secret",
+        version="v3",
+        sample_idx=0,
+        metadata={"execution_control": "custom"},
+    )
+    client._service._http.get.return_value = _dataset_payload(
+        name="secret", version="v3", content_visibility="protected"
+    )
+    with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
+        client.forward_backward([protected_with_metadata], "cross_entropy")
+
+    protected_with_config = Datum.from_sample_ref(dataset="secret", version="v4", sample_idx=0)
+    client._service._http.get.return_value = _dataset_payload(
+        name="secret", version="v4", content_visibility="protected"
+    )
+    with pytest.raises(ValueError, match="default-transport cross_entropy"):
+        client.forward_backward(
+            [protected_with_config], "cross_entropy", loss_fn_config={"reduction": "mean"}
+        )
+
+    protected_binary = Datum.from_sample_ref(dataset="secret", version="v5", sample_idx=0)
+    client._service._config.tensor_transport = "http-binary"
+    client._service._http.get.return_value = _dataset_payload(
+        name="secret", version="v5", content_visibility="protected"
+    )
+    with pytest.raises(ValueError, match="default-transport cross_entropy"):
+        client.forward_backward([protected_binary], "cross_entropy")
+    client._service._config.tensor_transport = "default"
+
     public = Datum.from_sample_ref(
-        dataset="open", version="v1", sample_idx=0, loss_fn_inputs={"signal": [1.0]}
+        dataset="open",
+        version="v1",
+        sample_idx=0,
+        loss_fn_inputs={"signal": [1.0]},
+        metadata={"execution_control": "custom"},
     )
     client._service._http.get.return_value = _dataset_payload(
         name="open", version="v1", content_visibility="public"
@@ -1099,7 +1133,44 @@ def test_async_training_client_matches_sample_ref_visibility_preflight():
         with pytest.raises(ValueError, match="is protected"):
             await client.forward([protected], "forward_logprob")
 
-        public = Datum.from_sample_ref(dataset="open", version="v1", sample_idx=0)
+        protected_with_metadata = Datum.from_sample_ref(
+            dataset="secret",
+            version="v2",
+            sample_idx=0,
+            metadata={"execution_control": "custom"},
+        )
+        client._service._http.get.return_value = _dataset_payload(
+            name="secret", version="v2", content_visibility="protected"
+        )
+        with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
+            await client.forward_backward([protected_with_metadata], "cross_entropy")
+
+        protected_with_config = Datum.from_sample_ref(dataset="secret", version="v3", sample_idx=0)
+        client._service._http.get.return_value = _dataset_payload(
+            name="secret", version="v3", content_visibility="protected"
+        )
+        with pytest.raises(ValueError, match="default-transport cross_entropy"):
+            await client.forward_backward(
+                [protected_with_config],
+                "cross_entropy",
+                loss_fn_config={"reduction": "mean"},
+            )
+
+        protected_binary = Datum.from_sample_ref(dataset="secret", version="v4", sample_idx=0)
+        client._service._config.tensor_transport = "http-binary"
+        client._service._http.get.return_value = _dataset_payload(
+            name="secret", version="v4", content_visibility="protected"
+        )
+        with pytest.raises(ValueError, match="default-transport cross_entropy"):
+            await client.forward_backward([protected_binary], "cross_entropy")
+        client._service._config.tensor_transport = "default"
+
+        public = Datum.from_sample_ref(
+            dataset="open",
+            version="v1",
+            sample_idx=0,
+            metadata={"execution_control": "custom"},
+        )
         client._service._http.get.return_value = _dataset_payload(
             name="open", version="v1", content_visibility="public"
         )
@@ -1108,7 +1179,7 @@ def test_async_training_client_matches_sample_ref_visibility_preflight():
         return client
 
     client = asyncio.run(run())
-    assert client._service._http.get.await_count == 2
+    assert client._service._http.get.await_count == 5
 
 
 def test_custom_training_is_public_only_for_sample_refs():

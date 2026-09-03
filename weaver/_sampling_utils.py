@@ -27,15 +27,25 @@ from typing import Any, Callable, Dict, List, Optional
 from transformers.tokenization_utils import PreTrainedTokenizer
 
 from ._utils import lookup_case_insensitive
-from .types import LogprobsParams, ModelInput, SamplingParams
+from .types import LogprobsParams, ModelInput, SampleRef, SamplingParams
 from .types.sampling_control import PauseMode, coerce_pause_mode
 
 TokenizerProvider = Callable[[], PreTrainedTokenizer]
 
 
+def sampling_prompt_payload(prompt: ModelInput | SampleRef) -> Dict[str, Any]:
+    """Serialize a token prompt or an opaque public managed-sample reference."""
+
+    if isinstance(prompt, ModelInput):
+        return prompt.to_payload()
+    if isinstance(prompt, SampleRef):
+        return {"kind": "sample_ref", **prompt.to_payload()}
+    raise TypeError("prompt must be ModelInput or SampleRef")
+
+
 def build_sample_body(
     *,
-    prompt: ModelInput,
+    prompt: ModelInput | SampleRef,
     sampling_params: SamplingParams | None,
     num_samples: int,
     include_prompt_logprobs: bool,
@@ -46,7 +56,7 @@ def build_sample_body(
 ) -> Dict[str, Any]:
     params = sampling_params or SamplingParams()
     body: Dict[str, Any] = {
-        "prompt": prompt.to_payload(),
+        "prompt": sampling_prompt_payload(prompt),
         "sampling_params": params.to_payload(),
         "num_samples": num_samples,
         "prompt_logprobs": include_prompt_logprobs,
@@ -62,10 +72,10 @@ def build_sample_body(
 
 
 def build_logprobs_body(
-    prompt: ModelInput, logprobs_params: LogprobsParams | None
+    prompt: ModelInput | SampleRef, logprobs_params: LogprobsParams | None
 ) -> Dict[str, Any]:
     params = logprobs_params or LogprobsParams()
-    return {"prompt": prompt.to_payload(), **params.to_payload()}
+    return {"prompt": sampling_prompt_payload(prompt), **params.to_payload()}
 
 
 def build_pause_generation_body(mode: "PauseMode | str") -> Dict[str, Any]:
@@ -280,12 +290,15 @@ def normalize_sample_result(payload: Any, get_tokenizer: TokenizerProvider) -> A
     return normalized
 
 
-def normalize_prompt_logprobs(prompt: ModelInput, payload: Any) -> List[float | None]:
-    tokens = prompt_tokens(prompt)
-    if not tokens:
-        return []
+def normalize_prompt_logprobs(prompt: ModelInput | SampleRef, payload: Any) -> List[float | None]:
+    expected = 0
+    if isinstance(prompt, ModelInput):
+        tokens = prompt_tokens(prompt)
+        if not tokens:
+            return []
+        expected = len(tokens)
     result = result_payload(payload)
-    prompt_values = coerce_prompt_logprob_list(result.get("prompt_logprobs"), len(tokens))
+    prompt_values = coerce_prompt_logprob_list(result.get("prompt_logprobs"), expected)
     if prompt_values is None:
         raise RuntimeError("trainer response missing prompt_logprobs")
     return prompt_values

@@ -25,7 +25,7 @@ from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle
-from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
+from .types import LogprobsParams, ModelInput, PauseMode, SampleRef, SamplingParams
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -52,12 +52,32 @@ class AsyncSamplingClient:
         # Cached result of the generation-control eligibility check; a model's
         # training mode is fixed at creation, so one confirmation is enough.
         self._is_full_ft = False
+        # Immutable per-version visibility cache for an early UX error only;
+        # the server resolves and enforces visibility again for every request.
+        self._managed_dataset_visibility_cache: Dict[tuple[str, str], str] = {}
+
+    async def _ensure_sample_ref_is_public(self, prompt: ModelInput | SampleRef) -> None:
+        """Fail before enqueue when sampling is attempted with protected data."""
+
+        if not isinstance(prompt, SampleRef):
+            return
+        source = (prompt.dataset, prompt.version)
+        visibility = self._managed_dataset_visibility_cache.get(source)
+        if visibility is None:
+            info = await self._service.datasets.get(name=source[0], version=source[1])
+            visibility = info.content_visibility
+            self._managed_dataset_visibility_cache[source] = visibility
+        if visibility != "public":
+            raise ValueError(
+                f"managed dataset {source[0]!r} version {source[1]!r} is protected; "
+                "sampling and compute_logprobs only support public SampleRef data"
+            )
 
     @overload
     async def sample(
         self,
         *,
-        prompt: ModelInput,
+        prompt: ModelInput | SampleRef,
         sampling_params: SamplingParams | None = None,
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
@@ -72,7 +92,7 @@ class AsyncSamplingClient:
     async def sample(
         self,
         *,
-        prompt: ModelInput,
+        prompt: ModelInput | SampleRef,
         sampling_params: SamplingParams | None = None,
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
@@ -86,7 +106,7 @@ class AsyncSamplingClient:
     async def sample(
         self,
         *,
-        prompt: ModelInput,
+        prompt: ModelInput | SampleRef,
         sampling_params: SamplingParams | None = None,
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
@@ -96,6 +116,7 @@ class AsyncSamplingClient:
         return_moe_topk_indices: bool = False,
         wait: bool = True,
     ) -> AsyncOperationHandle | Dict[str, Any]:
+        await self._ensure_sample_ref_is_public(prompt)
         body = _su.build_sample_body(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -121,13 +142,14 @@ class AsyncSamplingClient:
     async def compute_logprobs(
         self,
         *,
-        prompt: ModelInput,
+        prompt: ModelInput | SampleRef,
         logprobs_params: LogprobsParams | None = None,
     ) -> List[float | None] | Dict[str, Any]:
         """Compute log-probabilities for the given prompt.
 
         See :meth:`weaver.sampling_client.SamplingClient.compute_logprobs`.
         """
+        await self._ensure_sample_ref_is_public(prompt)
         params = logprobs_params or LogprobsParams()
         body = _su.build_logprobs_body(prompt, params)
         handle = await self._service.enqueue_operation(

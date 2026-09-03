@@ -185,18 +185,24 @@ class AsyncTrainingClient:
             if visibility != "public":
                 raise ValueError(
                     f"managed dataset {source[0]!r} version {source[1]!r} is protected; "
-                    "protected SampleRef data only supports cross_entropy forward_backward "
-                    "with empty loss_fn_inputs"
+                    "protected SampleRef data only supports default-transport cross_entropy "
+                    "forward_backward with empty loss_fn_config, loss_fn_inputs, and metadata"
                 )
 
     async def _validate_forward_backward_sample_refs(
-        self, data: Sequence[Datum], loss_fn: str
+        self,
+        data: Sequence[Datum],
+        loss_fn: str,
+        loss_fn_config: Mapping[str, Any] | None,
     ) -> None:
         managed = [datum for datum in data if datum.is_sample_ref]
         if not managed:
             return
-        protected_safe = loss_fn == "cross_entropy" and all(
-            not datum.loss_fn_inputs for datum in managed
+        protected_safe = (
+            loss_fn == "cross_entropy"
+            and not loss_fn_config
+            and self._service.tensor_transport == "default"
+            and all(not datum.loss_fn_inputs and not datum.metadata for datum in managed)
         )
         if not protected_safe:
             await self._ensure_sample_refs_are_public(managed)
@@ -357,7 +363,7 @@ class AsyncTrainingClient:
             wait: If True (default), awaits completion and returns the result dict;
                 if False, returns an ``AsyncOperationHandle`` immediately.
         """
-        await self._validate_forward_backward_sample_refs(data, loss_fn)
+        await self._validate_forward_backward_sample_refs(data, loss_fn, loss_fn_config)
         payload = await _build_training_payload(
             prepare_forward_backward_operation,
             model_id=self.model_id,

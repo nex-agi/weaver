@@ -195,19 +195,23 @@ The model fixes the tokenizer, chat template, and complete pre-shift token limit
 cannot override them per reference. `input_token_count` is the resulting autoregressive
 training length after shifting (and is smaller than the pinned full-token limit), which
 is sufficient for client-side whole-sample packing.
-Protected references support only built-in `cross_entropy` `forward_backward`, and their
-`loss_fn_inputs` must be empty. Forward logprobs, per-token losses, custom/surrogate loss,
-and sampling would expose label-dependent signals and are rejected by the server. A
-protected response carries a server-resolved `content_visibility="protected"`; any
-token-shaped identity field contains only the response-only `-8` sentinel at the true
-length. Never feed `-8` back into `ModelInput` or `target_tokens`.
+Protected references support only default-transport built-in `cross_entropy`
+`forward_backward`, with empty `loss_fn_config`, `loss_fn_inputs`, and per-datum `metadata`.
+Forward logprobs, per-token losses, custom/surrogate loss, and sampling would expose
+label-dependent signals and are rejected by the server. A protected response carries a
+server-resolved `content_visibility="protected"`; any token-shaped identity field contains
+only the response-only `-8` sentinel at the true length. Never feed `-8` back into
+`ModelInput` or `target_tokens`.
 
 Public references use the same `SampleRef` request shape, but their server-resolved
 `content_visibility="public"` response can contain real non-negative token IDs and the
 ordinary loss-specific output fields. Forward and custom/surrogate training requests are
-therefore available for public data. `datasets.download` always streams authenticated
-canonical JSONL to a same-directory `.part`, verifies exact size and SHA-256, then
-publishes atomically; it refuses to overwrite an existing path unless `overwrite=True`.
+therefore available for public data. A public `SampleRef` can also be passed directly as
+the `prompt` to `SamplingClient.sample` or `compute_logprobs`; the server materializes the
+complete model-bound input and returns the same public result shape as an ordinary token
+prompt. `datasets.download` always streams authenticated canonical JSONL to a same-directory
+`.part`, verifies exact size and SHA-256, then publishes atomically; it refuses to overwrite
+an existing path unless `overwrite=True`.
 
 ## Usage
 
