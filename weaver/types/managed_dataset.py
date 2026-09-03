@@ -121,6 +121,19 @@ _TOKEN_IDENTITY_FIELDS = frozenset(
     }
 )
 
+_MANAGED_ALIGNED_OUTPUT_FIELDS = frozenset(
+    {
+        "logprobs",
+        "elementwise_loss",
+        "teacher_logprobs",
+        "detached_kl_advantages",
+        "token_losses",
+        "per_token_kl",
+    }
+)
+_MANAGED_OUTPUT_DTYPES = frozenset({"float16", "float32", "float64", "bfloat16", "int32", "int64"})
+_MANAGED_TOKEN_OUTPUT_DTYPES = frozenset({"int32", "int64"})
+
 
 def _is_token_identity_field(field_name: str) -> bool:
     """Return whether a field can reveal token identities or vocabulary logits.
@@ -401,8 +414,37 @@ def _one_dimensional_values(value: Any, field_name: str) -> list[Any]:
     return values
 
 
+def _managed_output_values(
+    value: Any, field_name: str, *, token_identity: bool = False
+) -> list[Any]:
+    """Parse one audited inline managed-output vector shape."""
+
+    allowed_dtypes = _MANAGED_TOKEN_OUTPUT_DTYPES if token_identity else _MANAGED_OUTPUT_DTYPES
+    if isinstance(value, TensorData):
+        if value.dtype not in allowed_dtypes:
+            raise ValueError(f"{field_name} has an invalid managed output dtype")
+    elif isinstance(value, Mapping):
+        if set(value) != {"data", "dtype", "shape"}:
+            raise ValueError(f"{field_name} has invalid managed tensor fields")
+        dtype = value.get("dtype")
+        if not isinstance(dtype, str) or dtype not in allowed_dtypes:
+            raise ValueError(f"{field_name} has an invalid managed output dtype")
+        data = value.get("data")
+        shape = value.get("shape")
+        if not isinstance(data, list) or not isinstance(shape, list) or len(shape) != 1:
+            raise ValueError(f"{field_name} must be an exact one-dimensional tensor")
+        dimension = shape[0]
+        if (
+            isinstance(dimension, bool)
+            or not isinstance(dimension, Integral)
+            or int(dimension) != len(data)
+        ):
+            raise ValueError(f"{field_name} must be an exact one-dimensional tensor")
+    return _one_dimensional_values(value, field_name)
+
+
 def _redacted_token_values(value: Any, field_name: str, expected: int) -> tuple[int, ...]:
-    values = _one_dimensional_values(value, field_name)
+    values = _managed_output_values(value, field_name, token_identity=True)
     if len(values) != expected:
         raise ValueError(f"{field_name} length must equal input_token_count")
     if any(
@@ -443,11 +485,12 @@ class SampleRefOutput:
         return True
 
     def get_derived_output(self, name: str) -> float | tuple[float, ...] | None:
-        if name == "logprobs":
+        normalized = _canonical_output_field(name)
+        if normalized == "logprobs":
             return self.logprobs
-        if name == "elementwise_loss":
+        if normalized == "elementwise_loss":
             return self.elementwise_loss
-        return self.derived_outputs.get(name)
+        return self.derived_outputs.get(normalized)
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SampleRefOutput:
@@ -460,21 +503,10 @@ class SampleRefOutput:
         input_token_count = _positive_int(payload.get("input_token_count"), "input_token_count")
 
         target_tokens: tuple[int, ...] | None = None
-        if payload.get("target_tokens") is not None:
+        if "target_tokens" in payload:
             target_tokens = _redacted_token_values(
                 payload["target_tokens"], "target_tokens", input_token_count
             )
-
-        aligned: dict[str, tuple[float, ...] | None] = {}
-        for field_name in ("logprobs", "elementwise_loss"):
-            raw_value = payload.get(field_name)
-            if raw_value is None:
-                aligned[field_name] = None
-                continue
-            values = _one_dimensional_values(raw_value, field_name)
-            if len(values) != input_token_count:
-                raise ValueError(f"{field_name} length must equal input_token_count")
-            aligned[field_name] = tuple(_finite_float(value, field_name) for value in values)
 
         reserved = {
             "kind",
@@ -482,20 +514,24 @@ class SampleRefOutput:
             "sample_ref",
             "input_token_count",
             "target_tokens",
-            "logprobs",
-            "elementwise_loss",
         }
+        aligned_outputs: dict[str, tuple[float, ...]] = {}
         redacted_token_outputs: dict[str, tuple[int, ...]] = {}
         derived_outputs: dict[str, float | tuple[float, ...]] = {}
         for field_name, raw_value in payload.items():
             if field_name in reserved:
                 continue
+            if not isinstance(field_name, str):
+                raise ValueError("managed output field names must be strings")
+            normalized = _canonical_output_field(field_name)
             if (
                 _is_token_count_field(field_name)
                 and isinstance(raw_value, Real)
                 and not isinstance(raw_value, bool)
             ):
-                derived_outputs[field_name] = _finite_float(raw_value, field_name)
+                if normalized in derived_outputs:
+                    raise ValueError(f"duplicate managed output field {normalized}")
+                derived_outputs[normalized] = _finite_float(raw_value, field_name)
                 continue
             if _is_token_identity_field(field_name):
                 redacted_token_outputs[field_name] = _redacted_token_values(
@@ -504,30 +540,29 @@ class SampleRefOutput:
                 continue
             if _is_forbidden_managed_output_field(field_name):
                 raise ValueError(f"{field_name} is forbidden in a managed output")
-            if isinstance(raw_value, Real) and not isinstance(raw_value, bool):
-                derived_outputs[field_name] = _finite_float(raw_value, field_name)
+            if normalized in _MANAGED_ALIGNED_OUTPUT_FIELDS:
+                if normalized in aligned_outputs:
+                    raise ValueError(f"duplicate managed output field {normalized}")
+                values = _managed_output_values(raw_value, field_name)
+                if len(values) != input_token_count:
+                    raise ValueError(f"{field_name} length must equal input_token_count")
+                aligned_outputs[normalized] = tuple(
+                    _finite_float(value, field_name) for value in values
+                )
                 continue
-            try:
-                values = _one_dimensional_values(raw_value, field_name)
-                numeric_values = tuple(float(value) for value in values)
-            except (TypeError, ValueError):
-                # Typed managed results expose only safe numeric derived values.
-                # Unknown non-numeric control metadata remains in the legacy raw
-                # result but is not promoted into this public typed view.
-                continue
-            if not all(math.isfinite(value) for value in numeric_values):
-                raise ValueError(f"{field_name} must contain only finite numeric values")
-            if len(numeric_values) != input_token_count:
-                raise ValueError(f"{field_name} length must equal input_token_count")
-            derived_outputs[field_name] = numeric_values
+            raise ValueError(f"unsupported managed output field {field_name}")
+
+        for field_name, aligned_values in aligned_outputs.items():
+            if field_name not in {"logprobs", "elementwise_loss"}:
+                derived_outputs[field_name] = aligned_values
 
         return cls(
             datum_id=datum_id,
             sample_ref=SampleRef.from_payload(raw_ref),
             input_token_count=input_token_count,
             target_tokens=target_tokens,
-            logprobs=aligned["logprobs"],
-            elementwise_loss=aligned["elementwise_loss"],
+            logprobs=aligned_outputs.get("logprobs"),
+            elementwise_loss=aligned_outputs.get("elementwise_loss"),
             redacted_token_outputs=redacted_token_outputs,
             derived_outputs=derived_outputs,
         )

@@ -621,6 +621,11 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     with pytest.raises(ValueError, match="only the -8 sentinel"):
         SampleRefOutput.from_payload(wrong_sentinel)
 
+    null_tokens = _sample_output(datum)
+    null_tokens["target_tokens"] = None
+    with pytest.raises(ValueError, match="one-dimensional array"):
+        SampleRefOutput.from_payload(null_tokens)
+
     wrong_length = _sample_output(datum)
     wrong_length["logprobs"] = [-0.7]
     with pytest.raises(ValueError, match="logprobs length"):
@@ -628,8 +633,8 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
 
     for field_name, value in (
         ("logprobs", [float("nan"), -0.7]),
-        ("loss", float("inf")),
-        ("entropy", [0.1, float("-inf")]),
+        ("per_token_kl", [0.1, float("-inf")]),
+        ("token_count", float("inf")),
     ):
         non_finite = _sample_output(datum)
         non_finite[field_name] = value
@@ -637,13 +642,32 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
             SampleRefOutput.from_payload(non_finite)
 
     with_extra = _sample_output(datum)
-    with_extra["entropy"] = [0.1, 0.2]
+    with_extra["teacher_logprobs"] = [-0.3, -0.4]
+    with_extra["detached_kl_advantages"] = [0.3, 0.4]
     with_extra["per_token_kl"] = [0.01, 0.02]
     with_extra["token_losses"] = [0.7, 0.8]
     parsed = SampleRefOutput.from_payload(with_extra)
-    assert parsed.get_derived_output("entropy") == (0.1, 0.2)
+    assert parsed.get_derived_output("teacher_logprobs") == (-0.3, -0.4)
+    assert parsed.get_derived_output("detached_kl_advantages") == (0.3, 0.4)
     assert parsed.get_derived_output("per_token_kl") == (0.01, 0.02)
     assert parsed.get_derived_output("token_losses") == (0.7, 0.8)
+
+    for unknown_field, unsafe_value in (
+        ("loss", 0.7),
+        ("entropy", [0.1, 0.2]),
+        ("predictions", [0.2, 0.8]),
+        ("debug", "private"),
+        ("metadata", {"value": 1}),
+    ):
+        unknown_output = _sample_output(datum)
+        unknown_output[unknown_field] = unsafe_value
+        with pytest.raises(ValueError, match="unsupported managed output field"):
+            SampleRefOutput.from_payload(unknown_output)
+
+    non_string_field = _sample_output(datum)
+    non_string_field[7] = [0.1, 0.2]
+    with pytest.raises(ValueError, match="field names must be strings"):
+        SampleRefOutput.from_payload(non_string_field)
 
     redacted_extra = _sample_output(datum)
     redacted_extra["output-tokens"] = [-8, -8]
@@ -651,6 +675,20 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     parsed_redacted = SampleRefOutput.from_payload(redacted_extra)
     assert parsed_redacted.redacted_token_outputs["output-tokens"] == (-8, -8)
     assert parsed_redacted.get_derived_output("prompt_tokens") == 2.0
+
+    for field_name, malformed in (
+        (
+            "logprobs",
+            {"data": [-0.1, -0.2], "dtype": "float32", "shape": [2], "extra": 1},
+        ),
+        ("logprobs", {"data": [-0.1, -0.2], "dtype": "float32", "shape": [3]}),
+        ("logprobs", {"data": [-0.1, -0.2], "dtype": "complex64", "shape": [2]}),
+        ("output_tokens", {"data": [-8, -8], "dtype": "float32", "shape": [2]}),
+    ):
+        malformed_output = _sample_output(datum)
+        malformed_output[field_name] = malformed
+        with pytest.raises(ValueError, match="managed tensor fields|exact|dtype"):
+            SampleRefOutput.from_payload(malformed_output)
 
     for identity_field in (
         "token_ids",
