@@ -20,6 +20,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import torch
 
 from weaver import (
     WEAVER_REDACTED_TOKEN_ID,
@@ -28,9 +29,12 @@ from weaver import (
     align_training_outputs,
     attach_loss_fn_outputs,
 )
-from weaver._payloads import build_surrogate_data, parse_logprob_tensors
+from weaver._payloads import (
+    build_surrogate_data,
+    parse_logprob_tensors,
+    prepare_forward_backward_operation,
+)
 from weaver.async_training_client import AsyncTrainingClient
-from weaver.tensor_transport import prepare_forward_backward_operation
 from weaver.training_client import TrainingClient
 from weaver.types import Datum, ModelInput, SampleRef, SampleRefOutput
 from weaver.types.tensor import TensorData
@@ -430,11 +434,36 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     assert parsed_redacted.redacted_token_outputs["output-tokens"] == (-8, -8)
     assert parsed_redacted.get_derived_output("prompt_tokens") == 2.0
 
-    for identity_field in ("token_ids", "teacher_tokens", "teacher_labels"):
+    for identity_field in (
+        "token_ids",
+        "input_ids",
+        "target_ids",
+        "output_ids",
+        "prompt_ids",
+        "generated_ids",
+        "teacher_tokens",
+        "teacher_labels",
+    ):
         identity_leak = _sample_output(datum)
         identity_leak[identity_field] = [1, 2]
         with pytest.raises(ValueError, match="only the -8 sentinel"):
             SampleRefOutput.from_payload(identity_leak)
+
+        redacted_identity = _sample_output(datum)
+        redacted_identity[identity_field] = [-8, -8]
+        parsed_identity = SampleRefOutput.from_payload(redacted_identity)
+        assert parsed_identity.redacted_token_outputs[identity_field] == (-8, -8)
+
+    for forbidden_field, unsafe_value in (
+        ("request_ids", [1, 2]),
+        ("adapter_id", 17),
+        ("decoded_text", [1, 2]),
+        ("raw_logits", [0.1, 0.2]),
+    ):
+        invalid_response = _sample_output(datum)
+        invalid_response[forbidden_field] = unsafe_value
+        with pytest.raises(ValueError, match="forbidden in a managed output"):
+            SampleRefOutput.from_payload(invalid_response)
 
     too_long_id = _sample_output(datum)
     too_long_id["datum_id"] = "x" * 256
@@ -466,17 +495,21 @@ def test_mixed_output_alignment_and_safe_reattachment_preserve_datum_kinds():
     assert attached[1].sample_ref == managed.sample_ref
     assert attached[1].datum_id == managed.datum_id
     assert "target_tokens" not in attached[1].loss_fn_inputs
-    assert attached[1].loss_fn_inputs["old_logprobs"].tolist() == [-0.7, -0.7]
+    assert attached[1].loss_fn_inputs["old_logprobs"].tolist() == pytest.approx([-0.7, -0.7])
 
     result["result"]["loss_fn_outputs"][1]["per_token_kl"] = [0.01, 0.02]
     result["result"]["loss_fn_outputs"][1]["token_losses"] = [0.7, 0.8]
+    result["result"]["loss_fn_outputs"][0]["per_token_kl"] = [0.03, 0.04]
+    result["result"]["loss_fn_outputs"][0]["token_losses"] = [0.5, 0.6]
     attached_derived = attach_loss_fn_outputs(
         [local, managed],
         result,
         field_map={"per_token_kl": "old_kl", "token_losses": "old_token_losses"},
     )
-    assert attached_derived[1].loss_fn_inputs["old_kl"].tolist() == [0.01, 0.02]
-    assert attached_derived[1].loss_fn_inputs["old_token_losses"].tolist() == [0.7, 0.8]
+    assert attached_derived[1].loss_fn_inputs["old_kl"].tolist() == pytest.approx([0.01, 0.02])
+    assert attached_derived[1].loss_fn_inputs["old_token_losses"].tolist() == pytest.approx(
+        [0.7, 0.8]
+    )
 
 
 def test_mixed_output_alignment_requires_ids_on_every_occurrence():
@@ -565,6 +598,7 @@ def test_create_model_pins_training_max_sequence_length_sync_and_async():
     async def run():
         async_service = AsyncServiceClient()
         async_service._session_id = "session-1"
+        async_service._session = {"id": "session-1"}
         async_service._http = MagicMock()
         async_service._http.post = AsyncMock(
             return_value={

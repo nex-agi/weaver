@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import math
 import unicodedata
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Integral, Real
-from typing import Any, Iterator, Mapping, Sequence, overload
+from typing import Any, overload
 
 import torch
 
@@ -83,18 +84,22 @@ _TOKEN_IDENTITY_FIELDS = frozenset(
         "input_token",
         "input_id",
         "input_tokens",
+        "input_ids",
         "input_token_ids",
         "output_token",
         "output_id",
         "output_tokens",
+        "output_ids",
         "output_token_ids",
         "target_token",
         "target_id",
         "target_tokens",
+        "target_ids",
         "target_token_ids",
         "prompt_token",
         "prompt_id",
         "prompt_tokens",
+        "prompt_ids",
         "prompt_token_ids",
         "completion_token",
         "completion_tokens",
@@ -102,23 +107,13 @@ _TOKEN_IDENTITY_FIELDS = frozenset(
         "generated_token",
         "generated_id",
         "generated_tokens",
+        "generated_ids",
         "generated_token_ids",
         "sampled_token",
         "sampled_tokens",
         "sampled_token_ids",
         "label",
         "labels",
-        "model_input",
-        "messages",
-        "raw_messages",
-        "text",
-        "raw_text",
-        "logits",
-        "full_logits",
-        "top_k",
-        "topk",
-        "top_k_logits",
-        "topk_logits",
         "top_k_tokens",
         "topk_tokens",
         "top_k_token_ids",
@@ -138,6 +133,31 @@ def _is_token_identity_field(field_name: str) -> bool:
     normalized = _canonical_output_field(field_name)
     return normalized in _TOKEN_IDENTITY_FIELDS or normalized.endswith(
         ("_token_ids", "_tokens", "_labels", "_token", "_label")
+    )
+
+
+def _is_forbidden_managed_output_field(field_name: str) -> bool:
+    """Reject sensitive fields that are not aligned token-identity arrays.
+
+    The server drops these fields and the trainer rejects them. Seeing one in a
+    public managed response therefore means the service violated the wire
+    contract; silently promoting a numeric ``*_ids`` array would expose an
+    identifier sequence whose semantics the SDK cannot prove safe.
+    """
+
+    normalized = _canonical_output_field(field_name)
+    if (
+        "logit" in normalized
+        or "top_k" in normalized
+        or "topk" in normalized
+        or "text" in normalized
+        or "message" in normalized
+    ):
+        return True
+    return (
+        normalized in {"content", "id", "model_input"}
+        or normalized.endswith("_id")
+        or normalized.endswith("_ids")
     )
 
 
@@ -198,7 +218,7 @@ class SampleRef:
         }
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "SampleRef":
+    def from_payload(cls, payload: Mapping[str, Any]) -> SampleRef:
         return cls(
             dataset=_dataset_name(payload.get("dataset")),
             version=_dataset_version(payload.get("version")),
@@ -221,7 +241,7 @@ class SampleRefLength:
         )
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "SampleRefLength":
+    def from_payload(cls, payload: Mapping[str, Any]) -> SampleRefLength:
         return cls(
             sample_ref=SampleRef.from_payload(payload),
             input_token_count=_positive_int(payload.get("input_token_count"), "input_token_count"),
@@ -239,7 +259,7 @@ def parse_sample_ref_lengths(requested: Sequence[SampleRef], payload: Any) -> li
 
     resolved: list[SampleRefLength] = []
     known_counts: dict[SampleRef, int] = {}
-    for index, (reference, item) in enumerate(zip(requested, raw_items)):
+    for index, (reference, item) in enumerate(zip(requested, raw_items, strict=False)):
         if not isinstance(item, Mapping):
             raise ValueError(f"sample length item {index} must be an object")
         length = SampleRefLength.from_payload(item)
@@ -265,7 +285,7 @@ class ManagedDatasetInfo:
     status: str
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "ManagedDatasetInfo":
+    def from_payload(cls, payload: Mapping[str, Any]) -> ManagedDatasetInfo:
         raw_models = payload.get("compatible_models", [])
         if not isinstance(raw_models, list) or not all(
             isinstance(model, str) for model in raw_models
@@ -320,7 +340,7 @@ class ManagedDatasetPage(Sequence[ManagedDatasetInfo]):
     @classmethod
     def from_payload(
         cls, payload: Mapping[str, Any], *, requested_limit: int, requested_offset: int
-    ) -> "ManagedDatasetPage":
+    ) -> ManagedDatasetPage:
         raw_items = payload.get("items")
         if not isinstance(raw_items, list) or not all(
             isinstance(item, Mapping) for item in raw_items
@@ -349,11 +369,11 @@ def _one_dimensional_values(value: Any, field_name: str) -> list[Any]:
         value = value.detach().cpu().tolist()
     elif isinstance(value, Mapping):
         value = value.get("data")
-    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes | bytearray):
         raise ValueError(f"{field_name} must be a one-dimensional array")
     values = list(value)
     if any(
-        isinstance(item, Sequence) and not isinstance(item, (str, bytes, bytearray))
+        isinstance(item, Sequence) and not isinstance(item, str | bytes | bytearray)
         for item in values
     ):
         raise ValueError(f"{field_name} must be one-dimensional")
@@ -409,7 +429,7 @@ class SampleRefOutput:
         return self.derived_outputs.get(name)
 
     @classmethod
-    def from_payload(cls, payload: Mapping[str, Any]) -> "SampleRefOutput":
+    def from_payload(cls, payload: Mapping[str, Any]) -> SampleRefOutput:
         if payload.get("kind") != "sample_ref_output":
             raise ValueError("managed output kind must be 'sample_ref_output'")
         datum_id = _datum_id(payload.get("datum_id"))
@@ -461,6 +481,8 @@ class SampleRefOutput:
                     raw_value, field_name, input_token_count
                 )
                 continue
+            if _is_forbidden_managed_output_field(field_name):
+                raise ValueError(f"{field_name} is forbidden in a managed output")
             if isinstance(raw_value, Real) and not isinstance(raw_value, bool):
                 derived_outputs[field_name] = _finite_float(raw_value, field_name)
                 continue
