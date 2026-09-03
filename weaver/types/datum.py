@@ -29,7 +29,7 @@ from .managed_dataset import WEAVER_REDACTED_TOKEN_ID, SampleRef, _datum_id
 from .model_input import ModelInput
 from .tensor import TensorData, tensor_payload
 
-_SAMPLE_REF_PROTECTED_INPUTS = frozenset({"target_tokens", "loss_mask", "weights", "sampling_mask"})
+_SAMPLE_REF_PROTECTED_INPUTS = frozenset({"model_input", "target_tokens", "loss_mask", "weights"})
 
 
 @dataclass(slots=True)
@@ -98,7 +98,7 @@ class Datum:
         common: dict[str, object] = {
             "loss_fn_inputs": {
                 name: (
-                    _sample_ref_loss_input_payload(values)
+                    _sample_ref_loss_input_payload(values, name)
                     if self.sample_ref is not None
                     else (
                         values.to_dict()
@@ -319,15 +319,17 @@ def _managed_numeric_scalar(value: Any) -> int | float | None:
     return None
 
 
-def _sample_ref_loss_input_payload(value: Any) -> object:
-    """Serialize the managed scalar-or-exact-1-D loss-input wire union."""
+def _sample_ref_loss_input_payload(value: Any, field_name: str) -> object:
+    """Serialize a public-capable SampleRef loss input inline."""
 
     scalar = _managed_numeric_scalar(value)
     if scalar is not None:
         return scalar
-    if not isinstance(value, torch.Tensor) or value.ndim != 1:
+    if field_name == "sampling_mask" and _is_jagged_sequence(value):
+        return value
+    if not isinstance(value, torch.Tensor):
         raise ValueError(
-            "sample-ref loss inputs must be numeric scalars or one-dimensional tensors"
+            "sample-ref loss inputs must be numeric scalars, tensors, or a jagged sampling_mask"
         )
     payload = tensor_payload(value).to_dict()
     payload["shape"] = list(value.shape)

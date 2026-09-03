@@ -142,10 +142,11 @@ weaver list supported-models --format json
 
 ### Managed datasets
 
-Managed datasets expose authorized catalog metadata and stable sample references, never
-their source messages or real token IDs. Select an explicit dataset `name` and `version`,
-then ask the model-bound training client for effective lengths before packing whole
-samples:
+Managed datasets expose authorized catalog metadata and stable sample references. Every
+immutable dataset version declares `content_visibility`: `protected` data keeps source
+messages and token identities private, while `public` data can return its real content and
+be downloaded. Select an explicit dataset `name` and `version`, then ask the model-bound
+training client for effective lengths before packing whole samples:
 
 ```python
 from weaver import ServiceClient
@@ -154,7 +155,12 @@ from weaver.types import Datum, SampleRef
 with ServiceClient() as service:
     service.ensure_session()
     for dataset in service.datasets.list(compatible_model="Qwen/Qwen3-8B"):
-        print(dataset.name, dataset.version, dataset.sample_count)
+        print(
+            dataset.name,
+            dataset.version,
+            dataset.sample_count,
+            dataset.content_visibility,
+        )
 
     ref = SampleRef(dataset="hq-math", version="2026-08", sample_idx=42)
     trainer = service.create_model(
@@ -173,20 +179,35 @@ with ServiceClient() as service:
         version=ref.version,
         sample_idx=ref.sample_idx,
         datum_id="batch-7-item-3",
-        loss_fn_inputs={"advantages": [1.0] * length},
     )
     result = trainer.forward_backward([datum], "cross_entropy")
+
+    public = service.datasets.get(name="open-math", version="2026-08")
+    if public.content_visibility == "public":
+        service.datasets.download(
+            name=public.name,
+            version=public.version,
+            destination="open-math.jsonl",
+        )
 ```
 
 The model fixes the tokenizer, chat template, and complete pre-shift token limit; clients
 cannot override them per reference. `input_token_count` is the resulting autoregressive
 training length after shifting (and is smaller than the pinned full-token limit), which
 is sufficient for client-side whole-sample packing.
-Managed references cannot be passed to sampling. If an operation returns a token-shaped
-field, every protected token position is the response-only `-8` sentinel and the true
-length is preserved; never feed `-8` back into `ModelInput` or `target_tokens`.
-Client-provided `sampling_mask` is also rejected for a `SampleRef`, because probing
-candidate membership could reveal its hidden target tokens.
+Protected references support only built-in `cross_entropy` `forward_backward`, and their
+`loss_fn_inputs` must be empty. Forward logprobs, per-token losses, custom/surrogate loss,
+and sampling would expose label-dependent signals and are rejected by the server. A
+protected response carries a server-resolved `content_visibility="protected"`; any
+token-shaped identity field contains only the response-only `-8` sentinel at the true
+length. Never feed `-8` back into `ModelInput` or `target_tokens`.
+
+Public references use the same `SampleRef` request shape, but their server-resolved
+`content_visibility="public"` response can contain real non-negative token IDs and the
+ordinary loss-specific output fields. Forward and custom/surrogate training requests are
+therefore available for public data. `datasets.download` always streams authenticated
+canonical JSONL to a same-directory `.part`, verifies exact size and SHA-256, then
+publishes atomically; it refuses to overwrite an existing path unless `overwrite=True`.
 
 ## Usage
 

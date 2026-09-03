@@ -21,7 +21,7 @@ import unicodedata
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from numbers import Integral, Real
-from typing import Any, overload
+from typing import Any, Literal, TypeAlias, overload
 
 import torch
 
@@ -32,6 +32,8 @@ MAX_DATUM_ID_LENGTH = 255
 MAX_DATASET_NAME_LENGTH = 160
 MAX_DATASET_VERSION_LENGTH = 128
 MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS = 4096
+
+ManagedDatasetVisibility: TypeAlias = Literal["protected", "public"]
 
 
 def _required_name(value: Any, field_name: str) -> str:
@@ -73,6 +75,12 @@ def _dataset_name(value: Any, field_name: str = "dataset") -> str:
 
 def _dataset_version(value: Any) -> str:
     return _dataset_path_segment(value, "version", MAX_DATASET_VERSION_LENGTH)
+
+
+def _content_visibility(value: Any) -> ManagedDatasetVisibility:
+    if value not in {"protected", "public"}:
+        raise ValueError("content_visibility must be 'protected' or 'public'")
+    return value
 
 
 _TOKEN_IDENTITY_FIELDS = frozenset(
@@ -138,9 +146,9 @@ _MANAGED_TOKEN_OUTPUT_DTYPES = frozenset({"int32", "int64"})
 def _is_token_identity_field(field_name: str) -> bool:
     """Return whether a field can reveal token identities or vocabulary logits.
 
-    Names such as ``per_token_kl`` and ``token_losses`` describe safe aligned
-    numeric values and are intentionally not rejected merely for containing
-    the word "token".
+    Names such as ``per_token_kl`` and ``token_losses`` describe aligned
+    numeric values rather than token identities. They are permitted only for
+    public content and are intentionally classified separately.
     """
 
     normalized = _canonical_output_field(field_name)
@@ -150,10 +158,10 @@ def _is_token_identity_field(field_name: str) -> bool:
 
 
 def _is_forbidden_managed_output_field(field_name: str) -> bool:
-    """Reject sensitive fields that are not aligned token-identity arrays.
+    """Classify protected fields that are not aligned token-identity arrays.
 
     The server drops these fields and the trainer rejects them. Seeing one in a
-    public managed response therefore means the service violated the wire
+    protected managed response therefore means the service violated the wire
     contract; silently promoting a numeric ``*_ids`` array would expose an
     identifier sequence whose semantics the SDK cannot prove safe.
     """
@@ -317,6 +325,7 @@ class ManagedDatasetInfo:
     recommended_ratio: float | None
     compatible_models: tuple[str, ...]
     status: str
+    content_visibility: ManagedDatasetVisibility
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> ManagedDatasetInfo:
@@ -338,6 +347,7 @@ class ManagedDatasetInfo:
             recommended_ratio=float(raw_ratio) if raw_ratio is not None else None,
             compatible_models=tuple(raw_models),
             status=str(payload.get("status") or ""),
+            content_visibility=_content_visibility(payload.get("content_visibility")),
         )
 
 
@@ -457,6 +467,57 @@ def _redacted_token_values(value: Any, field_name: str, expected: int) -> tuple[
     return tuple(int(token) for token in values)
 
 
+def _public_token_values(value: Any, field_name: str, expected: int) -> tuple[int, ...]:
+    values = _managed_output_values(value, field_name, token_identity=True)
+    if len(values) != expected:
+        raise ValueError(f"{field_name} length must equal input_token_count")
+    if any(
+        isinstance(token, bool) or not isinstance(token, Integral) or int(token) < 0
+        for token in values
+    ):
+        raise ValueError(f"public managed {field_name} may contain only non-negative token IDs")
+    return tuple(int(token) for token in values)
+
+
+def _validate_public_token_identity(value: Any, field_name: str) -> None:
+    """Validate real token IDs without imposing a training-aligned shape.
+
+    Public ordinary outputs may contain generated sequences with a different
+    length or rank-2 top-k token IDs. Preserve their wire shape; only reject a
+    value that claims to be token identity while containing non-integers or a
+    negative/redaction sentinel.
+    """
+
+    raw_value = value
+    if isinstance(value, TensorData):
+        if value.dtype not in _MANAGED_TOKEN_OUTPUT_DTYPES:
+            raise ValueError(f"{field_name} has an invalid public token output dtype")
+        raw_value = value.data
+    elif isinstance(value, torch.Tensor):
+        if value.dtype not in {torch.int32, torch.int64}:
+            raise ValueError(f"{field_name} has an invalid public token output dtype")
+        raw_value = value.detach().cpu().tolist()
+    elif isinstance(value, Mapping):
+        if set(value) != {"data", "dtype", "shape"}:
+            # Normal operation handles materialize HTTP tensor references. A
+            # remaining ordinary public object has no confidentiality impact,
+            # so preserve it rather than guessing a loss-specific schema.
+            return
+        if value.get("dtype") not in _MANAGED_TOKEN_OUTPUT_DTYPES:
+            raise ValueError(f"{field_name} has an invalid public token output dtype")
+        raw_value = value.get("data")
+
+    def validate(item: Any) -> None:
+        if isinstance(item, Sequence) and not isinstance(item, str | bytes | bytearray):
+            for child in item:
+                validate(child)
+            return
+        if isinstance(item, bool) or not isinstance(item, Integral) or int(item) < 0:
+            raise ValueError(f"public managed {field_name} may contain only non-negative token IDs")
+
+    validate(raw_value)
+
+
 def _finite_float(value: Any, field_name: str) -> float:
     try:
         normalized = float(value)
@@ -474,17 +535,24 @@ class SampleRefOutput:
     datum_id: str
     sample_ref: SampleRef
     input_token_count: int
+    content_visibility: ManagedDatasetVisibility
     target_tokens: tuple[int, ...] | None = None
     logprobs: tuple[float, ...] | None = None
     elementwise_loss: tuple[float, ...] | None = None
-    redacted_token_outputs: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
-    derived_outputs: Mapping[str, float | tuple[float, ...]] = field(default_factory=dict)
+    token_outputs: Mapping[str, Any] = field(default_factory=dict)
+    derived_outputs: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def is_redacted(self) -> bool:
-        return True
+        return self.content_visibility == "protected"
 
-    def get_derived_output(self, name: str) -> float | tuple[float, ...] | None:
+    @property
+    def redacted_token_outputs(self) -> Mapping[str, tuple[int, ...]]:
+        """Compatibility view of token outputs that actually carry redaction sentinels."""
+
+        return self.token_outputs if self.is_redacted else {}
+
+    def get_derived_output(self, name: str) -> Any:
         normalized = _canonical_output_field(name)
         if normalized == "logprobs":
             return self.logprobs
@@ -501,10 +569,16 @@ class SampleRefOutput:
         if not isinstance(raw_ref, Mapping):
             raise ValueError("managed output must echo sample_ref")
         input_token_count = _positive_int(payload.get("input_token_count"), "input_token_count")
+        content_visibility = _content_visibility(payload.get("content_visibility"))
 
         target_tokens: tuple[int, ...] | None = None
         if "target_tokens" in payload:
-            target_tokens = _redacted_token_values(
+            token_parser = (
+                _redacted_token_values
+                if content_visibility == "protected"
+                else _public_token_values
+            )
+            target_tokens = token_parser(
                 payload["target_tokens"], "target_tokens", input_token_count
             )
 
@@ -513,36 +587,48 @@ class SampleRefOutput:
             "datum_id",
             "sample_ref",
             "input_token_count",
+            "content_visibility",
             "target_tokens",
         }
         aligned_outputs: dict[str, tuple[float, ...]] = {}
-        redacted_token_outputs: dict[str, tuple[int, ...]] = {}
-        derived_outputs: dict[str, float | tuple[float, ...]] = {}
+        token_outputs: dict[str, Any] = {}
+        derived_outputs: dict[str, Any] = {}
+        seen_normalized = {_canonical_output_field(field_name) for field_name in reserved}
         for field_name, raw_value in payload.items():
             if field_name in reserved:
                 continue
             if not isinstance(field_name, str):
                 raise ValueError("managed output field names must be strings")
             normalized = _canonical_output_field(field_name)
+            if not normalized:
+                raise ValueError("managed output field names must not be blank")
+            if normalized in seen_normalized:
+                raise ValueError(f"duplicate managed output field {normalized}")
+            seen_normalized.add(normalized)
             if (
                 _is_token_count_field(field_name)
                 and isinstance(raw_value, Real)
                 and not isinstance(raw_value, bool)
             ):
-                if normalized in derived_outputs:
-                    raise ValueError(f"duplicate managed output field {normalized}")
                 derived_outputs[normalized] = _finite_float(raw_value, field_name)
                 continue
             if _is_token_identity_field(field_name):
-                redacted_token_outputs[field_name] = _redacted_token_values(
-                    raw_value, field_name, input_token_count
-                )
+                if content_visibility == "protected":
+                    token_outputs[normalized] = _redacted_token_values(
+                        raw_value, field_name, input_token_count
+                    )
+                else:
+                    _validate_public_token_identity(raw_value, field_name)
+                    token_outputs[normalized] = raw_value
                 continue
-            if _is_forbidden_managed_output_field(field_name):
+            if content_visibility == "protected" and _is_forbidden_managed_output_field(field_name):
                 raise ValueError(f"{field_name} is forbidden in a managed output")
             if normalized in _MANAGED_ALIGNED_OUTPUT_FIELDS:
-                if normalized in aligned_outputs:
-                    raise ValueError(f"duplicate managed output field {normalized}")
+                if content_visibility == "protected":
+                    raise ValueError(
+                        f"protected managed output cannot contain label-dependent "
+                        f"per-token field {field_name}"
+                    )
                 values = _managed_output_values(raw_value, field_name)
                 if len(values) != input_token_count:
                     raise ValueError(f"{field_name} length must equal input_token_count")
@@ -550,7 +636,13 @@ class SampleRefOutput:
                     _finite_float(value, field_name) for value in values
                 )
                 continue
-            raise ValueError(f"unsupported managed output field {field_name}")
+            if content_visibility == "protected":
+                raise ValueError(f"unsupported protected managed output field {field_name}")
+            # Public datasets have no content-confidentiality boundary. Preserve
+            # loss-specific output fields with the same permissive semantics as
+            # an ordinary token Datum instead of closing the SDK over every
+            # server-side loss implementation.
+            derived_outputs[normalized] = raw_value
 
         for field_name, aligned_values in aligned_outputs.items():
             if field_name not in {"logprobs", "elementwise_loss"}:
@@ -560,9 +652,10 @@ class SampleRefOutput:
             datum_id=datum_id,
             sample_ref=SampleRef.from_payload(raw_ref),
             input_token_count=input_token_count,
+            content_visibility=content_visibility,
             target_tokens=target_tokens,
             logprobs=aligned_outputs.get("logprobs"),
             elementwise_loss=aligned_outputs.get("elementwise_loss"),
-            redacted_token_outputs=redacted_token_outputs,
+            token_outputs=token_outputs,
             derived_outputs=derived_outputs,
         )

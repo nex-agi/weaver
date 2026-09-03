@@ -114,6 +114,10 @@ class AsyncTrainingClient:
         self.tokenizer_path = tokenizer_path
         self.debug_info = debug_info
         self._tokenizer: Any = None
+        # Dataset-version visibility is immutable. This cache only avoids
+        # repeated catalog round trips for SDK-side public-operation checks;
+        # the server remains authoritative on every request.
+        self._managed_dataset_visibility_cache: Dict[tuple[str, str], str] = {}
 
     @property
     def training_run_id(self) -> str:
@@ -163,6 +167,39 @@ class AsyncTrainingClient:
 
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
+
+    async def _ensure_sample_refs_are_public(self, data: Sequence[Datum]) -> None:
+        """Fail early when a public-only operation contains a protected ref."""
+
+        sources = {
+            (datum.sample_ref.dataset, datum.sample_ref.version)
+            for datum in data
+            if datum.sample_ref is not None
+        }
+        for source in sorted(sources):
+            visibility = self._managed_dataset_visibility_cache.get(source)
+            if visibility is None:
+                info = await self._service.datasets.get(name=source[0], version=source[1])
+                visibility = info.content_visibility
+                self._managed_dataset_visibility_cache[source] = visibility
+            if visibility != "public":
+                raise ValueError(
+                    f"managed dataset {source[0]!r} version {source[1]!r} is protected; "
+                    "protected SampleRef data only supports cross_entropy forward_backward "
+                    "with empty loss_fn_inputs"
+                )
+
+    async def _validate_forward_backward_sample_refs(
+        self, data: Sequence[Datum], loss_fn: str
+    ) -> None:
+        managed = [datum for datum in data if datum.is_sample_ref]
+        if not managed:
+            return
+        protected_safe = loss_fn == "cross_entropy" and all(
+            not datum.loss_fn_inputs for datum in managed
+        )
+        if not protected_safe:
+            await self._ensure_sample_refs_are_public(managed)
 
     async def resolve_sample_ref_lengths(self, refs: Sequence[SampleRef]) -> List[SampleRefLength]:
         """Resolve safe, model-bound input lengths for whole-sample batching."""
@@ -253,6 +290,8 @@ class AsyncTrainingClient:
             wait: If True (default), awaits completion and returns the result dict;
                 if False, returns an ``AsyncOperationHandle`` immediately.
         """
+        if any(datum.is_sample_ref for datum in data):
+            await self._ensure_sample_refs_are_public(data)
         payload = await _build_training_payload(
             prepare_forward_operation,
             model_id=self.model_id,
@@ -318,6 +357,7 @@ class AsyncTrainingClient:
             wait: If True (default), awaits completion and returns the result dict;
                 if False, returns an ``AsyncOperationHandle`` immediately.
         """
+        await self._validate_forward_backward_sample_refs(data, loss_fn)
         payload = await _build_training_payload(
             prepare_forward_backward_operation,
             model_id=self.model_id,

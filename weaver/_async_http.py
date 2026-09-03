@@ -41,11 +41,14 @@ from ._http import (
     DEFAULT_TIMEOUT,
     DOWNLOAD_CHUNK_SIZE,
     DOWNLOAD_TIMEOUT,
+    MANAGED_DATASET_CONTENT_TYPE,
+    MANAGED_DATASET_DOWNLOAD_CHUNK_BYTES,
     TENSOR_PACK_CHUNK_BYTES,
     USER_AGENT,
     DownloadURLExpiredError,
     WeaverAPIError,
     _is_connection_error,
+    _managed_dataset_download_metadata,
     _validate_tensor_pack_download,
     _validate_tensor_pack_response_length,
     _validate_tensor_pack_response_metadata,
@@ -347,6 +350,52 @@ class AsyncAPIClient:
             finally:
                 if compressed is not None:
                     await _await_blocking_io(compressed.close)
+
+    async def download_managed_dataset(self, path: str, destination: BinaryIO) -> tuple[int, str]:
+        """Async stream of one authenticated public JSONL dataset."""
+
+        digest = hashlib.sha256()
+        received = 0
+        with self._tracer.start_as_current_span("weaver.get", kind=trace.SpanKind.CLIENT) as span:
+            apply_request_span_attributes(span, "GET", path, None)
+            self._ensure_fresh_client()
+            headers = {
+                key: value
+                for key, value in (self._client.headers or {}).items()
+                if key.lower() not in {"accept", "accept-encoding"}
+            }
+            headers["Accept"] = MANAGED_DATASET_CONTENT_TYPE
+            headers["Accept-Encoding"] = "identity"
+            inject(headers)
+            try:
+                async with self._client.stream("GET", path, headers=headers) as response:
+                    span.set_attribute("http.status_code", response.status_code)
+                    if not response.is_success:
+                        await response.aread()
+                        span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                        raise_for_response(response)
+                    expected_size, expected_sha256 = _managed_dataset_download_metadata(response)
+                    async for chunk in response.aiter_raw(
+                        chunk_size=MANAGED_DATASET_DOWNLOAD_CHUNK_BYTES
+                    ):
+                        if received + len(chunk) > expected_size:
+                            raise ValueError("managed dataset download exceeds its Content-Length")
+                        await _await_blocking_io(destination.write, chunk)
+                        digest.update(chunk)
+                        received += len(chunk)
+                if received != expected_size:
+                    raise ValueError(
+                        f"managed dataset download has {received} bytes, expected "
+                        f"{expected_size}"
+                    )
+                if digest.hexdigest() != expected_sha256:
+                    raise ValueError("managed dataset download SHA-256 mismatch")
+                span.set_status(Status(StatusCode.OK))
+                return received, expected_sha256
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
 
     async def patch(self, path: str, *, json: Any) -> Any:
         return await self._request("PATCH", path, json=json)

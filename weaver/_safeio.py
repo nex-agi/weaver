@@ -276,6 +276,27 @@ def rename_within(parent_fd: int, src_name: str, dst_name: str) -> None:
     os.rename(src_name, dst_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
 
+def publish_within(parent_fd: int, src_name: str, dst_name: str, *, overwrite: bool) -> None:
+    """Atomically publish a completed file, optionally refusing replacement.
+
+    ``rename`` is the replace-existing primitive. For no-overwrite publication,
+    a hard link creates the final directory entry atomically and fails if that
+    name already exists; the private ``.part`` name is then removed.
+    """
+
+    if overwrite:
+        rename_within(parent_fd, src_name, dst_name)
+        return
+    os.link(
+        src_name,
+        dst_name,
+        src_dir_fd=parent_fd,
+        dst_dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+    unlink_within(parent_fd, src_name)
+
+
 def unlink_within(parent_fd: int, name: str) -> None:
     """Unlink *name* under *parent_fd*; a name that is already gone is fine."""
     try:

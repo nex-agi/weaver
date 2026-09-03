@@ -198,7 +198,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
 
     @property
     def datasets(self) -> ManagedDatasetsClient:
-        """Authorized, metadata-only managed-dataset catalog."""
+        """Authorized managed-dataset catalog and public-data downloads."""
 
         return ManagedDatasetsClient(self)
 

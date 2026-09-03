@@ -50,6 +50,7 @@ def _dataset_payload(**updates):
         "recommended_ratio": 0.2,
         "compatible_models": ["qwen-*", "llama-*"],
         "status": "published",
+        "content_visibility": "protected",
         "internal_id": "must-not-be-retained",
         "storage_path": "/gpfs/secret",
     }
@@ -57,18 +58,34 @@ def _dataset_payload(**updates):
     return payload
 
 
-def _sample_output(datum: Datum, *, count: int = 2, with_targets: bool = True):
+def _sample_output(
+    datum: Datum,
+    *,
+    count: int = 2,
+    with_targets: bool = True,
+    content_visibility: str = "protected",
+):
     assert datum.sample_ref is not None
     payload = {
         "kind": "sample_ref_output",
         "datum_id": datum.datum_id,
         "sample_ref": datum.sample_ref.to_payload(),
         "input_token_count": count,
-        "logprobs": {"data": [-0.7] * count, "dtype": "float32", "shape": [count]},
-        "elementwise_loss": [0.7] * count,
+        "content_visibility": content_visibility,
     }
     if with_targets:
-        payload["target_tokens"] = [WEAVER_REDACTED_TOKEN_ID] * count
+        payload["target_tokens"] = (
+            [WEAVER_REDACTED_TOKEN_ID] * count
+            if content_visibility == "protected"
+            else list(range(101, 101 + count))
+        )
+    if content_visibility == "public":
+        payload["logprobs"] = {
+            "data": [-0.7] * count,
+            "dtype": "float32",
+            "shape": [count],
+        }
+        payload["elementwise_loss"] = [0.7] * count
     return payload
 
 
@@ -337,10 +354,39 @@ def test_generated_occurrence_id_anchor_is_unambiguous_for_control_char_ids():
     assert delimiter_in_id != separate_ids
 
 
-@pytest.mark.parametrize("field", ["target_tokens", "loss_mask", "weights", "sampling_mask"])
+@pytest.mark.parametrize("field", ["model_input", "target_tokens", "loss_mask", "weights"])
 def test_sample_ref_rejects_server_owned_inputs(field):
     with pytest.raises(ValueError, match="server-owned"):
         Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, loss_fn_inputs={field: [1]})
+
+
+def test_public_sample_ref_supports_sampling_mask_but_protected_preflight_rejects_it():
+    mask = [[1, 2], [3]]
+    datum = Datum.from_sample_ref(
+        dataset="open",
+        version="v1",
+        sample_idx=0,
+        loss_fn_inputs={"sampling_mask": mask},
+    )
+    assert datum.to_payload()["loss_fn_inputs"]["sampling_mask"] == mask
+
+    client = _training_client()
+    client._service._http.get.return_value = _dataset_payload(
+        name="open", version="v1", content_visibility="protected"
+    )
+    with pytest.raises(ValueError, match="empty loss_fn_inputs"):
+        client.forward_backward([datum], "cross_entropy")
+
+    client._managed_dataset_visibility_cache.clear()
+    client._service._http.get.return_value = _dataset_payload(
+        name="open", version="v1", content_visibility="public"
+    )
+    handle = MagicMock()
+    handle.result.return_value = {}
+    client._service.enqueue_operation = MagicMock(return_value=handle)
+    client.forward([datum], "forward_logprob")
+    wire = client._service.enqueue_operation.call_args.args[1]
+    assert wire["payload"]["forward_input"]["data"][0]["loss_fn_inputs"]["sampling_mask"] == mask
 
 
 def test_sample_ref_serializes_inline_tensor_data_like_an_ordinary_datum():
@@ -390,7 +436,7 @@ def test_token_datum_numeric_scalar_normalization_is_unchanged():
     assert datum.loss_fn_inputs["coefficient"].ndim == 0
 
 
-def test_sample_ref_rejects_non_vector_non_scalar_loss_input():
+def test_sample_ref_serializes_multidimensional_public_custom_input():
     datum = Datum.from_sample_ref(
         dataset="d",
         version="v1",
@@ -398,8 +444,11 @@ def test_sample_ref_rejects_non_vector_non_scalar_loss_input():
         loss_fn_inputs={"coefficient": [[1.0, 2.0]]},
     )
 
-    with pytest.raises(ValueError, match="numeric scalars or one-dimensional"):
-        datum.to_payload()
+    assert datum.to_payload()["loss_fn_inputs"]["coefficient"] == {
+        "data": [[1.0, 2.0]],
+        "dtype": "float32",
+        "shape": [1, 2],
+    }
 
 
 def test_negative_tokens_cannot_reenter_model_or_targets_but_minus_100_remains_ignore_index():
@@ -436,6 +485,7 @@ def test_sync_catalog_returns_only_typed_safe_fields_and_pagination():
     )
 
     assert page[0].name == "hq-math"
+    assert page[0].content_visibility == "protected"
     assert not hasattr(page[0], "internal_id")
     assert not hasattr(page[0], "storage_path")
     assert page.has_more
@@ -454,7 +504,7 @@ def test_sync_catalog_returns_only_typed_safe_fields_and_pagination():
 def test_catalog_get_quotes_safe_public_path_segments():
     service = ServiceClient()
     service._http = MagicMock()
-    service._http.get.return_value = _dataset_payload()
+    service._http.get.return_value = _dataset_payload(name="hq math")
 
     info = service.datasets.get(name="hq math", version="2026-08")
 
@@ -463,6 +513,13 @@ def test_catalog_get_quotes_safe_public_path_segments():
 
     with pytest.raises(ValueError, match="safe path segment"):
         service.datasets.get(name="hq math", version="2026/08")
+
+    for invalid in (None, "", "private", True):
+        service._http.get.return_value = _dataset_payload(
+            name="hq math", content_visibility=invalid
+        )
+        with pytest.raises(ValueError, match="content_visibility"):
+            service.datasets.get(name="hq math", version="2026-08")
 
 
 def test_async_catalog_has_the_same_contract():
@@ -607,7 +664,7 @@ def test_async_model_bound_lengths_has_the_same_contract():
     )
 
 
-def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths():
+def test_protected_managed_output_only_accepts_redaction_and_safe_counts():
     datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2, datum_id="managed-2")
     without_tokens = SampleRefOutput.from_payload(
         _sample_output(datum, count=2, with_targets=False)
@@ -626,31 +683,18 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     with pytest.raises(ValueError, match="one-dimensional array"):
         SampleRefOutput.from_payload(null_tokens)
 
-    wrong_length = _sample_output(datum)
-    wrong_length["logprobs"] = [-0.7]
-    with pytest.raises(ValueError, match="logprobs length"):
-        SampleRefOutput.from_payload(wrong_length)
-
-    for field_name, value in (
-        ("logprobs", [float("nan"), -0.7]),
-        ("per_token_kl", [0.1, float("-inf")]),
-        ("token_count", float("inf")),
+    for label_field in (
+        "logprobs",
+        "elementwise_loss",
+        "teacher_logprobs",
+        "detached_kl_advantages",
+        "per_token_kl",
+        "token_losses",
     ):
-        non_finite = _sample_output(datum)
-        non_finite[field_name] = value
-        with pytest.raises(ValueError, match="finite numeric"):
-            SampleRefOutput.from_payload(non_finite)
-
-    with_extra = _sample_output(datum)
-    with_extra["teacher_logprobs"] = [-0.3, -0.4]
-    with_extra["detached_kl_advantages"] = [0.3, 0.4]
-    with_extra["per_token_kl"] = [0.01, 0.02]
-    with_extra["token_losses"] = [0.7, 0.8]
-    parsed = SampleRefOutput.from_payload(with_extra)
-    assert parsed.get_derived_output("teacher_logprobs") == (-0.3, -0.4)
-    assert parsed.get_derived_output("detached_kl_advantages") == (0.3, 0.4)
-    assert parsed.get_derived_output("per_token_kl") == (0.01, 0.02)
-    assert parsed.get_derived_output("token_losses") == (0.7, 0.8)
+        leak = _sample_output(datum)
+        leak[label_field] = [-0.3, -0.4]
+        with pytest.raises(ValueError, match="label-dependent per-token"):
+            SampleRefOutput.from_payload(leak)
 
     for unknown_field, unsafe_value in (
         ("loss", 0.7),
@@ -661,7 +705,7 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     ):
         unknown_output = _sample_output(datum)
         unknown_output[unknown_field] = unsafe_value
-        with pytest.raises(ValueError, match="unsupported managed output field"):
+        with pytest.raises(ValueError, match="unsupported protected managed output field"):
             SampleRefOutput.from_payload(unknown_output)
 
     non_string_field = _sample_output(datum)
@@ -673,22 +717,8 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     redacted_extra["output-tokens"] = [-8, -8]
     redacted_extra["prompt_tokens"] = 2
     parsed_redacted = SampleRefOutput.from_payload(redacted_extra)
-    assert parsed_redacted.redacted_token_outputs["output-tokens"] == (-8, -8)
+    assert parsed_redacted.redacted_token_outputs["output_tokens"] == (-8, -8)
     assert parsed_redacted.get_derived_output("prompt_tokens") == 2.0
-
-    for field_name, malformed in (
-        (
-            "logprobs",
-            {"data": [-0.1, -0.2], "dtype": "float32", "shape": [2], "extra": 1},
-        ),
-        ("logprobs", {"data": [-0.1, -0.2], "dtype": "float32", "shape": [3]}),
-        ("logprobs", {"data": [-0.1, -0.2], "dtype": "complex64", "shape": [2]}),
-        ("output_tokens", {"data": [-8, -8], "dtype": "float32", "shape": [2]}),
-    ):
-        malformed_output = _sample_output(datum)
-        malformed_output[field_name] = malformed
-        with pytest.raises(ValueError, match="managed tensor fields|exact|dtype"):
-            SampleRefOutput.from_payload(malformed_output)
 
     for identity_field in (
         "token_ids",
@@ -726,6 +756,71 @@ def test_managed_output_allows_optional_redacted_tokens_and_checks_all_lengths()
     with pytest.raises(ValueError, match="at most 255"):
         SampleRefOutput.from_payload(too_long_id)
 
+    missing_visibility = _sample_output(datum)
+    del missing_visibility["content_visibility"]
+    with pytest.raises(ValueError, match="content_visibility"):
+        SampleRefOutput.from_payload(missing_visibility)
+
+    non_finite_count = _sample_output(datum)
+    non_finite_count["token_count"] = float("inf")
+    with pytest.raises(ValueError, match="finite numeric"):
+        SampleRefOutput.from_payload(non_finite_count)
+
+
+def test_public_managed_output_requires_real_tokens_and_preserves_ordinary_outputs():
+    datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2, datum_id="managed-2")
+    payload = _sample_output(datum, content_visibility="public")
+    payload["teacher_logprobs"] = [-0.3, -0.4]
+    payload["per_token_kl"] = [0.01, 0.02]
+    payload["custom_result"] = {"nested": [1, 2]}
+    payload["decoded_text"] = "public content"
+    payload["raw_logits"] = [[0.1, 0.2], [0.3, 0.4]]
+    payload["output_tokens"] = [201, 202, 203]
+    payload["top_k_token_ids"] = [[201, 202], [203, 204]]
+
+    parsed = SampleRefOutput.from_payload(payload)
+
+    assert not parsed.is_redacted
+    assert parsed.target_tokens == (101, 102)
+    assert parsed.token_outputs["output_tokens"] == [201, 202, 203]
+    assert parsed.token_outputs["top_k_token_ids"] == [[201, 202], [203, 204]]
+    assert parsed.redacted_token_outputs == {}
+    assert parsed.logprobs == (-0.7, -0.7)
+    assert parsed.elementwise_loss == (0.7, 0.7)
+    assert parsed.get_derived_output("teacher_logprobs") == (-0.3, -0.4)
+    assert parsed.get_derived_output("per_token_kl") == (0.01, 0.02)
+    assert parsed.get_derived_output("custom_result") == {"nested": [1, 2]}
+    assert parsed.get_derived_output("decoded_text") == "public content"
+    assert parsed.get_derived_output("raw_logits") == [[0.1, 0.2], [0.3, 0.4]]
+
+    for field_name in ("target_tokens", "output_tokens", "teacher_labels"):
+        redacted = _sample_output(datum, content_visibility="public")
+        redacted[field_name] = [-8, -8]
+        with pytest.raises(ValueError, match="non-negative token IDs"):
+            SampleRefOutput.from_payload(redacted)
+
+    for field_name, malformed in (
+        (
+            "logprobs",
+            {"data": [-0.1, -0.2], "dtype": "float32", "shape": [2], "extra": 1},
+        ),
+        ("logprobs", {"data": [-0.1, -0.2], "dtype": "float32", "shape": [3]}),
+        ("logprobs", {"data": [-0.1, -0.2], "dtype": "complex64", "shape": [2]}),
+        (
+            "output_tokens",
+            {"data": [1, 2, 3], "dtype": "float32", "shape": [3]},
+        ),
+    ):
+        malformed_output = _sample_output(datum, content_visibility="public")
+        malformed_output[field_name] = malformed
+        with pytest.raises(ValueError, match="managed tensor fields|exact|dtype"):
+            SampleRefOutput.from_payload(malformed_output)
+
+    non_finite = _sample_output(datum, content_visibility="public")
+    non_finite["per_token_kl"] = [0.1, float("-inf")]
+    with pytest.raises(ValueError, match="finite numeric"):
+        SampleRefOutput.from_payload(non_finite)
+
 
 def test_mixed_output_alignment_and_safe_reattachment_preserve_datum_kinds():
     local = Datum.from_raw(
@@ -738,7 +833,7 @@ def test_mixed_output_alignment_and_safe_reattachment_preserve_datum_kinds():
         "result": {
             "loss_fn_outputs": [
                 {"datum_id": "local-1", "logprobs": {"data": [-0.1, -0.2]}},
-                _sample_output(managed),
+                _sample_output(managed, content_visibility="public"),
             ]
         }
     }
@@ -790,7 +885,7 @@ def test_mixed_output_alignment_uses_generated_local_occurrence_id():
         "result": {
             "loss_fn_outputs": [
                 {"datum_id": wire[0]["datum_id"], "logprobs": [0.0]},
-                _sample_output(managed, count=1),
+                _sample_output(managed, count=1, content_visibility="public"),
             ]
         }
     }
@@ -829,7 +924,7 @@ def test_token_only_identified_batch_rejects_duplicate_explicit_ids_before_submi
 
 def test_custom_surrogate_preserves_sample_ref_without_synthesizing_targets():
     datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2, datum_id="d-2")
-    result = {"result": {"loss_fn_outputs": [_sample_output(datum)]}}
+    result = {"result": {"loss_fn_outputs": [_sample_output(datum, content_visibility="public")]}}
 
     logprobs = parse_logprob_tensors(result, [datum])
     (logprobs[0] * 3.0).sum().backward()
@@ -928,9 +1023,249 @@ def test_sdk_does_not_close_protocol_over_loss_names_or_client_derived_fields():
     handle = MagicMock()
     handle.result.return_value = {}
     client._service.enqueue_operation = MagicMock(return_value=handle)
+    client._service._http.get.return_value = _dataset_payload(
+        name="d", version="v1", content_visibility="public"
+    )
 
     client.forward([datum], "future_server_loss")
 
     wire = client._service.enqueue_operation.call_args.args[1]
     inputs = wire["payload"]["forward_input"]["data"][0]["loss_fn_inputs"]
     assert inputs["future_scalar_signal"]["data"] == [1.0]
+
+
+def test_sync_training_client_only_preflights_public_only_sample_ref_operations():
+    client = _training_client()
+    handle = MagicMock()
+    handle.result.return_value = {}
+    client._service.enqueue_operation = MagicMock(return_value=handle)
+    protected = Datum.from_sample_ref(dataset="secret", version="v1", sample_idx=0)
+
+    # The protected-safe SFT shape stays on the hot path: no catalog round trip.
+    client.forward_backward([protected], "cross_entropy")
+    client._service._http.get.assert_not_called()
+
+    client._service._http.get.return_value = _dataset_payload(
+        name="secret", version="v1", content_visibility="protected"
+    )
+    with pytest.raises(ValueError, match="is protected"):
+        client.forward([protected], "forward_logprob")
+
+    protected_with_inputs = Datum.from_sample_ref(
+        dataset="secret",
+        version="v2",
+        sample_idx=0,
+        loss_fn_inputs={"coefficient": 0.5},
+    )
+    client._service._http.get.return_value = _dataset_payload(
+        name="secret", version="v2", content_visibility="protected"
+    )
+    with pytest.raises(ValueError, match="empty loss_fn_inputs"):
+        client.forward_backward([protected_with_inputs], "cross_entropy")
+
+    public = Datum.from_sample_ref(
+        dataset="open", version="v1", sample_idx=0, loss_fn_inputs={"signal": [1.0]}
+    )
+    client._service._http.get.return_value = _dataset_payload(
+        name="open", version="v1", content_visibility="public"
+    )
+    client.forward([public], "future_loss")
+    client.forward_backward([public], "surrogate")
+
+    # Public visibility is immutable, so the second public-only operation uses
+    # the UX cache. Server authorization is still performed for both submits.
+    public_gets = [
+        call
+        for call in client._service._http.get.call_args_list
+        if call.args and "/managed-datasets/open/" in call.args[0]
+    ]
+    assert len(public_gets) == 1
+
+
+def test_async_training_client_matches_sample_ref_visibility_preflight():
+    async def run():
+        client = _async_training_client()
+        handle = MagicMock()
+        handle.result = AsyncMock(return_value={})
+        client._service.enqueue_operation = AsyncMock(return_value=handle)
+        protected = Datum.from_sample_ref(dataset="secret", version="v1", sample_idx=0)
+
+        await client.forward_backward([protected], "cross_entropy")
+        client._service._http.get = AsyncMock(
+            return_value=_dataset_payload(
+                name="secret", version="v1", content_visibility="protected"
+            )
+        )
+        with pytest.raises(ValueError, match="is protected"):
+            await client.forward([protected], "forward_logprob")
+
+        public = Datum.from_sample_ref(dataset="open", version="v1", sample_idx=0)
+        client._service._http.get.return_value = _dataset_payload(
+            name="open", version="v1", content_visibility="public"
+        )
+        await client.forward([public], "forward_logprob")
+        await client.forward_backward([public], "surrogate")
+        return client
+
+    client = asyncio.run(run())
+    assert client._service._http.get.await_count == 2
+
+
+def test_custom_training_is_public_only_for_sample_refs():
+    client = _training_client()
+    datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, datum_id="d-0")
+    client._service._http.get.return_value = _dataset_payload(
+        name="d", version="v1", content_visibility="protected"
+    )
+    client._service.enqueue_operation = MagicMock()
+    with pytest.raises(ValueError, match="is protected"):
+        client.forward_backward_custom([datum], lambda _data, logprobs: (logprobs[0].sum(), {}))
+    client._service.enqueue_operation.assert_not_called()
+
+    client._managed_dataset_visibility_cache.clear()
+    client._service._http.get.return_value = _dataset_payload(
+        name="d", version="v1", content_visibility="public"
+    )
+    forward_handle = MagicMock()
+    forward_handle.result.return_value = {
+        "result": {"loss_fn_outputs": [_sample_output(datum, content_visibility="public")]}
+    }
+    backward_handle = MagicMock()
+    backward_handle.result.return_value = {}
+    client._service.enqueue_operation.side_effect = [forward_handle, backward_handle]
+
+    result = client.forward_backward_custom(
+        [datum], lambda _data, logprobs: (logprobs[0].sum(), {"ok": 1})
+    )
+
+    assert result["metrics"] == {"ok": 1}
+    assert client._service.enqueue_operation.call_count == 2
+    second_request = client._service.enqueue_operation.call_args_list[1].args[1]
+    assert second_request["payload"]["forward_backward_input"]["loss_fn"] == "surrogate"
+
+
+def test_async_custom_training_matches_public_only_sample_ref_policy():
+    async def run():
+        client = _async_training_client()
+        datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, datum_id="d-0")
+        client._service._http.get = AsyncMock(
+            return_value=_dataset_payload(name="d", version="v1", content_visibility="protected")
+        )
+        client._service.enqueue_operation = AsyncMock()
+        with pytest.raises(ValueError, match="is protected"):
+            await client.forward_backward_custom(
+                [datum], lambda _data, logprobs: (logprobs[0].sum(), {})
+            )
+        client._service.enqueue_operation.assert_not_awaited()
+
+        client._managed_dataset_visibility_cache.clear()
+        client._service._http.get.return_value = _dataset_payload(
+            name="d", version="v1", content_visibility="public"
+        )
+        forward_handle = MagicMock()
+        forward_handle.result = AsyncMock(
+            return_value={
+                "result": {"loss_fn_outputs": [_sample_output(datum, content_visibility="public")]}
+            }
+        )
+        backward_handle = MagicMock()
+        backward_handle.result = AsyncMock(return_value={})
+        client._service.enqueue_operation.side_effect = [forward_handle, backward_handle]
+        result = await client.forward_backward_custom(
+            [datum], lambda _data, logprobs: (logprobs[0].sum(), {"ok": 1})
+        )
+        return result, client._service.enqueue_operation
+
+    result, enqueue = asyncio.run(run())
+    assert result["metrics"] == {"ok": 1}
+    assert enqueue.await_count == 2
+
+
+def test_sync_public_dataset_download_is_atomic_and_protected_is_rejected(tmp_path):
+    service = ServiceClient()
+    service._http = MagicMock()
+    content = b'{"messages":[]}\n'
+    service._http.get.return_value = _dataset_payload(content_visibility="public")
+    service._http.download_managed_dataset.side_effect = lambda _path, handle: handle.write(content)
+    destination = tmp_path / "dataset.jsonl"
+
+    result = service.datasets.download(name="hq-math", version="2026-08", destination=destination)
+
+    assert result == destination
+    assert destination.read_bytes() == content
+    assert not list(tmp_path.glob("*.part"))
+    service._http.download_managed_dataset.assert_called_once_with(
+        "/api/v1/managed-datasets/hq-math/versions/2026-08/download",
+        service._http.download_managed_dataset.call_args.args[1],
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        service.datasets.download(name="hq-math", version="2026-08", destination=destination)
+    replacement = b'{"messages":[{"role":"user"}]}\n'
+    service._http.download_managed_dataset.side_effect = lambda _path, handle: handle.write(
+        replacement
+    )
+    service.datasets.download(
+        name="hq-math",
+        version="2026-08",
+        destination=destination,
+        overwrite=True,
+    )
+    assert destination.read_bytes() == replacement
+
+    service._http.get.return_value = _dataset_payload(content_visibility="protected")
+    with pytest.raises(ValueError, match="cannot be downloaded"):
+        service.datasets.download(
+            name="hq-math", version="2026-08", destination=tmp_path / "secret.jsonl"
+        )
+
+
+def test_failed_public_dataset_download_removes_partial_file(tmp_path):
+    service = ServiceClient()
+    service._http = MagicMock()
+    service._http.get.return_value = _dataset_payload(content_visibility="public")
+
+    def fail(_path, handle):
+        handle.write(b"partial")
+        raise ValueError("SHA-256 mismatch")
+
+    service._http.download_managed_dataset.side_effect = fail
+    destination = tmp_path / "dataset.jsonl"
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        service.datasets.download(name="hq-math", version="2026-08", destination=destination)
+    assert not destination.exists()
+    assert not list(tmp_path.glob("*.part"))
+
+
+def test_async_public_dataset_download_has_sync_parity(tmp_path):
+    async def run():
+        service = AsyncServiceClient()
+        service._http = MagicMock()
+        service._http.get = AsyncMock(return_value=_dataset_payload(content_visibility="public"))
+        content = b'{"messages":[]}\n'
+
+        async def download(_path, handle):
+            handle.write(content)
+
+        service._http.download_managed_dataset = AsyncMock(side_effect=download)
+        destination = tmp_path / "dataset.jsonl"
+        result = await service.datasets.download(
+            name="hq-math", version="2026-08", destination=destination
+        )
+        with pytest.raises(FileExistsError, match="already exists"):
+            await service.datasets.download(
+                name="hq-math", version="2026-08", destination=destination
+            )
+        await service.datasets.download(
+            name="hq-math",
+            version="2026-08",
+            destination=destination,
+            overwrite=True,
+        )
+        return result, destination, content, service._http.download_managed_dataset
+
+    result, destination, content, download = asyncio.run(run())
+    assert result == destination
+    assert destination.read_bytes() == content
+    assert not list(tmp_path.glob("*.part"))
+    assert download.await_count == 2

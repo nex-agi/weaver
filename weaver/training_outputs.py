@@ -105,9 +105,10 @@ def attach_loss_fn_outputs(
 ) -> list[Datum]:
     """Copy datums and attach selected aligned numeric outputs as loss inputs.
 
-    The redacted ``target_tokens`` field is deliberately unaddressable here;
-    safe arrays such as ``logprobs``, ``per_token_kl``, or ``token_losses``
-    may be copied.
+    Token identity fields are deliberately unaddressable here. Public managed
+    outputs may expose and reattach ordinary numeric arrays such as
+    ``logprobs``. Protected SFT outputs contain no label-dependent per-token
+    values, so selecting one fails closed as a missing field.
     """
 
     selected = dict(field_map or {"logprobs": "old_logprobs"})
