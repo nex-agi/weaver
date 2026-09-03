@@ -161,7 +161,11 @@ with ServiceClient() as service:
         base_model="Qwen/Qwen3-8B",
         training_max_sequence_length=4096,
     )
-    length = trainer.resolve_sample_ref_lengths([ref])[0].input_token_count
+    resolved = trainer.resolve_sample_ref_lengths([ref])[0]
+    length = resolved.input_token_count
+    # Opaque identity of the server-private model data profile. Persist it if
+    # exact resume must fail closed when that profile changes.
+    model_data_revision = resolved.model_data_revision
     print(length)
 
     datum = Datum.from_sample_ref(

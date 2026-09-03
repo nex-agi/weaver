@@ -18,7 +18,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nex-weaver"
-version = "1.17.0"
+version = "1.18.0"
 description = "Python SDK for the Weaver platform"
 readme = "README.md"
 authors = [
