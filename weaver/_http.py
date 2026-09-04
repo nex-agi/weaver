@@ -61,38 +61,7 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MiB
 # Per-read timeout, not whole-transfer: httpx applies ``read`` between socket
 # reads, so a long download stays alive as long as bytes keep flowing.
 DOWNLOAD_TIMEOUT = httpx.Timeout(timeout=60.0, connect=10.0)
-MANAGED_DATASET_CONTENT_TYPE = "application/x-ndjson"
-MANAGED_DATASET_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
-_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
-
 logger = logging.getLogger(__name__)
-
-
-def _managed_dataset_download_metadata(response: httpx.Response) -> tuple[int, str]:
-    """Validate the authenticated public-dataset stream contract."""
-
-    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-    if content_type != MANAGED_DATASET_CONTENT_TYPE:
-        raise ValueError(
-            f"managed dataset download must use {MANAGED_DATASET_CONTENT_TYPE}, "
-            f"got {content_type or 'no Content-Type'}"
-        )
-    content_encoding = response.headers.get("Content-Encoding", "identity").strip().lower()
-    if content_encoding != "identity":
-        raise ValueError("managed dataset download must not use content encoding")
-    if response.headers.get("X-Weaver-Content-Visibility") != "public":
-        raise ValueError("managed dataset download must be marked content_visibility=public")
-    raw_size = response.headers.get("Content-Length")
-    try:
-        size_bytes = int(raw_size) if raw_size is not None else -1
-    except ValueError as exc:
-        raise ValueError("managed dataset download has an invalid Content-Length") from exc
-    if size_bytes < 0:
-        raise ValueError("managed dataset download requires a non-negative Content-Length")
-    sha256 = response.headers.get("X-Weaver-Content-SHA256", "")
-    if not _SHA256_HEX_RE.fullmatch(sha256):
-        raise ValueError("managed dataset download requires a lowercase SHA-256 response header")
-    return size_bytes, sha256
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -612,50 +581,6 @@ class APIClient:
             finally:
                 if compressed is not None:
                     compressed.close()
-
-    def download_managed_dataset(self, path: str, destination: BinaryIO) -> tuple[int, str]:
-        """Stream one authenticated public JSONL dataset with exact integrity checks."""
-
-        digest = hashlib.sha256()
-        received = 0
-        with self._tracer.start_as_current_span("weaver.get", kind=trace.SpanKind.CLIENT) as span:
-            apply_request_span_attributes(span, "GET", path, None)
-            self._ensure_fresh_client()
-            headers = {
-                key: value
-                for key, value in (self._client.headers or {}).items()
-                if key.lower() not in {"accept", "accept-encoding"}
-            }
-            headers["Accept"] = MANAGED_DATASET_CONTENT_TYPE
-            headers["Accept-Encoding"] = "identity"
-            inject(headers)
-            try:
-                with self._client.stream("GET", path, headers=headers) as response:
-                    span.set_attribute("http.status_code", response.status_code)
-                    if not response.is_success:
-                        response.read()
-                        span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
-                        self._raise_error(response)
-                    expected_size, expected_sha256 = _managed_dataset_download_metadata(response)
-                    for chunk in response.iter_raw(chunk_size=MANAGED_DATASET_DOWNLOAD_CHUNK_BYTES):
-                        if received + len(chunk) > expected_size:
-                            raise ValueError("managed dataset download exceeds its Content-Length")
-                        destination.write(chunk)
-                        digest.update(chunk)
-                        received += len(chunk)
-                if received != expected_size:
-                    raise ValueError(
-                        f"managed dataset download has {received} bytes, expected "
-                        f"{expected_size}"
-                    )
-                if digest.hexdigest() != expected_sha256:
-                    raise ValueError("managed dataset download SHA-256 mismatch")
-                span.set_status(Status(StatusCode.OK))
-                return received, expected_sha256
-            except Exception as exc:
-                span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR, str(exc)))
-                raise
 
     def patch(self, path: str, *, json: Any) -> Any:
         return self._request("PATCH", path, json=json)

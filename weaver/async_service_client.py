@@ -271,7 +271,7 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
 
     @property
     def datasets(self) -> AsyncManagedDatasetsClient:
-        """Authorized managed-dataset catalog and public-data downloads."""
+        """Authorized managed-dataset catalog."""
 
         return AsyncManagedDatasetsClient(self)
 

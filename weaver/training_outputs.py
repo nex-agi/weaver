@@ -105,15 +105,16 @@ def attach_loss_fn_outputs(
 ) -> list[Datum]:
     """Copy datums and attach selected aligned numeric outputs as loss inputs.
 
-    Token identity fields are deliberately unaddressable here. Public managed
-    outputs may expose and reattach ordinary numeric arrays such as
-    ``logprobs``. Protected SFT outputs contain no label-dependent per-token
-    values, so selecting one fails closed as a missing field.
+    Token identity fields are deliberately unaddressable here. Phase-one
+    SampleRefs use a closed SFT input contract, so managed outputs cannot be
+    reattached as client loss inputs even when their content is public.
     """
 
     selected = dict(field_map or {"logprobs": "old_logprobs"})
     if not selected:
         return list(data)
+    if any(datum.is_sample_ref for datum in data):
+        raise ValueError("SampleRef outputs cannot be attached as loss inputs in phase one")
     protected_destinations = {"target_tokens", "loss_mask", "weights", "model_input"}
     if any(_is_token_identity_field(output_name) for output_name in selected) or (
         protected_destinations & set(selected.values())

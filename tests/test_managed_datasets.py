@@ -22,20 +22,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import torch
 
-from weaver import (
-    WEAVER_REDACTED_TOKEN_ID,
-    AsyncServiceClient,
-    ServiceClient,
-    align_training_outputs,
-    attach_loss_fn_outputs,
-)
+from weaver import WEAVER_REDACTED_TOKEN_ID, AsyncServiceClient, ServiceClient
+from weaver import _sampling_utils as _su
+from weaver import align_training_outputs, attach_loss_fn_outputs
 from weaver._payloads import (
     build_surrogate_data,
     parse_logprob_tensors,
     prepare_forward_backward_operation,
     prepare_forward_operation,
 )
+from weaver.async_sampling_client import AsyncSamplingClient
 from weaver.async_training_client import AsyncTrainingClient
+from weaver.sampling_client import SamplingClient
 from weaver.training_client import TrainingClient
 from weaver.types import Datum, ModelInput, SampleRef, SampleRefOutput
 from weaver.types.tensor import TensorData
@@ -173,16 +171,7 @@ def test_legacy_datum_wire_shape_is_unchanged_and_new_id_is_optional():
     assert identified.to_payload()["datum_id"] == "local-1"
 
 
-@pytest.mark.parametrize(
-    ("prepare", "input_key", "transport"),
-    [
-        (prepare_forward_operation, "forward_input", "default"),
-        (prepare_forward_operation, "forward_input", "http-binary"),
-        (prepare_forward_backward_operation, "forward_backward_input", "default"),
-        (prepare_forward_backward_operation, "forward_backward_input", "http-binary"),
-    ],
-)
-def test_natural_mixed_batch_assigns_stable_local_occurrence_ids(prepare, input_key, transport):
+def test_natural_mixed_sft_batch_assigns_stable_local_occurrence_ids():
     local = Datum.from_raw(
         model_input=ModelInput.from_ints([1, 2]),
         loss_fn_inputs={"target_tokens": [2, 3], "custom_signal": [0.25, 0.5]},
@@ -191,17 +180,17 @@ def test_natural_mixed_batch_assigns_stable_local_occurrence_ids(prepare, input_
     managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2)
 
     def wire_data():
-        prepared = prepare(
+        prepared = prepare_forward_backward_operation(
             model_id="model-1",
             seq_id=7,
             data=[local, managed],
             loss_fn="cross_entropy",
             loss_fn_config=None,
             request_metadata=None,
-            tensor_transport=transport,
+            tensor_transport="default",
         )
         try:
-            return prepared.body["payload"][input_key]["data"]
+            return prepared.body["payload"]["forward_backward_input"]["data"]
         finally:
             prepared.close()
 
@@ -212,10 +201,7 @@ def test_natural_mixed_batch_assigns_stable_local_occurrence_ids(prepare, input_
     assert first[0]["datum_id"].startswith("d-mixed-")
     assert first[0]["datum_id"] == second[0]["datum_id"]
     assert first[1]["datum_id"] == managed.datum_id
-    if transport == "default":
-        assert first[0]["loss_fn_inputs"]["target_tokens"]["data"] == [2, 3]
-    else:
-        assert "$tensor" in first[0]["loss_fn_inputs"]["target_tokens"]
+    assert first[0]["loss_fn_inputs"]["target_tokens"]["data"] == [2, 3]
     assert first[0]["loss_fn_inputs"]["custom_signal"]["data"] == [0.25, 0.5]
     assert first[0]["metadata"] == {"source": "local"}
 
@@ -250,6 +236,24 @@ def test_mixed_batch_preserves_explicit_ids_and_distinguishes_repeated_object_oc
     assert wire[2]["datum_id"] == managed.datum_id
     assert wire[0]["datum_id"] != wire[3]["datum_id"]
     assert len({datum["datum_id"] for datum in wire}) == len(wire)
+
+
+@pytest.mark.parametrize("transport", ["default", "http-binary"])
+def test_shared_payload_builders_enforce_sample_ref_sft_only(transport):
+    managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2)
+    common = {
+        "model_id": "model-1",
+        "seq_id": 7,
+        "data": [managed],
+        "loss_fn_config": None,
+        "request_metadata": None,
+        "tensor_transport": transport,
+    }
+
+    with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
+        prepare_forward_operation(loss_fn="cross_entropy", **common)
+    with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
+        prepare_forward_backward_operation(loss_fn="surrogate", **common)
 
 
 @pytest.mark.parametrize(
@@ -360,7 +364,7 @@ def test_sample_ref_rejects_server_owned_inputs(field):
         Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, loss_fn_inputs={field: [1]})
 
 
-def test_public_sample_ref_supports_sampling_mask_but_protected_preflight_rejects_it():
+def test_sample_ref_can_be_constructed_with_extensions_but_sft_rejects_them():
     mask = [[1, 2], [3]]
     datum = Datum.from_sample_ref(
         dataset="open",
@@ -371,22 +375,13 @@ def test_public_sample_ref_supports_sampling_mask_but_protected_preflight_reject
     assert datum.to_payload()["loss_fn_inputs"]["sampling_mask"] == mask
 
     client = _training_client()
-    client._service._http.get.return_value = _dataset_payload(
-        name="open", version="v1", content_visibility="protected"
-    )
-    with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
-        client.forward_backward([datum], "cross_entropy")
-
-    client._managed_dataset_visibility_cache.clear()
-    client._service._http.get.return_value = _dataset_payload(
-        name="open", version="v1", content_visibility="public"
-    )
     handle = MagicMock()
     handle.result.return_value = {}
     client._service.enqueue_operation = MagicMock(return_value=handle)
-    client.forward([datum], "forward_logprob")
-    wire = client._service.enqueue_operation.call_args.args[1]
-    assert wire["payload"]["forward_input"]["data"][0]["loss_fn_inputs"]["sampling_mask"] == mask
+    with pytest.raises(ValueError, match="requires empty loss_fn_inputs"):
+        client.forward_backward([datum], "cross_entropy")
+    client._service.enqueue_operation.assert_not_called()
+    client._service._http.get.assert_not_called()
 
 
 def test_sample_ref_serializes_inline_tensor_data_like_an_ordinary_datum():
@@ -436,7 +431,7 @@ def test_token_datum_numeric_scalar_normalization_is_unchanged():
     assert datum.loss_fn_inputs["coefficient"].ndim == 0
 
 
-def test_sample_ref_serializes_multidimensional_public_custom_input():
+def test_sample_ref_serializes_multidimensional_sft_input():
     datum = Datum.from_sample_ref(
         dataset="d",
         version="v1",
@@ -538,6 +533,55 @@ def test_async_catalog_has_the_same_contract():
     page, get = asyncio.run(run())
     assert page[0].version == "2026-08"
     get.assert_awaited_once_with("/api/v1/managed-datasets", params={"limit": 100, "offset": 0})
+
+
+def test_managed_dataset_catalog_does_not_expose_download():
+    assert not hasattr(ServiceClient().datasets, "download")
+    assert not hasattr(AsyncServiceClient().datasets, "download")
+
+
+def test_sampling_clients_reject_sample_refs_before_enqueue():
+    ref = SampleRef("open", "v1", 0)
+    sync_service = MagicMock()
+    sync_client = SamplingClient(service=sync_service, sampling_session_id="sampling-1")
+    with pytest.raises(TypeError, match="prompt must be ModelInput"):
+        sync_client.sample(prompt=ref)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="prompt must be ModelInput"):
+        sync_client.compute_logprobs(prompt=ref)  # type: ignore[arg-type]
+    sync_service.enqueue_operation.assert_not_called()
+
+    async def run():
+        async_service = MagicMock()
+        async_service.enqueue_operation = AsyncMock()
+        async_client = AsyncSamplingClient(service=async_service, sampling_session_id="sampling-1")
+        with pytest.raises(TypeError, match="prompt must be ModelInput"):
+            await async_client.sample(prompt=ref)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="prompt must be ModelInput"):
+            await async_client.compute_logprobs(prompt=ref)  # type: ignore[arg-type]
+        async_service.enqueue_operation.assert_not_awaited()
+
+    asyncio.run(run())
+
+
+def test_sampling_model_input_wire_shape_remains_unchanged():
+    prompt = ModelInput.from_ints([1, 2, 3])
+    assert _su.sampling_prompt_payload(prompt) == prompt.to_payload()
+
+
+def test_token_in_training_operations_remain_unrestricted():
+    client = _training_client()
+    handle = MagicMock()
+    handle.result.return_value = {}
+    client._service.enqueue_operation = MagicMock(return_value=handle)
+    datum = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]),
+        loss_fn_inputs={"target_tokens": [2]},
+    )
+
+    client.forward([datum], "future_server_loss")
+    client.forward_backward([datum], "surrogate")
+
+    assert client._service.enqueue_operation.call_count == 2
 
 
 def test_sync_model_bound_lengths_preserve_and_validate_order():
@@ -822,7 +866,7 @@ def test_public_managed_output_requires_real_tokens_and_preserves_ordinary_outpu
         SampleRefOutput.from_payload(non_finite)
 
 
-def test_mixed_output_alignment_and_safe_reattachment_preserve_datum_kinds():
+def test_mixed_output_alignment_preserves_datum_kinds_but_reattachment_is_forbidden():
     local = Datum.from_raw(
         model_input=ModelInput.from_ints([1, 2]),
         loss_fn_inputs={"target_tokens": [2, 3]},
@@ -839,28 +883,20 @@ def test_mixed_output_alignment_and_safe_reattachment_preserve_datum_kinds():
     }
 
     aligned = align_training_outputs([local, managed], result)
-    attached = attach_loss_fn_outputs([local, managed], result)
-
     assert isinstance(aligned[1], SampleRefOutput)
-    assert attached[0].model_input is local.model_input
-    assert attached[1].sample_ref == managed.sample_ref
-    assert attached[1].datum_id == managed.datum_id
-    assert "target_tokens" not in attached[1].loss_fn_inputs
-    assert attached[1].loss_fn_inputs["old_logprobs"].tolist() == pytest.approx([-0.7, -0.7])
+    with pytest.raises(ValueError, match="cannot be attached as loss inputs"):
+        attach_loss_fn_outputs([local, managed], result)
 
     result["result"]["loss_fn_outputs"][1]["per_token_kl"] = [0.01, 0.02]
     result["result"]["loss_fn_outputs"][1]["token_losses"] = [0.7, 0.8]
     result["result"]["loss_fn_outputs"][0]["per_token_kl"] = [0.03, 0.04]
     result["result"]["loss_fn_outputs"][0]["token_losses"] = [0.5, 0.6]
-    attached_derived = attach_loss_fn_outputs(
-        [local, managed],
-        result,
-        field_map={"per_token_kl": "old_kl", "token_losses": "old_token_losses"},
-    )
-    assert attached_derived[1].loss_fn_inputs["old_kl"].tolist() == pytest.approx([0.01, 0.02])
-    assert attached_derived[1].loss_fn_inputs["old_token_losses"].tolist() == pytest.approx(
-        [0.7, 0.8]
-    )
+    with pytest.raises(ValueError, match="cannot be attached as loss inputs"):
+        attach_loss_fn_outputs(
+            [local, managed],
+            result,
+            field_map={"per_token_kl": "old_kl", "token_losses": "old_token_losses"},
+        )
 
 
 def test_mixed_output_alignment_uses_generated_local_occurrence_id():
@@ -891,11 +927,9 @@ def test_mixed_output_alignment_uses_generated_local_occurrence_id():
     }
 
     aligned = align_training_outputs([local, managed], result)
-    attached = attach_loss_fn_outputs([local, managed], result)
-
     assert aligned[0]["datum_id"] == wire[0]["datum_id"]
-    assert attached[0].datum_id == wire[0]["datum_id"]
-    assert attached[0].loss_fn_inputs["old_logprobs"].tolist() == [0.0]
+    with pytest.raises(ValueError, match="cannot be attached as loss inputs"):
+        attach_loss_fn_outputs([local, managed], result)
 
 
 def test_token_only_identified_batch_rejects_duplicate_explicit_ids_before_submission():
@@ -922,55 +956,36 @@ def test_token_only_identified_batch_rejects_duplicate_explicit_ids_before_submi
         )
 
 
-def test_custom_surrogate_preserves_sample_ref_without_synthesizing_targets():
+def test_shared_custom_and_surrogate_helpers_reject_sample_refs():
     datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2, datum_id="d-2")
     result = {"result": {"loss_fn_outputs": [_sample_output(datum, content_visibility="public")]}}
 
-    logprobs = parse_logprob_tensors(result, [datum])
-    (logprobs[0] * 3.0).sum().backward()
-    surrogate = build_surrogate_data([datum], logprobs)
-
-    assert surrogate[0].sample_ref == datum.sample_ref
-    assert surrogate[0].datum_id == datum.datum_id
-    assert set(surrogate[0].loss_fn_inputs) == {"surrogate_weights"}
-    assert surrogate[0].loss_fn_inputs["surrogate_weights"].tolist() == [3.0, 3.0]
+    with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
+        parse_logprob_tensors(result, [datum])
+    logprobs = torch.tensor([-0.7, -0.7], requires_grad=True)
+    logprobs.sum().backward()
+    with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
+        build_surrogate_data([datum], [logprobs])
 
 
-def test_http_binary_keeps_sample_refs_inline_and_packs_only_local_datums():
+def test_http_binary_rejects_mixed_and_managed_only_sample_ref_batches():
     local = Datum.from_raw(
         model_input=ModelInput.from_ints([1, 2]),
         loss_fn_inputs={"target_tokens": [2, 3], "weights": [0.0, 1.0]},
         datum_id="local",
     )
     managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2, datum_id="managed")
-    prepared = prepare_forward_backward_operation(
-        model_id="model-1",
-        seq_id=1,
-        data=[managed, local],
-        loss_fn="cross_entropy",
-        loss_fn_config=None,
-        request_metadata=None,
-        tensor_transport="http-binary",
-    )
-    try:
-        assert prepared.tensor_pack is not None
-        wire = prepared.body["payload"]["forward_backward_input"]["data"]
-        assert wire[0] == managed.to_payload()
-        assert "$tensor" in wire[1]["model_input"]["chunks"][0]["tokens"]
-        assert wire[1]["datum_id"] == "local"
-    finally:
-        prepared.close()
-
-    managed_only = prepare_forward_backward_operation(
-        model_id="model-1",
-        seq_id=2,
-        data=[managed],
-        loss_fn="cross_entropy",
-        loss_fn_config=None,
-        request_metadata=None,
-        tensor_transport="http-binary",
-    )
-    assert managed_only.tensor_pack is None
+    for data in ([managed, local], [managed]):
+        with pytest.raises(ValueError, match="default JSON tensor transport"):
+            prepare_forward_backward_operation(
+                model_id="model-1",
+                seq_id=1,
+                data=data,
+                loss_fn="cross_entropy",
+                loss_fn_config=None,
+                request_metadata=None,
+                tensor_transport="http-binary",
+            )
 
 
 def test_create_model_pins_training_max_sequence_length_sync_and_async():
@@ -1012,7 +1027,7 @@ def test_create_model_pins_training_max_sequence_length_sync_and_async():
         service.create_model(base_model="Qwen/Qwen3-8B", training_max_sequence_length=1)
 
 
-def test_sdk_does_not_close_protocol_over_loss_names_or_client_derived_fields():
+def test_sample_ref_sft_rejects_non_server_owned_loss_inputs_too():
     client = _training_client()
     datum = Datum.from_sample_ref(
         dataset="d",
@@ -1023,320 +1038,102 @@ def test_sdk_does_not_close_protocol_over_loss_names_or_client_derived_fields():
     handle = MagicMock()
     handle.result.return_value = {}
     client._service.enqueue_operation = MagicMock(return_value=handle)
-    client._service._http.get.return_value = _dataset_payload(
-        name="d", version="v1", content_visibility="public"
-    )
-
-    client.forward([datum], "future_server_loss")
-
-    wire = client._service.enqueue_operation.call_args.args[1]
-    inputs = wire["payload"]["forward_input"]["data"][0]["loss_fn_inputs"]
-    assert inputs["future_scalar_signal"]["data"] == [1.0]
+    with pytest.raises(ValueError, match="requires empty loss_fn_inputs"):
+        client.forward_backward([datum], "cross_entropy")
+    client._service.enqueue_operation.assert_not_called()
 
 
-def test_sync_training_client_only_preflights_public_only_sample_ref_operations():
+def test_sync_training_client_enforces_sample_ref_sft_only_without_catalog_preflight():
     client = _training_client()
     handle = MagicMock()
     handle.result.return_value = {}
     client._service.enqueue_operation = MagicMock(return_value=handle)
-    protected = Datum.from_sample_ref(dataset="secret", version="v1", sample_idx=0)
-
-    # The protected-safe SFT shape stays on the hot path: no catalog round trip.
-    client.forward_backward([protected], "cross_entropy")
+    managed = Datum.from_sample_ref(dataset="secret", version="v1", sample_idx=0)
+    client.forward_backward([managed], "cross_entropy")
     client._service._http.get.assert_not_called()
 
-    client._service._http.get.return_value = _dataset_payload(
-        name="secret", version="v1", content_visibility="protected"
+    for operation in (
+        lambda: client.forward([managed], "cross_entropy"),
+        lambda: client.forward([managed], "forward_logprob"),
+        lambda: client.forward_backward([managed], "surrogate"),
+    ):
+        with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
+            operation()
+    with pytest.raises(ValueError, match="empty loss_fn_config"):
+        client.forward_backward([managed], "cross_entropy", loss_fn_config={"reduction": "mean"})
+    with_inputs = Datum.from_sample_ref(
+        dataset="secret", version="v1", sample_idx=0, loss_fn_inputs={"coefficient": 0.5}
     )
-    with pytest.raises(ValueError, match="is protected"):
-        client.forward([protected], "forward_logprob")
-
-    protected_with_inputs = Datum.from_sample_ref(
-        dataset="secret",
-        version="v2",
-        sample_idx=0,
-        loss_fn_inputs={"coefficient": 0.5},
+    with pytest.raises(ValueError, match="empty loss_fn_inputs"):
+        client.forward_backward([with_inputs], "cross_entropy")
+    with_metadata = Datum.from_sample_ref(
+        dataset="secret", version="v1", sample_idx=0, metadata={"source": "managed"}
     )
-    client._service._http.get.return_value = _dataset_payload(
-        name="secret", version="v2", content_visibility="protected"
-    )
-    with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
-        client.forward_backward([protected_with_inputs], "cross_entropy")
-
-    protected_with_metadata = Datum.from_sample_ref(
-        dataset="secret",
-        version="v3",
-        sample_idx=0,
-        metadata={"execution_control": "custom"},
-    )
-    client._service._http.get.return_value = _dataset_payload(
-        name="secret", version="v3", content_visibility="protected"
-    )
-    with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
-        client.forward_backward([protected_with_metadata], "cross_entropy")
-
-    protected_with_config = Datum.from_sample_ref(dataset="secret", version="v4", sample_idx=0)
-    client._service._http.get.return_value = _dataset_payload(
-        name="secret", version="v4", content_visibility="protected"
-    )
-    with pytest.raises(ValueError, match="default-transport cross_entropy"):
-        client.forward_backward(
-            [protected_with_config], "cross_entropy", loss_fn_config={"reduction": "mean"}
-        )
-
-    protected_binary = Datum.from_sample_ref(dataset="secret", version="v5", sample_idx=0)
+    with pytest.raises(ValueError, match="empty metadata"):
+        client.forward_backward([with_metadata], "cross_entropy")
     client._service._config.tensor_transport = "http-binary"
-    client._service._http.get.return_value = _dataset_payload(
-        name="secret", version="v5", content_visibility="protected"
-    )
-    with pytest.raises(ValueError, match="default-transport cross_entropy"):
-        client.forward_backward([protected_binary], "cross_entropy")
-    client._service._config.tensor_transport = "default"
-
-    public = Datum.from_sample_ref(
-        dataset="open",
-        version="v1",
-        sample_idx=0,
-        loss_fn_inputs={"signal": [1.0]},
-        metadata={"execution_control": "custom"},
-    )
-    client._service._http.get.return_value = _dataset_payload(
-        name="open", version="v1", content_visibility="public"
-    )
-    client.forward([public], "future_loss")
-    client.forward_backward([public], "surrogate")
-
-    # Public visibility is immutable, so the second public-only operation uses
-    # the UX cache. Server authorization is still performed for both submits.
-    public_gets = [
-        call
-        for call in client._service._http.get.call_args_list
-        if call.args and "/managed-datasets/open/" in call.args[0]
-    ]
-    assert len(public_gets) == 1
+    with pytest.raises(ValueError, match="default JSON tensor transport"):
+        client.forward_backward([managed], "cross_entropy")
+    assert client._service.enqueue_operation.call_count == 1
 
 
-def test_async_training_client_matches_sample_ref_visibility_preflight():
+def test_async_training_client_matches_sample_ref_sft_only_policy():
     async def run():
         client = _async_training_client()
         handle = MagicMock()
         handle.result = AsyncMock(return_value={})
         client._service.enqueue_operation = AsyncMock(return_value=handle)
-        protected = Datum.from_sample_ref(dataset="secret", version="v1", sample_idx=0)
-
-        await client.forward_backward([protected], "cross_entropy")
-        client._service._http.get = AsyncMock(
-            return_value=_dataset_payload(
-                name="secret", version="v1", content_visibility="protected"
-            )
-        )
-        with pytest.raises(ValueError, match="is protected"):
-            await client.forward([protected], "forward_logprob")
-
-        protected_with_metadata = Datum.from_sample_ref(
-            dataset="secret",
-            version="v2",
-            sample_idx=0,
-            metadata={"execution_control": "custom"},
-        )
-        client._service._http.get.return_value = _dataset_payload(
-            name="secret", version="v2", content_visibility="protected"
-        )
-        with pytest.raises(ValueError, match="empty loss_fn_config, loss_fn_inputs, and metadata"):
-            await client.forward_backward([protected_with_metadata], "cross_entropy")
-
-        protected_with_config = Datum.from_sample_ref(dataset="secret", version="v3", sample_idx=0)
-        client._service._http.get.return_value = _dataset_payload(
-            name="secret", version="v3", content_visibility="protected"
-        )
-        with pytest.raises(ValueError, match="default-transport cross_entropy"):
+        managed = Datum.from_sample_ref(dataset="open", version="v1", sample_idx=0)
+        await client.forward_backward([managed], "cross_entropy")
+        for operation in (
+            lambda: client.forward([managed], "cross_entropy"),
+            lambda: client.forward([managed], "forward_logprob"),
+            lambda: client.forward_backward([managed], "surrogate"),
+        ):
+            with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
+                await operation()
+        with pytest.raises(ValueError, match="empty loss_fn_config"):
             await client.forward_backward(
-                [protected_with_config],
-                "cross_entropy",
-                loss_fn_config={"reduction": "mean"},
+                [managed], "cross_entropy", loss_fn_config={"reduction": "mean"}
             )
-
-        protected_binary = Datum.from_sample_ref(dataset="secret", version="v4", sample_idx=0)
+        with_inputs = Datum.from_sample_ref(
+            dataset="open", version="v1", sample_idx=0, loss_fn_inputs={"coefficient": 0.5}
+        )
+        with pytest.raises(ValueError, match="empty loss_fn_inputs"):
+            await client.forward_backward([with_inputs], "cross_entropy")
+        with_metadata = Datum.from_sample_ref(
+            dataset="open", version="v1", sample_idx=0, metadata={"source": "managed"}
+        )
+        with pytest.raises(ValueError, match="empty metadata"):
+            await client.forward_backward([with_metadata], "cross_entropy")
         client._service._config.tensor_transport = "http-binary"
-        client._service._http.get.return_value = _dataset_payload(
-            name="secret", version="v4", content_visibility="protected"
-        )
-        with pytest.raises(ValueError, match="default-transport cross_entropy"):
-            await client.forward_backward([protected_binary], "cross_entropy")
-        client._service._config.tensor_transport = "default"
-
-        public = Datum.from_sample_ref(
-            dataset="open",
-            version="v1",
-            sample_idx=0,
-            metadata={"execution_control": "custom"},
-        )
-        client._service._http.get.return_value = _dataset_payload(
-            name="open", version="v1", content_visibility="public"
-        )
-        await client.forward([public], "forward_logprob")
-        await client.forward_backward([public], "surrogate")
+        with pytest.raises(ValueError, match="default JSON tensor transport"):
+            await client.forward_backward([managed], "cross_entropy")
         return client
 
     client = asyncio.run(run())
-    assert client._service._http.get.await_count == 5
+    assert client._service.enqueue_operation.await_count == 1
+    client._service._http.get.assert_not_called()
 
 
-def test_custom_training_is_public_only_for_sample_refs():
+def test_sync_custom_training_rejects_all_sample_refs():
     client = _training_client()
     datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, datum_id="d-0")
-    client._service._http.get.return_value = _dataset_payload(
-        name="d", version="v1", content_visibility="protected"
-    )
     client._service.enqueue_operation = MagicMock()
-    with pytest.raises(ValueError, match="is protected"):
+    with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
         client.forward_backward_custom([datum], lambda _data, logprobs: (logprobs[0].sum(), {}))
     client._service.enqueue_operation.assert_not_called()
 
-    client._managed_dataset_visibility_cache.clear()
-    client._service._http.get.return_value = _dataset_payload(
-        name="d", version="v1", content_visibility="public"
-    )
-    forward_handle = MagicMock()
-    forward_handle.result.return_value = {
-        "result": {"loss_fn_outputs": [_sample_output(datum, content_visibility="public")]}
-    }
-    backward_handle = MagicMock()
-    backward_handle.result.return_value = {}
-    client._service.enqueue_operation.side_effect = [forward_handle, backward_handle]
 
-    result = client.forward_backward_custom(
-        [datum], lambda _data, logprobs: (logprobs[0].sum(), {"ok": 1})
-    )
-
-    assert result["metrics"] == {"ok": 1}
-    assert client._service.enqueue_operation.call_count == 2
-    second_request = client._service.enqueue_operation.call_args_list[1].args[1]
-    assert second_request["payload"]["forward_backward_input"]["loss_fn"] == "surrogate"
-
-
-def test_async_custom_training_matches_public_only_sample_ref_policy():
+def test_async_custom_training_rejects_all_sample_refs():
     async def run():
         client = _async_training_client()
         datum = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, datum_id="d-0")
-        client._service._http.get = AsyncMock(
-            return_value=_dataset_payload(name="d", version="v1", content_visibility="protected")
-        )
         client._service.enqueue_operation = AsyncMock()
-        with pytest.raises(ValueError, match="is protected"):
+        with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
             await client.forward_backward_custom(
                 [datum], lambda _data, logprobs: (logprobs[0].sum(), {})
             )
         client._service.enqueue_operation.assert_not_awaited()
 
-        client._managed_dataset_visibility_cache.clear()
-        client._service._http.get.return_value = _dataset_payload(
-            name="d", version="v1", content_visibility="public"
-        )
-        forward_handle = MagicMock()
-        forward_handle.result = AsyncMock(
-            return_value={
-                "result": {"loss_fn_outputs": [_sample_output(datum, content_visibility="public")]}
-            }
-        )
-        backward_handle = MagicMock()
-        backward_handle.result = AsyncMock(return_value={})
-        client._service.enqueue_operation.side_effect = [forward_handle, backward_handle]
-        result = await client.forward_backward_custom(
-            [datum], lambda _data, logprobs: (logprobs[0].sum(), {"ok": 1})
-        )
-        return result, client._service.enqueue_operation
-
-    result, enqueue = asyncio.run(run())
-    assert result["metrics"] == {"ok": 1}
-    assert enqueue.await_count == 2
-
-
-def test_sync_public_dataset_download_is_atomic_and_protected_is_rejected(tmp_path):
-    service = ServiceClient()
-    service._http = MagicMock()
-    content = b'{"messages":[]}\n'
-    service._http.get.return_value = _dataset_payload(content_visibility="public")
-    service._http.download_managed_dataset.side_effect = lambda _path, handle: handle.write(content)
-    destination = tmp_path / "dataset.jsonl"
-
-    result = service.datasets.download(name="hq-math", version="2026-08", destination=destination)
-
-    assert result == destination
-    assert destination.read_bytes() == content
-    assert not list(tmp_path.glob("*.part"))
-    service._http.download_managed_dataset.assert_called_once_with(
-        "/api/v1/managed-datasets/hq-math/versions/2026-08/download",
-        service._http.download_managed_dataset.call_args.args[1],
-    )
-
-    with pytest.raises(FileExistsError, match="already exists"):
-        service.datasets.download(name="hq-math", version="2026-08", destination=destination)
-    replacement = b'{"messages":[{"role":"user"}]}\n'
-    service._http.download_managed_dataset.side_effect = lambda _path, handle: handle.write(
-        replacement
-    )
-    service.datasets.download(
-        name="hq-math",
-        version="2026-08",
-        destination=destination,
-        overwrite=True,
-    )
-    assert destination.read_bytes() == replacement
-
-    service._http.get.return_value = _dataset_payload(content_visibility="protected")
-    with pytest.raises(ValueError, match="cannot be downloaded"):
-        service.datasets.download(
-            name="hq-math", version="2026-08", destination=tmp_path / "secret.jsonl"
-        )
-
-
-def test_failed_public_dataset_download_removes_partial_file(tmp_path):
-    service = ServiceClient()
-    service._http = MagicMock()
-    service._http.get.return_value = _dataset_payload(content_visibility="public")
-
-    def fail(_path, handle):
-        handle.write(b"partial")
-        raise ValueError("SHA-256 mismatch")
-
-    service._http.download_managed_dataset.side_effect = fail
-    destination = tmp_path / "dataset.jsonl"
-    with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        service.datasets.download(name="hq-math", version="2026-08", destination=destination)
-    assert not destination.exists()
-    assert not list(tmp_path.glob("*.part"))
-
-
-def test_async_public_dataset_download_has_sync_parity(tmp_path):
-    async def run():
-        service = AsyncServiceClient()
-        service._http = MagicMock()
-        service._http.get = AsyncMock(return_value=_dataset_payload(content_visibility="public"))
-        content = b'{"messages":[]}\n'
-
-        async def download(_path, handle):
-            handle.write(content)
-
-        service._http.download_managed_dataset = AsyncMock(side_effect=download)
-        destination = tmp_path / "dataset.jsonl"
-        result = await service.datasets.download(
-            name="hq-math", version="2026-08", destination=destination
-        )
-        with pytest.raises(FileExistsError, match="already exists"):
-            await service.datasets.download(
-                name="hq-math", version="2026-08", destination=destination
-            )
-        await service.datasets.download(
-            name="hq-math",
-            version="2026-08",
-            destination=destination,
-            overwrite=True,
-        )
-        return result, destination, content, service._http.download_managed_dataset
-
-    result, destination, content, download = asyncio.run(run())
-    assert result == destination
-    assert destination.read_bytes() == content
-    assert not list(tmp_path.glob("*.part"))
-    assert download.await_count == 2
+    asyncio.run(run())

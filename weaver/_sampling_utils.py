@@ -22,30 +22,31 @@ owning one. The callable is invoked lazily, only when decoding is required.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from ._utils import lookup_case_insensitive
-from .types import LogprobsParams, ModelInput, SampleRef, SamplingParams
-from .types.sampling_control import PauseMode, coerce_pause_mode
+from .types import LogprobsParams, ModelInput, SamplingParams
+from .types.sampling_control import coerce_pause_mode
+
+if TYPE_CHECKING:
+    from .types import PauseMode
 
 TokenizerProvider = Callable[[], PreTrainedTokenizer]
 
 
-def sampling_prompt_payload(prompt: ModelInput | SampleRef) -> Dict[str, Any]:
-    """Serialize a token prompt or an opaque public managed-sample reference."""
+def sampling_prompt_payload(prompt: ModelInput) -> Dict[str, Any]:
+    """Serialize a token prompt."""
 
     if isinstance(prompt, ModelInput):
         return prompt.to_payload()
-    if isinstance(prompt, SampleRef):
-        return {"kind": "sample_ref", **prompt.to_payload()}
-    raise TypeError("prompt must be ModelInput or SampleRef")
+    raise TypeError("prompt must be ModelInput")
 
 
 def build_sample_body(
     *,
-    prompt: ModelInput | SampleRef,
+    prompt: ModelInput,
     sampling_params: SamplingParams | None,
     num_samples: int,
     include_prompt_logprobs: bool,
@@ -72,7 +73,7 @@ def build_sample_body(
 
 
 def build_logprobs_body(
-    prompt: ModelInput | SampleRef, logprobs_params: LogprobsParams | None
+    prompt: ModelInput, logprobs_params: LogprobsParams | None
 ) -> Dict[str, Any]:
     params = logprobs_params or LogprobsParams()
     return {"prompt": sampling_prompt_payload(prompt), **params.to_payload()}
@@ -290,13 +291,11 @@ def normalize_sample_result(payload: Any, get_tokenizer: TokenizerProvider) -> A
     return normalized
 
 
-def normalize_prompt_logprobs(prompt: ModelInput | SampleRef, payload: Any) -> List[float | None]:
-    expected = 0
-    if isinstance(prompt, ModelInput):
-        tokens = prompt_tokens(prompt)
-        if not tokens:
-            return []
-        expected = len(tokens)
+def normalize_prompt_logprobs(prompt: ModelInput, payload: Any) -> List[float | None]:
+    tokens = prompt_tokens(prompt)
+    if not tokens:
+        return []
+    expected = len(tokens)
     result = result_payload(payload)
     prompt_values = coerce_prompt_logprob_list(result.get("prompt_logprobs"), expected)
     if prompt_values is None:

@@ -43,6 +43,7 @@ from ._payloads import (
     parse_logprob_tensors,
     prepare_forward_backward_operation,
     prepare_forward_operation,
+    validate_sample_ref_operation,
 )
 from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
@@ -114,10 +115,6 @@ class AsyncTrainingClient:
         self.tokenizer_path = tokenizer_path
         self.debug_info = debug_info
         self._tokenizer: Any = None
-        # Dataset-version visibility is immutable. This cache only avoids
-        # repeated catalog round trips for SDK-side public-operation checks;
-        # the server remains authoritative on every request.
-        self._managed_dataset_visibility_cache: Dict[tuple[str, str], str] = {}
 
     @property
     def training_run_id(self) -> str:
@@ -167,45 +164,6 @@ class AsyncTrainingClient:
 
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
-
-    async def _ensure_sample_refs_are_public(self, data: Sequence[Datum]) -> None:
-        """Fail early when a public-only operation contains a protected ref."""
-
-        sources = {
-            (datum.sample_ref.dataset, datum.sample_ref.version)
-            for datum in data
-            if datum.sample_ref is not None
-        }
-        for source in sorted(sources):
-            visibility = self._managed_dataset_visibility_cache.get(source)
-            if visibility is None:
-                info = await self._service.datasets.get(name=source[0], version=source[1])
-                visibility = info.content_visibility
-                self._managed_dataset_visibility_cache[source] = visibility
-            if visibility != "public":
-                raise ValueError(
-                    f"managed dataset {source[0]!r} version {source[1]!r} is protected; "
-                    "protected SampleRef data only supports default-transport cross_entropy "
-                    "forward_backward with empty loss_fn_config, loss_fn_inputs, and metadata"
-                )
-
-    async def _validate_forward_backward_sample_refs(
-        self,
-        data: Sequence[Datum],
-        loss_fn: str,
-        loss_fn_config: Mapping[str, Any] | None,
-    ) -> None:
-        managed = [datum for datum in data if datum.is_sample_ref]
-        if not managed:
-            return
-        protected_safe = (
-            loss_fn == "cross_entropy"
-            and not loss_fn_config
-            and self._service.tensor_transport == "default"
-            and all(not datum.loss_fn_inputs and not datum.metadata for datum in managed)
-        )
-        if not protected_safe:
-            await self._ensure_sample_refs_are_public(managed)
 
     async def resolve_sample_ref_lengths(self, refs: Sequence[SampleRef]) -> List[SampleRefLength]:
         """Resolve safe, model-bound input lengths for whole-sample batching."""
@@ -296,8 +254,13 @@ class AsyncTrainingClient:
             wait: If True (default), awaits completion and returns the result dict;
                 if False, returns an ``AsyncOperationHandle`` immediately.
         """
-        if any(datum.is_sample_ref for datum in data):
-            await self._ensure_sample_refs_are_public(data)
+        validate_sample_ref_operation(
+            data,
+            operation="forward",
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            tensor_transport=self._service.tensor_transport,
+        )
         payload = await _build_training_payload(
             prepare_forward_operation,
             model_id=self.model_id,
@@ -363,7 +326,13 @@ class AsyncTrainingClient:
             wait: If True (default), awaits completion and returns the result dict;
                 if False, returns an ``AsyncOperationHandle`` immediately.
         """
-        await self._validate_forward_backward_sample_refs(data, loss_fn, loss_fn_config)
+        validate_sample_ref_operation(
+            data,
+            operation="forward_backward",
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            tensor_transport=self._service.tensor_transport,
+        )
         payload = await _build_training_payload(
             prepare_forward_backward_operation,
             model_id=self.model_id,

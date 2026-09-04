@@ -320,7 +320,7 @@ def _managed_numeric_scalar(value: Any) -> int | float | None:
 
 
 def _sample_ref_loss_input_payload(value: Any, field_name: str) -> object:
-    """Serialize a public-capable SampleRef loss input inline."""
+    """Serialize a SampleRef SFT loss input inline."""
 
     scalar = _managed_numeric_scalar(value)
     if scalar is not None:

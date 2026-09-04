@@ -143,10 +143,10 @@ weaver list supported-models --format json
 ### Managed datasets
 
 Managed datasets expose authorized catalog metadata and stable sample references. Every
-immutable dataset version declares `content_visibility`: `protected` data keeps source
-messages and token identities private, while `public` data can return its real content and
-be downloaded. Select an explicit dataset `name` and `version`, then ask the model-bound
-training client for effective lengths before packing whole samples:
+immutable dataset version declares `content_visibility`: protected responses hide token
+identities, while public responses may preserve them. The first release is deliberately
+SFT-only for both visibility modes. Select an explicit dataset `name` and `version`, then
+ask the model-bound training client for effective lengths before packing whole samples:
 
 ```python
 from weaver import ServiceClient
@@ -181,37 +181,25 @@ with ServiceClient() as service:
         datum_id="batch-7-item-3",
     )
     result = trainer.forward_backward([datum], "cross_entropy")
-
-    public = service.datasets.get(name="open-math", version="2026-08")
-    if public.content_visibility == "public":
-        service.datasets.download(
-            name=public.name,
-            version=public.version,
-            destination="open-math.jsonl",
-        )
 ```
 
 The model fixes the tokenizer, chat template, and complete pre-shift token limit; clients
 cannot override them per reference. `input_token_count` is the resulting autoregressive
 training length after shifting (and is smaller than the pinned full-token limit), which
 is sufficient for client-side whole-sample packing.
-Protected references support only default-transport built-in `cross_entropy`
-`forward_backward`, with empty `loss_fn_config`, `loss_fn_inputs`, and per-datum `metadata`.
-Forward logprobs, per-token losses, custom/surrogate loss, and sampling would expose
-label-dependent signals and are rejected by the server. A protected response carries a
-server-resolved `content_visibility="protected"`; any token-shaped identity field contains
-only the response-only `-8` sentinel at the true length. Never feed `-8` back into
-`ModelInput` or `target_tokens`.
+Every `SampleRef`, regardless of `content_visibility`, supports only the built-in
+`cross_entropy` `forward_backward` operation. Managed references cannot be used with
+`forward`, custom/surrogate losses, `sample`, or `compute_logprobs`, and the first release
+does not expose dataset download. These limits do not affect ordinary token-in datums.
+Managed datums require empty `loss_fn_config`, client `loss_fn_inputs`, and per-datum
+`metadata`, and use the default JSON tensor transport. The server owns the model input,
+targets, loss mask, and weights.
 
-Public references use the same `SampleRef` request shape, but their server-resolved
-`content_visibility="public"` response can contain real non-negative token IDs and the
-ordinary loss-specific output fields. Forward and custom/surrogate training requests are
-therefore available for public data. A public `SampleRef` can also be passed directly as
-the `prompt` to `SamplingClient.sample` or `compute_logprobs`; the server materializes the
-complete model-bound input and returns the same public result shape as an ordinary token
-prompt. `datasets.download` always streams authenticated canonical JSONL to a same-directory
-`.part`, verifies exact size and SHA-256, then publishes atomically; it refuses to overwrite
-an existing path unless `overwrite=True`.
+A protected response carries a server-resolved `content_visibility="protected"`; any
+token-identity array contains only the response-only `-8` sentinel at the true length, and
+label-dependent per-token outputs such as logprobs and elementwise loss are rejected.
+Never feed `-8` back into `ModelInput` or `target_tokens`. A public response may contain
+real non-negative token identities, but has the same SFT-only request boundary.
 
 ## Usage
 

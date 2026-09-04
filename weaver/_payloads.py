@@ -22,7 +22,6 @@ from .config import TensorCompression, TensorTransport
 from .tensor_transport import PreparedOperationBody, serialize_training_data
 from .training_outputs import align_training_outputs
 from .types import Datum
-from .types.managed_dataset import SampleRefOutput
 
 if TYPE_CHECKING:
     import torch
@@ -65,6 +64,39 @@ def serialize_data(data: Sequence[Datum]) -> List[Dict[str, Any]]:
     return [datum.to_payload() for datum in normalize_mixed_datum_ids(data)]
 
 
+def validate_sample_ref_operation(
+    data: Sequence[Datum],
+    *,
+    operation: str,
+    loss_fn: str,
+    loss_fn_config: Mapping[str, Any] | None = None,
+    tensor_transport: TensorTransport = "default",
+) -> None:
+    """Enforce the phase-one SFT-only boundary for managed samples."""
+
+    managed = [(index, datum) for index, datum in enumerate(data) if datum.is_sample_ref]
+    if not managed:
+        return
+    if operation != "forward_backward" or loss_fn != "cross_entropy":
+        raise ValueError("SampleRef data only supports built-in cross_entropy forward_backward")
+    if loss_fn_config:
+        raise ValueError("SampleRef cross_entropy forward_backward requires empty loss_fn_config")
+    if tensor_transport != "default":
+        raise ValueError(
+            "SampleRef cross_entropy forward_backward requires default JSON tensor transport"
+        )
+    for index, datum in managed:
+        if datum.loss_fn_inputs:
+            raise ValueError(
+                f"datum {index}: SampleRef cross_entropy forward_backward requires empty "
+                "loss_fn_inputs"
+            )
+        if datum.metadata:
+            raise ValueError(
+                f"datum {index}: SampleRef cross_entropy forward_backward requires empty metadata"
+            )
+
+
 def _prepare_training_operation(
     *,
     input_key: str,
@@ -77,6 +109,14 @@ def _prepare_training_operation(
     tensor_transport: TensorTransport,
     tensor_compression: TensorCompression,
 ) -> PreparedOperationBody:
+    operation = "forward_backward" if input_key == "forward_backward_input" else "forward"
+    validate_sample_ref_operation(
+        data,
+        operation=operation,
+        loss_fn=loss_fn,
+        loss_fn_config=loss_fn_config,
+        tensor_transport=tensor_transport,
+    )
     serialized = serialize_training_data(
         data,
         loss_fn=loss_fn,
@@ -164,6 +204,12 @@ def forward_payload(
 ) -> Dict[str, Any]:
     from .types.datum import validate_sample_ref_loss_inputs
 
+    validate_sample_ref_operation(
+        data,
+        operation="forward",
+        loss_fn=loss_fn,
+        loss_fn_config=loss_fn_config,
+    )
     validate_sample_ref_loss_inputs(data, loss_fn)
     payload: Dict[str, Any] = {
         "model_id": model_id,
@@ -188,6 +234,12 @@ def forward_backward_payload(
 ) -> Dict[str, Any]:
     from .types.datum import validate_sample_ref_loss_inputs
 
+    validate_sample_ref_operation(
+        data,
+        operation="forward_backward",
+        loss_fn=loss_fn,
+        loss_fn_config=loss_fn_config,
+    )
     validate_sample_ref_loss_inputs(data, loss_fn)
     payload: Dict[str, Any] = {
         "model_id": model_id,
@@ -210,6 +262,7 @@ def parse_logprob_tensors(
     """Extract per-datum logprob tensors (``requires_grad=True``) from a forward result."""
     import torch
 
+    validate_sample_ref_operation(data, operation="forward", loss_fn="forward_logprob")
     parsed_result: Mapping[str, Any] = fwd_result
     if tensor_pack is not None:
         from .tensor_transport import materialize_http_tensor_payloads
@@ -221,12 +274,11 @@ def parse_logprob_tensors(
 
     logprob_tensors: List[torch.Tensor] = []
     for output in outputs:
-        if isinstance(output, SampleRefOutput):
-            lp: Any = output.logprobs
-        else:
-            lp = output.get("logprobs")
-            if lp is None:
-                lp = output.get("Logprobs")
+        if not isinstance(output, Mapping):
+            raise ValueError("SampleRef outputs cannot be used for custom training")
+        lp = output.get("logprobs")
+        if lp is None:
+            lp = output.get("Logprobs")
         if isinstance(lp, dict) and "$tensor" in lp:
             if tensor_pack is None:
                 raise ValueError("HTTP tensor logprobs require the operation tensor pack")
@@ -246,6 +298,7 @@ def build_surrogate_data(
     data: Sequence[Datum], logprob_tensors: Sequence["torch.Tensor"]
 ) -> List[Datum]:
     """Build surrogate :class:`~weaver.types.Datum` objects carrying gradient weights."""
+    validate_sample_ref_operation(data, operation="forward_backward", loss_fn="surrogate")
     surrogate_data: List[Datum] = []
     for i, (datum, logprob_tensor) in enumerate(zip(data, logprob_tensors)):
         if logprob_tensor.grad is None:
@@ -254,17 +307,6 @@ def build_surrogate_data(
             raise ValueError(
                 f"logprob_tensors[{i}] gradient shape must match its target-position shape"
             )
-
-        if datum.is_sample_ref:
-            surrogate_data.append(
-                Datum(
-                    sample_ref=datum.sample_ref,
-                    datum_id=datum.datum_id,
-                    loss_fn_inputs={"surrogate_weights": logprob_tensor.grad.detach().tolist()},
-                    metadata=dict(datum.metadata),
-                )
-            )
-            continue
 
         raw_targets = datum.loss_fn_inputs.get("target_tokens")
         if raw_targets is None:

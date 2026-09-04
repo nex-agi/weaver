@@ -19,13 +19,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List
 
-from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
-from .types import LogprobsParams, ModelInput, PauseMode, SampleRef, SamplingParams
+from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
 
 
 class SamplingClient:
@@ -49,31 +49,11 @@ class SamplingClient:
         # Cached result of the generation-control eligibility check; a model's
         # training mode is fixed at creation, so one confirmation is enough.
         self._is_full_ft = False
-        # Managed dataset visibility is immutable for a (name, version), so it
-        # is safe to cache for client-side UX. The server remains authoritative.
-        self._managed_dataset_visibility_cache: Dict[tuple[str, str], str] = {}
-
-    def _ensure_sample_ref_is_public(self, prompt: ModelInput | SampleRef) -> None:
-        """Fail before enqueue when sampling is attempted with protected data."""
-
-        if not isinstance(prompt, SampleRef):
-            return
-        source = (prompt.dataset, prompt.version)
-        visibility = self._managed_dataset_visibility_cache.get(source)
-        if visibility is None:
-            info = self._service.datasets.get(name=source[0], version=source[1])
-            visibility = info.content_visibility
-            self._managed_dataset_visibility_cache[source] = visibility
-        if visibility != "public":
-            raise ValueError(
-                f"managed dataset {source[0]!r} version {source[1]!r} is protected; "
-                "sampling and compute_logprobs only support public SampleRef data"
-            )
 
     def sample(
         self,
         *,
-        prompt: ModelInput | SampleRef,
+        prompt: ModelInput,
         sampling_params: SamplingParams | None = None,
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
@@ -83,7 +63,6 @@ class SamplingClient:
         return_moe_topk_indices: bool = False,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
-        self._ensure_sample_ref_is_public(prompt)
         body = _su.build_sample_body(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -106,7 +85,7 @@ class SamplingClient:
     def compute_logprobs(
         self,
         *,
-        prompt: ModelInput | SampleRef,
+        prompt: ModelInput,
         logprobs_params: LogprobsParams | None = None,
     ) -> List[float | None] | Dict[str, Any]:
         """Compute log-probabilities for the given prompt.
@@ -119,9 +98,7 @@ class SamplingClient:
         leading placeholder.
 
         Args:
-            prompt: The model input, or a public managed-sample reference, to
-                compute logprobs for. A reference resolves to the complete
-                server-rendered model input.
+            prompt: The tokenized model input to compute logprobs for.
             logprobs_params: Optional parameters (e.g. return_rollout_token_expert for MoE router replay).
                 When None, uses defaults.
 
@@ -130,7 +107,6 @@ class SamplingClient:
             When logprobs_params.return_rollout_token_expert=True: Dict with "logprobs" and
                 "return_rollout_token_expert_data" (None if not MoE or not available).
         """
-        self._ensure_sample_ref_is_public(prompt)
         params = logprobs_params or LogprobsParams()
         body = _su.build_logprobs_body(prompt, params)
         handle = self._service.enqueue_operation(

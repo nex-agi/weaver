@@ -38,6 +38,7 @@ from ._payloads import (
     prepare_forward_backward_operation,
     prepare_forward_operation,
     serialize_data,
+    validate_sample_ref_operation,
 )
 from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
@@ -83,10 +84,6 @@ class TrainingClient:
         self.session_id = session_id
         self.tokenizer_path = tokenizer_path
         self.debug_info = debug_info
-        # Dataset-version visibility is immutable. This cache is only an SDK
-        # ergonomics optimization for public-only operations; the server is the
-        # authoritative policy enforcement point on every request.
-        self._managed_dataset_visibility_cache: Dict[tuple[str, str], str] = {}
 
     @property
     def training_run_id(self) -> str:
@@ -186,51 +183,6 @@ class TrainingClient:
     def _serialize_data(self, data: Sequence[Datum]) -> Sequence[Dict[str, Any]]:
         return serialize_data(data)
 
-    def _ensure_sample_refs_are_public(self, data: Sequence[Datum]) -> None:
-        """Fail early when a public-only operation contains a protected ref.
-
-        A SampleRef deliberately carries no client-asserted visibility. The
-        immutable catalog value is used here only for a clearer local error;
-        the server resolves and enforces the database value again at submit and
-        execution time.
-        """
-
-        sources = {
-            (datum.sample_ref.dataset, datum.sample_ref.version)
-            for datum in data
-            if datum.sample_ref is not None
-        }
-        for source in sorted(sources):
-            visibility = self._managed_dataset_visibility_cache.get(source)
-            if visibility is None:
-                info = self._service.datasets.get(name=source[0], version=source[1])
-                visibility = info.content_visibility
-                self._managed_dataset_visibility_cache[source] = visibility
-            if visibility != "public":
-                raise ValueError(
-                    f"managed dataset {source[0]!r} version {source[1]!r} is protected; "
-                    "protected SampleRef data only supports default-transport cross_entropy "
-                    "forward_backward with empty loss_fn_config, loss_fn_inputs, and metadata"
-                )
-
-    def _validate_forward_backward_sample_refs(
-        self,
-        data: Sequence[Datum],
-        loss_fn: str,
-        loss_fn_config: Mapping[str, Any] | None,
-    ) -> None:
-        managed = [datum for datum in data if datum.is_sample_ref]
-        if not managed:
-            return
-        protected_safe = (
-            loss_fn == "cross_entropy"
-            and not loss_fn_config
-            and self._service.tensor_transport == "default"
-            and all(not datum.loss_fn_inputs and not datum.metadata for datum in managed)
-        )
-        if not protected_safe:
-            self._ensure_sample_refs_are_public(managed)
-
     def _build_metadata(
         self,
         metadata: Mapping[str, Any] | None,
@@ -292,8 +244,13 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        if any(datum.is_sample_ref for datum in data):
-            self._ensure_sample_refs_are_public(data)
+        validate_sample_ref_operation(
+            data,
+            operation="forward",
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            tensor_transport=self._service.tensor_transport,
+        )
         prepared = prepare_forward_operation(
             model_id=self.model_id,
             seq_id=self._next_seq(),
@@ -358,7 +315,13 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
-        self._validate_forward_backward_sample_refs(data, loss_fn, loss_fn_config)
+        validate_sample_ref_operation(
+            data,
+            operation="forward_backward",
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            tensor_transport=self._service.tensor_transport,
+        )
         prepared = prepare_forward_backward_operation(
             model_id=self.model_id,
             seq_id=self._next_seq(),
