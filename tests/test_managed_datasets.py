@@ -177,7 +177,12 @@ def test_natural_mixed_sft_batch_assigns_stable_local_occurrence_ids():
         loss_fn_inputs={"target_tokens": [2, 3], "custom_signal": [0.25, 0.5]},
         metadata={"source": "local"},
     )
-    managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2)
+    managed = Datum.from_sample_ref(
+        dataset="d",
+        version="v1",
+        sample_idx=2,
+        loss_fn_inputs={"coefficient": 0.75},
+    )
 
     def wire_data():
         prepared = prepare_forward_backward_operation(
@@ -204,6 +209,7 @@ def test_natural_mixed_sft_batch_assigns_stable_local_occurrence_ids():
     assert first[0]["loss_fn_inputs"]["target_tokens"]["data"] == [2, 3]
     assert first[0]["loss_fn_inputs"]["custom_signal"]["data"] == [0.25, 0.5]
     assert first[0]["metadata"] == {"source": "local"}
+    assert first[1]["loss_fn_inputs"] == {"coefficient": 0.75}
 
 
 def test_mixed_batch_preserves_explicit_ids_and_distinguishes_repeated_object_occurrences():
@@ -364,7 +370,7 @@ def test_sample_ref_rejects_server_owned_inputs(field):
         Datum.from_sample_ref(dataset="d", version="v1", sample_idx=0, loss_fn_inputs={field: [1]})
 
 
-def test_sample_ref_can_be_constructed_with_extensions_but_sft_rejects_them():
+def test_sample_ref_sft_accepts_caller_loss_inputs():
     mask = [[1, 2], [3]]
     datum = Datum.from_sample_ref(
         dataset="open",
@@ -378,9 +384,8 @@ def test_sample_ref_can_be_constructed_with_extensions_but_sft_rejects_them():
     handle = MagicMock()
     handle.result.return_value = {}
     client._service.enqueue_operation = MagicMock(return_value=handle)
-    with pytest.raises(ValueError, match="requires empty loss_fn_inputs"):
-        client.forward_backward([datum], "cross_entropy")
-    client._service.enqueue_operation.assert_not_called()
+    client.forward_backward([datum], "cross_entropy")
+    client._service.enqueue_operation.assert_called_once()
     client._service._http.get.assert_not_called()
 
 
@@ -1027,7 +1032,7 @@ def test_create_model_pins_training_max_sequence_length_sync_and_async():
         service.create_model(base_model="Qwen/Qwen3-8B", training_max_sequence_length=1)
 
 
-def test_sample_ref_sft_rejects_non_server_owned_loss_inputs_too():
+def test_sample_ref_sft_accepts_non_server_owned_loss_inputs():
     client = _training_client()
     datum = Datum.from_sample_ref(
         dataset="d",
@@ -1038,9 +1043,8 @@ def test_sample_ref_sft_rejects_non_server_owned_loss_inputs_too():
     handle = MagicMock()
     handle.result.return_value = {}
     client._service.enqueue_operation = MagicMock(return_value=handle)
-    with pytest.raises(ValueError, match="requires empty loss_fn_inputs"):
-        client.forward_backward([datum], "cross_entropy")
-    client._service.enqueue_operation.assert_not_called()
+    client.forward_backward([datum], "cross_entropy")
+    client._service.enqueue_operation.assert_called_once()
 
 
 def test_sync_training_client_enforces_sample_ref_sft_only_without_catalog_preflight():
@@ -1064,8 +1068,7 @@ def test_sync_training_client_enforces_sample_ref_sft_only_without_catalog_prefl
     with_inputs = Datum.from_sample_ref(
         dataset="secret", version="v1", sample_idx=0, loss_fn_inputs={"coefficient": 0.5}
     )
-    with pytest.raises(ValueError, match="empty loss_fn_inputs"):
-        client.forward_backward([with_inputs], "cross_entropy")
+    client.forward_backward([with_inputs], "cross_entropy")
     with_metadata = Datum.from_sample_ref(
         dataset="secret", version="v1", sample_idx=0, metadata={"source": "managed"}
     )
@@ -1074,7 +1077,7 @@ def test_sync_training_client_enforces_sample_ref_sft_only_without_catalog_prefl
     client._service._config.tensor_transport = "http-binary"
     with pytest.raises(ValueError, match="default JSON tensor transport"):
         client.forward_backward([managed], "cross_entropy")
-    assert client._service.enqueue_operation.call_count == 1
+    assert client._service.enqueue_operation.call_count == 2
 
 
 def test_async_training_client_matches_sample_ref_sft_only_policy():
@@ -1099,8 +1102,7 @@ def test_async_training_client_matches_sample_ref_sft_only_policy():
         with_inputs = Datum.from_sample_ref(
             dataset="open", version="v1", sample_idx=0, loss_fn_inputs={"coefficient": 0.5}
         )
-        with pytest.raises(ValueError, match="empty loss_fn_inputs"):
-            await client.forward_backward([with_inputs], "cross_entropy")
+        await client.forward_backward([with_inputs], "cross_entropy")
         with_metadata = Datum.from_sample_ref(
             dataset="open", version="v1", sample_idx=0, metadata={"source": "managed"}
         )
@@ -1112,7 +1114,7 @@ def test_async_training_client_matches_sample_ref_sft_only_policy():
         return client
 
     client = asyncio.run(run())
-    assert client._service.enqueue_operation.await_count == 1
+    assert client._service.enqueue_operation.await_count == 2
     client._service._http.get.assert_not_called()
 
 

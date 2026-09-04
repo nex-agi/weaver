@@ -191,9 +191,11 @@ Every `SampleRef`, regardless of `content_visibility`, supports only the built-i
 `cross_entropy` `forward_backward` operation. Managed references cannot be used with
 `forward`, custom/surrogate losses, `sample`, or `compute_logprobs`, and the first release
 does not expose dataset download. These limits do not affect ordinary token-in datums.
-Managed datums require empty `loss_fn_config`, client `loss_fn_inputs`, and per-datum
-`metadata`, and use the default JSON tensor transport. The server owns the model input,
-targets, loss mask, and weights.
+Managed datums require empty `loss_fn_config` and per-datum `metadata`, and use the
+default JSON tensor transport. Caller `loss_fn_inputs` use the same serialization
+semantics as ordinary token-in datums and remain attached to their original datum. The
+server supplies the model input, targets, loss mask, and weights, so callers cannot use
+those names in a managed datum's `loss_fn_inputs`.
 
 A protected response carries a server-resolved `content_visibility="protected"`; any
 token-identity array contains only the response-only `-8` sentinel at the true length, and

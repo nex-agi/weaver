@@ -86,11 +86,6 @@ def validate_sample_ref_operation(
             "SampleRef cross_entropy forward_backward requires default JSON tensor transport"
         )
     for index, datum in managed:
-        if datum.loss_fn_inputs:
-            raise ValueError(
-                f"datum {index}: SampleRef cross_entropy forward_backward requires empty "
-                "loss_fn_inputs"
-            )
         if datum.metadata:
             raise ValueError(
                 f"datum {index}: SampleRef cross_entropy forward_backward requires empty metadata"
