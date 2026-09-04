@@ -253,7 +253,6 @@ class SampleRefLength:
 
     sample_ref: SampleRef
     input_token_count: int
-    model_data_revision: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -261,23 +260,12 @@ class SampleRefLength:
             "input_token_count",
             _positive_int(self.input_token_count, "input_token_count"),
         )
-        if self.model_data_revision is not None:
-            if (
-                not isinstance(self.model_data_revision, str)
-                or not self.model_data_revision.strip()
-                or self.model_data_revision != self.model_data_revision.strip()
-            ):
-                raise ValueError(
-                    "model_data_revision must be a non-empty string without boundary "
-                    "whitespace, or null"
-                )
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> SampleRefLength:
         return cls(
             sample_ref=SampleRef.from_payload(payload),
             input_token_count=_positive_int(payload.get("input_token_count"), "input_token_count"),
-            model_data_revision=payload.get("model_data_revision"),
         )
 
 
@@ -286,15 +274,6 @@ def parse_sample_ref_lengths(requested: Sequence[SampleRef], payload: Any) -> li
 
     if not isinstance(payload, Mapping) or not isinstance(payload.get("items"), list):
         raise ValueError("sample length response must contain an items array")
-    model_data_revision = payload.get("model_data_revision")
-    if model_data_revision is not None and (
-        not isinstance(model_data_revision, str)
-        or not model_data_revision.strip()
-        or model_data_revision != model_data_revision.strip()
-    ):
-        raise ValueError(
-            "model_data_revision must be a non-empty string without boundary whitespace, or null"
-        )
     raw_items = payload["items"]
     if len(raw_items) != len(requested):
         raise ValueError(f"Expected {len(requested)} sample lengths, got {len(raw_items)}")
@@ -304,7 +283,7 @@ def parse_sample_ref_lengths(requested: Sequence[SampleRef], payload: Any) -> li
     for index, (reference, item) in enumerate(zip(requested, raw_items, strict=False)):
         if not isinstance(item, Mapping):
             raise ValueError(f"sample length item {index} must be an object")
-        length = SampleRefLength.from_payload({**item, "model_data_revision": model_data_revision})
+        length = SampleRefLength.from_payload(item)
         if length.sample_ref != reference:
             raise ValueError(f"sample length item {index} does not match request order")
         previous = known_counts.setdefault(reference, length.input_token_count)

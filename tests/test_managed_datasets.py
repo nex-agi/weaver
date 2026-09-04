@@ -614,7 +614,6 @@ def test_sync_model_bound_lengths_preserve_and_validate_order():
     client = _training_client()
     refs = [SampleRef("d", "v1", 4), SampleRef("d", "v1", 4), SampleRef("d", "v1", 8)]
     client._service._http.post.return_value = {
-        "model_data_revision": "mdr1-profile-a",
         "items": [
             {**refs[0].to_payload(), "input_token_count": 11},
             {**refs[1].to_payload(), "input_token_count": 11},
@@ -625,7 +624,6 @@ def test_sync_model_bound_lengths_preserve_and_validate_order():
     lengths = client.resolve_sample_ref_lengths(refs)
 
     assert [item.input_token_count for item in lengths] == [11, 11, 17]
-    assert {item.model_data_revision for item in lengths} == {"mdr1-profile-a"}
     client._service._http.post.assert_called_once_with(
         "/api/v1/models/model-1/managed-dataset-sample-lengths",
         json={"items": [ref.to_payload() for ref in refs]},
@@ -681,44 +679,11 @@ def test_model_bound_lengths_chunk_server_limit_and_preserve_cross_chunk_duplica
     assert client._service._http.post.call_count == 2
 
 
-def test_model_bound_lengths_reject_invalid_or_inconsistent_data_revision(monkeypatch):
-    client = _training_client()
-    ref = SampleRef("d", "v1", 1)
-    client._service._http.post.return_value = {
-        "model_data_revision": "",
-        "items": [{**ref.to_payload(), "input_token_count": 11}],
-    }
-    with pytest.raises(ValueError, match="model_data_revision"):
-        client.resolve_sample_ref_lengths([ref])
-
-    client._service._http.post.return_value = {
-        "model_data_revision": " mdr1-profile-a",
-        "items": [{**ref.to_payload(), "input_token_count": 11}],
-    }
-    with pytest.raises(ValueError, match="boundary whitespace"):
-        client.resolve_sample_ref_lengths([ref])
-
-    monkeypatch.setattr("weaver.training_client.MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS", 1)
-    revisions = iter(["mdr1-profile-a", "mdr1-profile-b"])
-
-    def response(*_args, **kwargs):
-        item = kwargs["json"]["items"][0]
-        return {
-            "model_data_revision": next(revisions),
-            "items": [{**item, "input_token_count": 11}],
-        }
-
-    client._service._http.post.side_effect = response
-    with pytest.raises(ValueError, match="inconsistent model_data_revision"):
-        client.resolve_sample_ref_lengths([ref, SampleRef("d", "v1", 2)])
-
-
 def test_async_model_bound_lengths_has_the_same_contract():
     async def run():
         client = _async_training_client()
         ref = SampleRef("d", "v1", 2)
         client._service._http.post.return_value = {
-            "model_data_revision": "mdr1-profile-a",
             "items": [{**ref.to_payload(), "input_token_count": 9}],
         }
         resolved = await client.resolve_sample_ref_lengths([ref])
@@ -726,7 +691,6 @@ def test_async_model_bound_lengths_has_the_same_contract():
 
     resolved, ref, post = asyncio.run(run())
     assert resolved[0].input_token_count == 9
-    assert resolved[0].model_data_revision == "mdr1-profile-a"
     post.assert_awaited_once_with(
         "/api/v1/models/model-1/managed-dataset-sample-lengths",
         json={"items": [ref.to_payload()]},

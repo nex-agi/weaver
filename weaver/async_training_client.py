@@ -175,7 +175,6 @@ class AsyncTrainingClient:
             raise TypeError("refs must contain only SampleRef values")
         resolved: List[SampleRefLength] = []
         known_counts: Dict[SampleRef, int] = {}
-        known_revision: str | None = None
         for start in range(0, len(requested), MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS):
             chunk = requested[start : start + MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS]
             payload = await self._service.http.post(
@@ -184,13 +183,6 @@ class AsyncTrainingClient:
                 max_retries=1,
             )
             parsed = parse_sample_ref_lengths(chunk, payload)
-            chunk_revision = parsed[0].model_data_revision
-            if start == 0:
-                known_revision = chunk_revision
-            elif chunk_revision != known_revision:
-                raise ValueError(
-                    "sample length chunks returned inconsistent model_data_revision values"
-                )
             for item in parsed:
                 previous = known_counts.setdefault(item.sample_ref, item.input_token_count)
                 if previous != item.input_token_count:
