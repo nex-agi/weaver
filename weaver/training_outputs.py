@@ -27,18 +27,53 @@ from .types.managed_dataset import (
 )
 
 AlignedTrainingOutput = SampleRefOutput | Mapping[str, Any]
+_MISSING = object()
+
+
+def _validated_loss_fn_outputs(value: Any) -> list[Mapping[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("training result must contain a loss_fn_outputs array")
+    if not all(isinstance(output, Mapping) for output in value):
+        raise ValueError("every loss_fn_outputs entry must be an object")
+    return list(value)
+
+
+def _same_loss_fn_outputs(left: list[Mapping[str, Any]], right: list[Mapping[str, Any]]) -> bool:
+    if left is right:
+        return True
+    try:
+        equivalent = left == right
+    except (TypeError, ValueError, RuntimeError):
+        return False
+    return isinstance(equivalent, bool) and equivalent
 
 
 def _loss_fn_outputs(result: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    nested = result.get("result")
-    if not isinstance(nested, Mapping):
-        raise ValueError("training result must contain a result object")
-    raw_outputs = nested.get("loss_fn_outputs")
-    if not isinstance(raw_outputs, list):
+    """Extract V1-wrapped or V2-direct outputs without guessing precedence."""
+
+    direct = result.get("loss_fn_outputs", _MISSING)
+    nested_container = result.get("result", _MISSING)
+    nested = _MISSING
+    if nested_container is not _MISSING:
+        if not isinstance(nested_container, Mapping):
+            if direct is not _MISSING:
+                raise ValueError("training result contains ambiguous result envelopes")
+            raise ValueError("training result result field must be an object")
+        nested = nested_container.get("loss_fn_outputs", _MISSING)
+
+    if direct is _MISSING and nested is _MISSING:
         raise ValueError("training result must contain a loss_fn_outputs array")
-    if not all(isinstance(output, Mapping) for output in raw_outputs):
-        raise ValueError("every loss_fn_outputs entry must be an object")
-    return list(raw_outputs)
+
+    direct_outputs = _validated_loss_fn_outputs(direct) if direct is not _MISSING else None
+    nested_outputs = _validated_loss_fn_outputs(nested) if nested is not _MISSING else None
+    if direct_outputs is not None and nested_outputs is not None:
+        if not _same_loss_fn_outputs(direct_outputs, nested_outputs):
+            raise ValueError("training result contains ambiguous loss_fn_outputs arrays")
+        return direct_outputs
+    if direct_outputs is not None:
+        return direct_outputs
+    assert nested_outputs is not None
+    return nested_outputs
 
 
 def align_training_outputs(
@@ -46,11 +81,13 @@ def align_training_outputs(
 ) -> list[AlignedTrainingOutput]:
     """Validate and align per-datum outputs without consuming redacted tokens.
 
-    Legacy batches in which every token datum lacks ``datum_id`` retain the
-    historical positional behavior. Mixed or ID-bearing batches require a
+    Both V1's nested ``result`` envelope and V2's direct operation response are
+    accepted. If both shapes are present, they must carry equivalent output
+    arrays. Legacy batches in which every token datum lacks ``datum_id`` retain
+    the historical positional behavior. Mixed or ID-bearing batches require a
     unique ID on every datum and output, and wire order remains a checked
-    invariant in addition to exact ID-set equality. Completed operation
-    handles materialize HTTP-binary tensors before this parser runs.
+    invariant in addition to exact ID-set equality. Completed operation handles
+    materialize HTTP-binary tensors before this parser runs.
     """
 
     normalized_data = normalize_mixed_datum_ids(data)

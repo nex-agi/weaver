@@ -856,7 +856,7 @@ def test_public_managed_output_requires_real_tokens_and_preserves_ordinary_outpu
         SampleRefOutput.from_payload(non_finite)
 
 
-def test_mixed_output_alignment_preserves_datum_kinds_but_reattachment_is_forbidden():
+def test_v1_nested_mixed_output_alignment_remains_supported():
     local = Datum.from_raw(
         model_input=ModelInput.from_ints([1, 2]),
         loss_fn_inputs={"target_tokens": [2, 3]},
@@ -887,6 +887,87 @@ def test_mixed_output_alignment_preserves_datum_kinds_but_reattachment_is_forbid
             result,
             field_map={"per_token_kl": "old_kl", "token_losses": "old_token_losses"},
         )
+
+
+def test_v2_direct_mixed_output_alignment_preserves_order_and_visibility():
+    protected = Datum.from_sample_ref(
+        dataset="closed", version="v1", sample_idx=1, datum_id="protected-1"
+    )
+    local = Datum.from_raw(
+        model_input=ModelInput.from_ints([1, 2]),
+        loss_fn_inputs={"target_tokens": [2, 3]},
+        datum_id="local-1",
+    )
+    public = Datum.from_sample_ref(dataset="open", version="v2", sample_idx=3, datum_id="public-1")
+    outputs = [
+        _sample_output(protected),
+        {"datum_id": "local-1", "logprobs": [-0.1, -0.2]},
+        _sample_output(public, content_visibility="public"),
+    ]
+    result = {"metrics": {"loss": 0.5}, "loss_fn_outputs": outputs}
+
+    aligned = align_training_outputs([protected, local, public], result)
+
+    assert isinstance(aligned[0], SampleRefOutput)
+    assert aligned[0].content_visibility == "protected"
+    assert aligned[0].target_tokens == (-8, -8)
+    assert aligned[1] == outputs[1]
+    assert isinstance(aligned[2], SampleRefOutput)
+    assert aligned[2].content_visibility == "public"
+    assert aligned[2].target_tokens == (101, 102)
+    assert aligned[2].logprobs == (-0.7, -0.7)
+
+    reordered = {"loss_fn_outputs": [outputs[1], outputs[0], outputs[2]]}
+    with pytest.raises(ValueError, match="input wire order"):
+        align_training_outputs([protected, local, public], reordered)
+
+
+def test_equivalent_dual_result_envelopes_are_unambiguous():
+    local = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]),
+        loss_fn_inputs={"target_tokens": [2]},
+        datum_id="local-1",
+    )
+    direct_outputs = [{"datum_id": "local-1", "logprobs": [0.0]}]
+    nested_outputs = [dict(direct_outputs[0])]
+
+    aligned = align_training_outputs(
+        [local],
+        {
+            "loss_fn_outputs": direct_outputs,
+            "result": {"loss_fn_outputs": nested_outputs},
+        },
+    )
+
+    assert aligned == direct_outputs
+
+
+def test_conflicting_dual_result_envelopes_are_rejected_as_ambiguous():
+    local = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]),
+        loss_fn_inputs={"target_tokens": [2]},
+        datum_id="local-1",
+    )
+
+    with pytest.raises(ValueError, match="ambiguous loss_fn_outputs"):
+        align_training_outputs(
+            [local],
+            {
+                "loss_fn_outputs": [{"datum_id": "local-1", "logprobs": [0.0]}],
+                "result": {"loss_fn_outputs": [{"datum_id": "local-1", "logprobs": [-1.0]}]},
+            },
+        )
+
+
+@pytest.mark.parametrize("result", [{}, {"result": {}}, {"metrics": {"loss": 1.0}}])
+def test_training_output_alignment_rejects_missing_output_array(result):
+    local = Datum.from_raw(
+        model_input=ModelInput.from_ints([1]),
+        loss_fn_inputs={"target_tokens": [2]},
+    )
+
+    with pytest.raises(ValueError, match="must contain a loss_fn_outputs array"):
+        align_training_outputs([local], result)
 
 
 def test_mixed_output_alignment_uses_generated_local_occurrence_id():
