@@ -74,13 +74,14 @@ def validate_sample_ref_operation(
 ) -> None:
     """Enforce the phase-one SFT-only boundary for managed samples."""
 
+    # Built-in CE configuration is forwarded unchanged for both local and
+    # managed datums so a mixed batch shares one aggregation contract.
+    del loss_fn_config
     managed = [(index, datum) for index, datum in enumerate(data) if datum.is_sample_ref]
     if not managed:
         return
     if operation != "forward_backward" or loss_fn != "cross_entropy":
         raise ValueError("SampleRef data only supports built-in cross_entropy forward_backward")
-    if loss_fn_config:
-        raise ValueError("SampleRef cross_entropy forward_backward requires empty loss_fn_config")
     if tensor_transport != "default":
         raise ValueError(
             "SampleRef cross_entropy forward_backward requires default JSON tensor transport"

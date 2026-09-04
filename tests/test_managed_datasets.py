@@ -212,6 +212,27 @@ def test_natural_mixed_sft_batch_assigns_stable_local_occurrence_ids():
     assert first[1]["loss_fn_inputs"] == {"coefficient": 0.75}
 
 
+def test_managed_sft_forwards_token_mean_loss_configuration():
+    managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2)
+    configured = {"loss_agg_mode": "token-mean", "entropy_coeff": 0.0}
+
+    prepared = prepare_forward_backward_operation(
+        model_id="model-1",
+        seq_id=7,
+        data=[managed],
+        loss_fn="cross_entropy",
+        loss_fn_config=configured,
+        request_metadata=None,
+        tensor_transport="default",
+    )
+    try:
+        forwarded = prepared.body["payload"]["forward_backward_input"]
+    finally:
+        prepared.close()
+
+    assert forwarded["loss_fn_config"] == configured
+
+
 def test_mixed_batch_preserves_explicit_ids_and_distinguishes_repeated_object_occurrences():
     repeated = Datum.from_raw(
         model_input=ModelInput.from_ints([1]),
@@ -1063,8 +1084,9 @@ def test_sync_training_client_enforces_sample_ref_sft_only_without_catalog_prefl
     ):
         with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
             operation()
-    with pytest.raises(ValueError, match="empty loss_fn_config"):
-        client.forward_backward([managed], "cross_entropy", loss_fn_config={"reduction": "mean"})
+    client.forward_backward(
+        [managed], "cross_entropy", loss_fn_config={"loss_agg_mode": "token-mean"}
+    )
     with_inputs = Datum.from_sample_ref(
         dataset="secret", version="v1", sample_idx=0, loss_fn_inputs={"coefficient": 0.5}
     )
@@ -1077,7 +1099,7 @@ def test_sync_training_client_enforces_sample_ref_sft_only_without_catalog_prefl
     client._service._config.tensor_transport = "http-binary"
     with pytest.raises(ValueError, match="default JSON tensor transport"):
         client.forward_backward([managed], "cross_entropy")
-    assert client._service.enqueue_operation.call_count == 2
+    assert client._service.enqueue_operation.call_count == 3
 
 
 def test_async_training_client_matches_sample_ref_sft_only_policy():
@@ -1095,10 +1117,9 @@ def test_async_training_client_matches_sample_ref_sft_only_policy():
         ):
             with pytest.raises(ValueError, match="only supports built-in cross_entropy"):
                 await operation()
-        with pytest.raises(ValueError, match="empty loss_fn_config"):
-            await client.forward_backward(
-                [managed], "cross_entropy", loss_fn_config={"reduction": "mean"}
-            )
+        await client.forward_backward(
+            [managed], "cross_entropy", loss_fn_config={"loss_agg_mode": "token-mean"}
+        )
         with_inputs = Datum.from_sample_ref(
             dataset="open", version="v1", sample_idx=0, loss_fn_inputs={"coefficient": 0.5}
         )
@@ -1114,7 +1135,7 @@ def test_async_training_client_matches_sample_ref_sft_only_policy():
         return client
 
     client = asyncio.run(run())
-    assert client._service.enqueue_operation.await_count == 2
+    assert client._service.enqueue_operation.await_count == 3
     client._service._http.get.assert_not_called()
 
 
