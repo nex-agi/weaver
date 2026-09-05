@@ -169,9 +169,6 @@ with ServiceClient() as service:
     )
     resolved = trainer.resolve_sample_ref_lengths([ref])[0]
     length = resolved.input_token_count
-    # Opaque identity of the server-private model data profile. Persist it if
-    # exact resume must fail closed when that profile changes.
-    model_data_revision = resolved.model_data_revision
     print(length)
 
     datum = Datum.from_sample_ref(
@@ -191,11 +188,11 @@ Every `SampleRef`, regardless of `content_visibility`, supports only the built-i
 `cross_entropy` `forward_backward` operation. Managed references cannot be used with
 `forward`, custom/surrogate losses, `sample`, or `compute_logprobs`, and the first release
 does not expose dataset download. These limits do not affect ordinary token-in datums.
-Managed datums require empty `loss_fn_config` and per-datum `metadata`, and use the
-default JSON tensor transport. Caller `loss_fn_inputs` use the same serialization
-semantics as ordinary token-in datums and remain attached to their original datum. The
-server supplies the model input, targets, loss mask, and weights, so callers cannot use
-those names in a managed datum's `loss_fn_inputs`.
+Managed datums use the default JSON tensor transport. Phase-one requests may pass the
+built-in cross-entropy configuration, request metadata, and caller-owned
+`loss_fn_inputs`; those inputs remain attached to their original datum. The server
+supplies `model_input`, `target_tokens`, `loss_mask`, and `weights`, so callers cannot
+use those names in a managed datum's `loss_fn_inputs`.
 
 A protected response carries a server-resolved `content_visibility="protected"`; any
 token-identity array contains only the response-only `-8` sentinel at the true length, and

@@ -153,10 +153,11 @@ token 上限），可用于 client 侧整样本 packing。
 无论 `content_visibility` 是 `protected` 还是 `public`，`SampleRef` 第一期都只能用于内置
 `cross_entropy` 的 `forward_backward`；不能用于 `forward`、自定义或 surrogate loss、
 `sample`、`compute_logprobs`，也不提供数据集下载。普通 token-in Datum 不受这些限制。
-managed Datum 要求 `loss_fn_config`、client `loss_fn_inputs` 和逐 datum `metadata` 均为空，
-并使用默认 JSON tensor transport；model input、target、loss mask 和 weights 均由 server
-提供。受保护响应中的 token 身份数组会按真实长度替换为 `-8`，并拒绝
-logprobs、elementwise loss 等依赖 label 的逐 token 字段；不要把 `-8` 再传入
+managed Datum 使用默认 JSON tensor transport。第一期请求可以附带内置交叉熵配置、请求
+metadata 和 client-owned `loss_fn_inputs`，这些输入会始终与原 datum 对齐；model input、
+target、loss mask 和 weights 均由 server 提供，因此 client 不能在 managed datum 的
+`loss_fn_inputs` 中使用这些字段名。受保护响应中的 token 身份数组会按真实长度替换为
+`-8`，并拒绝 logprobs、elementwise loss 等依赖 label 的逐 token 字段；不要把 `-8` 再传入
 `ModelInput` 或 `target_tokens`。公开响应可以保留真实 token，但请求侧仍遵循同一 SFT-only
 边界。
 
