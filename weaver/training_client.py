@@ -14,6 +14,10 @@
 
 """Training client built on top of the Weaver ServiceClient."""
 
+# The public client intentionally keeps its synchronous operation surface in
+# one module; managed-dataset helpers push it slightly over pylint's size limit.
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 import logging
@@ -34,6 +38,7 @@ from ._payloads import (
     prepare_forward_backward_operation,
     prepare_forward_operation,
     serialize_data,
+    validate_sample_ref_operation,
 )
 from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
@@ -43,6 +48,12 @@ from .tensor_transport import PreparedOperationBody
 from .types import AdamParams, Datum
 from .types.checkpoint import Checkpoint
 from .types.deployment import Deployment
+from .types.managed_dataset import (
+    MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS,
+    SampleRef,
+    SampleRefLength,
+    parse_sample_ref_lengths,
+)
 from .types.weights_artifact import WeightsArtifact
 
 if TYPE_CHECKING:
@@ -131,6 +142,36 @@ class TrainingClient:
     def _next_seq(self) -> int:
         return self._service.next_operation_seq(self.model_id)
 
+    def resolve_sample_ref_lengths(self, refs: Sequence[SampleRef]) -> List[SampleRefLength]:
+        """Resolve safe, model-bound input lengths for whole-sample batching.
+
+        Rendering, tokenization, truncation, and autoregressive shifting use
+        the policy pinned when this training model was created. No tokenizer,
+        template, or per-call maximum-length override is accepted here.
+        """
+
+        requested = list(refs)
+        if not requested:
+            return []
+        if not all(isinstance(ref, SampleRef) for ref in requested):
+            raise TypeError("refs must contain only SampleRef values")
+        resolved: List[SampleRefLength] = []
+        known_counts: Dict[SampleRef, int] = {}
+        for start in range(0, len(requested), MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS):
+            chunk = requested[start : start + MAX_SAMPLE_REF_LENGTH_REQUEST_ITEMS]
+            payload = self._service.http.post(
+                f"/api/v1/models/{self.model_id}/managed-dataset-sample-lengths",
+                json={"items": [ref.to_payload() for ref in chunk]},
+                max_retries=1,
+            )
+            parsed = parse_sample_ref_lengths(chunk, payload)
+            for item in parsed:
+                previous = known_counts.setdefault(item.sample_ref, item.input_token_count)
+                if previous != item.input_token_count:
+                    raise ValueError("duplicate SampleRef entries returned inconsistent lengths")
+            resolved.extend(parsed)
+        return resolved
+
     def _serialize_data(self, data: Sequence[Datum]) -> Sequence[Dict[str, Any]]:
         return serialize_data(data)
 
@@ -195,6 +236,13 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
+        validate_sample_ref_operation(
+            data,
+            operation="forward",
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            tensor_transport=self._service.tensor_transport,
+        )
         prepared = prepare_forward_operation(
             model_id=self.model_id,
             seq_id=self._next_seq(),
@@ -259,6 +307,13 @@ class TrainingClient:
                 Passing this argument raises ``ValueError``.
             wait: If True, blocks until the operation completes.
         """
+        validate_sample_ref_operation(
+            data,
+            operation="forward_backward",
+            loss_fn=loss_fn,
+            loss_fn_config=loss_fn_config,
+            tensor_transport=self._service.tensor_transport,
+        )
         prepared = prepare_forward_backward_operation(
             model_id=self.model_id,
             seq_id=self._next_seq(),

@@ -30,7 +30,17 @@ from .async_service_client import AsyncServiceClient  # noqa: F401
 from .async_training_client import AsyncTrainingClient  # noqa: F401
 from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
+from .training_outputs import align_training_outputs, attach_loss_fn_outputs  # noqa: F401
 from .types.deployment import Deployment  # noqa: F401
+from .types.managed_dataset import (  # noqa: F401
+    WEAVER_REDACTED_TOKEN_ID,
+    ManagedDatasetInfo,
+    ManagedDatasetPage,
+    ManagedDatasetVisibility,
+    SampleRef,
+    SampleRefLength,
+    SampleRefOutput,
+)
 from .types.supported_model import (  # noqa: F401
     SupportedModel,
     SupportedModelPrice,
@@ -46,11 +56,20 @@ __all__ = [
     "AsyncSamplingClient",
     "AsyncOperationHandle",
     "WeaverAPIError",
+    "WEAVER_REDACTED_TOKEN_ID",
+    "ManagedDatasetInfo",
+    "ManagedDatasetPage",
+    "ManagedDatasetVisibility",
+    "SampleRef",
+    "SampleRefLength",
+    "SampleRefOutput",
     "WeightsArtifact",
     "Deployment",
     "SupportedModel",
     "SupportedModelPrice",
     "SupportedTrainingMode",
+    "align_training_outputs",
+    "attach_loss_fn_outputs",
     "types",
     "__version__",
 ]

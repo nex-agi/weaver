@@ -19,7 +19,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List
 
-from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive
@@ -98,7 +98,7 @@ class SamplingClient:
         leading placeholder.
 
         Args:
-            prompt: The model input (tokens) to compute logprobs for.
+            prompt: The tokenized model input to compute logprobs for.
             logprobs_params: Optional parameters (e.g. return_rollout_token_expert for MoE router replay).
                 When None, uses defaults.
 

@@ -101,7 +101,7 @@ class TestPostMaxRetriesOverride:
         assert result == {"id": "op-1"}
         assert client._client.request.call_count == 2
 
-    def test_post_retries_retryable_503(self, client, monkeypatch):
+    def test_explicit_max_retries_is_hard_bound_for_retryable_503(self, client, monkeypatch):
         monkeypatch.setattr("weaver._http.time.sleep", lambda _delay: None)
         draining = MagicMock()
         draining.is_success = False
@@ -123,7 +123,34 @@ class TestPostMaxRetriesOverride:
         client._client.headers = {}
         client._client.request.side_effect = [draining, ok]
 
-        result = client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
+        with pytest.raises(WeaverAPIError, match="server_draining"):
+            client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
+
+        assert client._client.request.call_count == 1
+
+    def test_post_default_retries_retryable_503(self, client, monkeypatch):
+        monkeypatch.setattr("weaver._http.time.sleep", lambda _delay: None)
+        draining = MagicMock()
+        draining.is_success = False
+        draining.status_code = 503
+        draining.content = b'{"error":"server_draining"}'
+        draining.text = "service temporarily unavailable"
+        draining.headers = {}
+        draining.json.return_value = {
+            "error": "server_draining",
+            "message": "service temporarily unavailable",
+            "retryable": True,
+        }
+        ok = MagicMock()
+        ok.is_success = True
+        ok.status_code = 200
+        ok.content = b'{"id":"op-1"}'
+        ok.json.return_value = {"id": "op-1"}
+        client._client = MagicMock()
+        client._client.headers = {}
+        client._client.request.side_effect = [draining, ok]
+
+        result = client.post("/api/v1/sampling-sessions/s1/sample", json={})
 
         assert result == {"id": "op-1"}
         assert client._client.request.call_count == 2

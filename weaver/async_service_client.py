@@ -130,6 +130,7 @@ from ._safeio import (
 )
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import TensorCompression, TensorTransport, WeaverConfig
+from .managed_dataset_client import AsyncManagedDatasetsClient
 from .operations import AsyncOperationHandle, build_async_operation_handle
 from .tensor_transport import TensorPack
 from .types import LoraConfig
@@ -267,6 +268,12 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         """Configured HTTP tensor-pack compression."""
 
         return self._config.tensor_compression
+
+    @property
+    def datasets(self) -> AsyncManagedDatasetsClient:
+        """Authorized managed-dataset catalog."""
+
+        return AsyncManagedDatasetsClient(self)
 
     async def connect(self, *, ensure_session: bool = True) -> None:
         """Connect, optionally without creating or fetching a Session."""
@@ -468,6 +475,7 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         lora_config: Union[LoraConfig, Dict[str, Any]] = DEFAULT_LORA_CONFIG,
         user_metadata: Optional[Dict[str, Any]] = None,
         performance_tier: Optional[str] = None,
+        training_max_sequence_length: Optional[int] = None,
     ) -> "AsyncTrainingClient":
         """Create a training model with LoRA or FullFT configuration.
 
@@ -490,6 +498,15 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             payload["user_metadata"] = user_metadata
         if performance_tier is not None:
             payload["performance_tier"] = performance_tier
+
+        if training_max_sequence_length is not None:
+            if (
+                isinstance(training_max_sequence_length, bool)
+                or not isinstance(training_max_sequence_length, int)
+                or training_max_sequence_length < 2
+            ):
+                raise ValueError("training_max_sequence_length must be an integer >= 2")
+            payload["training_max_sequence_length"] = training_max_sequence_length
 
         response = await self.http.post(
             f"/api/v1/sessions/{self.session_id}/models",

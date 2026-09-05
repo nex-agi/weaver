@@ -61,7 +61,6 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1 MiB
 # Per-read timeout, not whole-transfer: httpx applies ``read`` between socket
 # reads, so a long download stays alive as long as bytes keep flowing.
 DOWNLOAD_TIMEOUT = httpx.Timeout(timeout=60.0, connect=10.0)
-
 logger = logging.getLogger(__name__)
 
 
@@ -708,7 +707,7 @@ class APIClient:
                 span.record_exception(e)
                 request_attempt += 1
                 retryable_503 = e.status_code == httpx.codes.SERVICE_UNAVAILABLE
-                if retryable_503:
+                if retryable_503 and max_retries is None:
                     effective_max_retries = max(effective_max_retries, self._max_retries)
                 is_last_attempt = request_attempt >= effective_max_retries
                 idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
