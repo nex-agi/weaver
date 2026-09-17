@@ -87,7 +87,7 @@ async def _build_training_payload(
 ) -> PreparedOperationBody:
     """Build an async request without blocking the loop on pack file I/O."""
 
-    if kwargs.get("loss_fn") == "cross_entropy" and kwargs.get("tensor_transport") != "default":
+    if kwargs.get("tensor_transport") != "default":
         task = asyncio.create_task(asyncio.to_thread(builder, **kwargs))
         try:
             return await asyncio.shield(task)
