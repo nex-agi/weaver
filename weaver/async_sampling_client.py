@@ -19,7 +19,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, overload
 
-from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive

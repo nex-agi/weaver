@@ -22,15 +22,26 @@ owning one. The callable is invoked lazily, only when decoding is required.
 from __future__ import annotations
 
 import re
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from transformers.tokenization_utils import PreTrainedTokenizer
+from transformers import PreTrainedTokenizer
 
 from ._utils import lookup_case_insensitive
 from .types import LogprobsParams, ModelInput, SamplingParams
-from .types.sampling_control import PauseMode, coerce_pause_mode
+from .types.sampling_control import coerce_pause_mode
+
+if TYPE_CHECKING:
+    from .types import PauseMode
 
 TokenizerProvider = Callable[[], PreTrainedTokenizer]
+
+
+def sampling_prompt_payload(prompt: ModelInput) -> Dict[str, Any]:
+    """Serialize a token prompt."""
+
+    if isinstance(prompt, ModelInput):
+        return prompt.to_payload()
+    raise TypeError("prompt must be ModelInput")
 
 
 def build_sample_body(
@@ -46,7 +57,7 @@ def build_sample_body(
 ) -> Dict[str, Any]:
     params = sampling_params or SamplingParams()
     body: Dict[str, Any] = {
-        "prompt": prompt.to_payload(),
+        "prompt": sampling_prompt_payload(prompt),
         "sampling_params": params.to_payload(),
         "num_samples": num_samples,
         "prompt_logprobs": include_prompt_logprobs,
@@ -65,7 +76,7 @@ def build_logprobs_body(
     prompt: ModelInput, logprobs_params: LogprobsParams | None
 ) -> Dict[str, Any]:
     params = logprobs_params or LogprobsParams()
-    return {"prompt": prompt.to_payload(), **params.to_payload()}
+    return {"prompt": sampling_prompt_payload(prompt), **params.to_payload()}
 
 
 def build_pause_generation_body(mode: "PauseMode | str") -> Dict[str, Any]:
@@ -284,8 +295,9 @@ def normalize_prompt_logprobs(prompt: ModelInput, payload: Any) -> List[float | 
     tokens = prompt_tokens(prompt)
     if not tokens:
         return []
+    expected = len(tokens)
     result = result_payload(payload)
-    prompt_values = coerce_prompt_logprob_list(result.get("prompt_logprobs"), len(tokens))
+    prompt_values = coerce_prompt_logprob_list(result.get("prompt_logprobs"), expected)
     if prompt_values is None:
         raise RuntimeError("trainer response missing prompt_logprobs")
     return prompt_values

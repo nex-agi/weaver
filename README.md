@@ -140,6 +140,66 @@ weaver list supported-models --format names
 weaver list supported-models --format json
 ```
 
+### Managed datasets
+
+Managed datasets expose authorized catalog metadata and stable sample references. Every
+immutable dataset version declares `content_visibility`: protected responses hide token
+identities, while public responses may preserve them. The first release is deliberately
+SFT-only for both visibility modes. Select an explicit dataset `name` and `version`, then
+ask the model-bound training client for effective lengths before packing whole samples:
+
+```python
+from weaver import ServiceClient
+from weaver.types import Datum, SampleRef
+
+with ServiceClient() as service:
+    service.ensure_session()
+    for dataset in service.datasets.list(compatible_model="Qwen/Qwen3-8B"):
+        print(
+            dataset.name,
+            dataset.version,
+            dataset.sample_count,
+            dataset.content_visibility,
+        )
+
+    ref = SampleRef(dataset="hq-math", version="2026-08", sample_idx=42)
+    trainer = service.create_model(
+        base_model="Qwen/Qwen3-8B",
+        training_max_sequence_length=4096,
+    )
+    resolved = trainer.resolve_sample_ref_lengths([ref])[0]
+    length = resolved.input_token_count
+    print(length)
+
+    datum = Datum.from_sample_ref(
+        dataset=ref.dataset,
+        version=ref.version,
+        sample_idx=ref.sample_idx,
+        datum_id="batch-7-item-3",
+    )
+    result = trainer.forward_backward([datum], "cross_entropy")
+```
+
+The model fixes the tokenizer, chat template, and complete pre-shift token limit; clients
+cannot override them per reference. `input_token_count` is the resulting autoregressive
+training length after shifting (and is smaller than the pinned full-token limit), which
+is sufficient for client-side whole-sample packing.
+Every `SampleRef`, regardless of `content_visibility`, supports only the built-in
+`cross_entropy` `forward_backward` operation. Managed references cannot be used with
+`forward`, custom/surrogate losses, `sample`, or `compute_logprobs`, and the first release
+does not expose dataset download. These limits do not affect ordinary token-in datums.
+Managed datums use the default JSON tensor transport. Phase-one requests may pass the
+built-in cross-entropy configuration, request metadata, and caller-owned
+`loss_fn_inputs`; those inputs remain attached to their original datum. The server
+supplies `model_input`, `target_tokens`, `loss_mask`, and `weights`, so callers cannot
+use those names in a managed datum's `loss_fn_inputs`.
+
+A protected response carries a server-resolved `content_visibility="protected"`; any
+token-identity array contains only the response-only `-8` sentinel at the true length, and
+label-dependent per-token outputs such as logprobs and elementwise loss are rejected.
+Never feed `-8` back into `ModelInput` or `target_tokens`. A public response may contain
+real non-negative token identities, but has the same SFT-only request boundary.
+
 ## Usage
 
 See [`examples/weaver_walkthrough.ipynb`](examples/weaver_walkthrough.ipynb) for an interactive

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Iterable, List, Sequence
 
 
@@ -25,8 +26,23 @@ class ModelInputChunk:
     type: str
     tokens: List[int]
 
+    def __post_init__(self) -> None:
+        normalized: list[int] = []
+        for token in self.tokens:
+            if isinstance(token, bool) or not isinstance(token, Integral):
+                raise ValueError("model input tokens must be integers")
+            value = int(token)
+            if value < 0:
+                raise ValueError("model input tokens must be non-negative")
+            normalized.append(value)
+        self.tokens = normalized
+
     def to_dict(self) -> dict[str, object]:
-        return {"type": self.type, "tokens": self.tokens}
+        # ``tokens`` is intentionally a mutable list for compatibility. Re-run
+        # validation at the wire boundary so callers cannot append a response-
+        # only redaction sentinel after construction and submit it as input.
+        self.__post_init__()
+        return {"type": self.type, "tokens": list(self.tokens)}
 
 
 @dataclass(slots=True)
@@ -45,10 +61,11 @@ class ModelInput:
         return [token for chunk in self.chunks for token in chunk.tokens]
 
     def extend_tokens(self, tokens: Iterable[int], *, chunk_index: int = 0) -> None:
+        normalized = ModelInputChunk(type="encoded_text", tokens=list(tokens)).tokens
         if not self.chunks:
-            self.chunks.append(ModelInputChunk(type="encoded_text", tokens=list(tokens)))
+            self.chunks.append(ModelInputChunk(type="encoded_text", tokens=normalized))
             return
-        self.chunks[chunk_index].tokens.extend(tokens)
+        self.chunks[chunk_index].tokens.extend(normalized)
 
     def to_payload(self) -> dict[str, object]:
         return {"chunks": [chunk.to_dict() for chunk in self.chunks]}

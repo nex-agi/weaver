@@ -27,6 +27,7 @@ import pytest
 
 from weaver import _async_http
 from weaver._async_http import AsyncAPIClient
+from weaver._http import WeaverAPIError
 from weaver.async_service_client import AsyncServiceClient
 from weaver.config import WeaverConfig
 from weaver.operations import AsyncOperationHandle, WeaverOperationError
@@ -112,7 +113,7 @@ class TestAsyncRetry:
 
         asyncio.run(run())
 
-    def test_post_retries_retryable_503(self, config, monkeypatch):
+    def test_explicit_max_retries_is_hard_bound_for_retryable_503(self, config, monkeypatch):
         monkeypatch.setattr(_async_http, "compute_retry_delay", lambda attempt: 0.0)
 
         async def run():
@@ -133,9 +134,35 @@ class TestAsyncRetry:
             client._client.headers = {}
             client._client.request = AsyncMock(side_effect=[draining, ok])
 
-            result = await client.post(
-                "/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1
-            )
+            with pytest.raises(WeaverAPIError, match="server_draining"):
+                await client.post("/api/v1/sampling-sessions/s1/sample", json={}, max_retries=1)
+
+            assert client._client.request.call_count == 1
+
+        asyncio.run(run())
+
+    def test_post_default_retries_retryable_503(self, config, monkeypatch):
+        monkeypatch.setattr(_async_http, "compute_retry_delay", lambda attempt: 0.0)
+
+        async def run():
+            draining = MagicMock()
+            draining.is_success = False
+            draining.status_code = 503
+            draining.content = b'{"error":"server_draining"}'
+            draining.text = "service temporarily unavailable"
+            draining.headers = {}
+            draining.json.return_value = {
+                "error": "server_draining",
+                "message": "service temporarily unavailable",
+                "retryable": True,
+            }
+            ok = _ok_response({"id": "op-1"})
+            client = AsyncAPIClient(config, max_retries=3)
+            client._client = MagicMock()
+            client._client.headers = {}
+            client._client.request = AsyncMock(side_effect=[draining, ok])
+
+            result = await client.post("/api/v1/sampling-sessions/s1/sample", json={})
 
             assert result == {"id": "op-1"}
             assert client._client.request.call_count == 2
