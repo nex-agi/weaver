@@ -37,6 +37,7 @@ from weaver._http import APIClient
 from weaver._payloads import (
     parse_logprob_tensors,
     prepare_forward_backward_operation,
+    prepare_forward_operation,
 )
 from weaver.async_training_client import AsyncTrainingClient, _build_training_payload
 from weaver.config import WeaverConfig
@@ -222,18 +223,173 @@ def test_http_binary_zstd_streams_one_compressed_pack():
         prepared.close()
 
 
-def test_http_binary_is_cross_entropy_only():
-    prepared = _prepare(transport="http-binary", compression="zstd", loss_fn="forward_logprob")
+@pytest.mark.parametrize("compression", ["raw", "zstd"])
+@pytest.mark.parametrize(
+    "loss_fn,fields",
+    [
+        ("cross_entropy", ["weights"]),
+        ("forward_logprob", ["weights"]),
+        ("importance_sampling", ["logprobs", "advantages", "loss_mask", "ref_logprobs"]),
+        ("truncated_importance_sampling", ["logprobs", "advantages", "loss_mask"]),
+        ("ppo_clip", ["logprobs", "advantages", "loss_mask"]),
+        (
+            "opd_kl_importance_sampling",
+            ["logprobs", "old_logprobs", "teacher_logprobs", "loss_mask"],
+        ),
+        ("opd_ppo_clip", ["logprobs", "teacher_logprobs", "advantages", "loss_mask"]),
+        ("surrogate", ["surrogate_weights"]),
+    ],
+)
+def test_http_binary_all_losses_match_inline_values(compression, loss_fn, fields):
+    inputs = {"target_tokens": torch.tensor([12, 13, 14], dtype=torch.int32)}
+    inputs.update(
+        {
+            name: torch.tensor(
+                [0.0, 1.0, 1.0] if name in {"weights", "loss_mask"} else [-0.1, 0.2, -0.3],
+                dtype=torch.float64,
+            )
+            for name in fields
+        }
+    )
+    datum = Datum(
+        model_input=_datum().model_input,
+        loss_fn_inputs=inputs,
+        datum_id="sample-1",
+        metadata={"router_replay": {"ref": "route-1"}},
+    )
+    builder = (
+        prepare_forward_operation
+        if loss_fn == "forward_logprob"
+        else prepare_forward_backward_operation
+    )
+    kwargs = dict(
+        model_id="model-1",
+        seq_id=7,
+        data=[datum],
+        loss_fn=loss_fn,
+        loss_fn_config=None,
+        request_metadata=None,
+    )
+    inline = builder(**kwargs, tensor_transport="default")
+    binary = builder(**kwargs, tensor_transport="http-binary", tensor_compression=compression)
+    try:
+        input_key = "forward_input" if loss_fn == "forward_logprob" else "forward_backward_input"
+        expected = inline.body["payload"][input_key]["data"][0]
+        actual = binary.body["payload"][input_key]["data"][0]
+        assert binary.tensor_pack is not None
+        assert binary.tensor_pack.codec == compression
+        assert binary.body["payload"]["tensor_transport"] == "http-binary"
+        assert binary.body["payload"]["tensor_compression"] == compression
+        decoded = binary.tensor_pack.path.read_bytes()
+        if compression == "zstd":
+            decoded = zstandard.ZstdDecompressor().decompress(
+                decoded, max_output_size=binary.tensor_pack.decoded_size_bytes
+            )
+        source = io.BytesIO(decoded)
+        tokens = actual["model_input"]["chunks"][0]["tokens"]
+        assert materialize_http_tensor(tokens, source).tolist() == [11, 12, 13]
+        for name, reference in actual["loss_fn_inputs"].items():
+            assert reference[TENSOR_KEY]["dtype"] == expected["loss_fn_inputs"][name]["dtype"]
+            tensor = materialize_http_tensor(reference, source)
+            assert tensor.tolist() == expected["loss_fn_inputs"][name]["data"]
+            assert list(tensor.shape) == [3]
+        assert actual["datum_id"] == expected["datum_id"]
+        assert actual["metadata"] == expected["metadata"]
+    finally:
+        inline.close()
+        binary.close()
 
-    assert prepared.tensor_pack is None
-    payload = prepared.body["payload"]
-    assert payload["tensor_transport"] == "http-binary"
-    assert payload["tensor_compression"] == "zstd"
-    assert payload["forward_backward_input"]["data"][0]["model_input"]["chunks"][0]["tokens"] == [
-        11,
-        12,
-        13,
-    ]
+
+@pytest.mark.parametrize("compression", ["raw", "zstd"])
+@pytest.mark.parametrize("ragged", [False, True])
+def test_http_binary_sampling_mask_preserves_mixed_fields(compression, ragged):
+    mask = [[12], [13, 21], [14]] if ragged else [[12, 20], [13, 21], [14, 22]]
+    datum = _datum()
+    datum.loss_fn_inputs["sampling_mask"] = mask if ragged else torch.tensor(mask)
+    prepared = _prepare(
+        transport="http-binary", compression=compression, loss_fn="forward_logprob", data=[datum]
+    )
+    try:
+        actual = prepared.body["payload"]["forward_backward_input"]["data"][0]
+        assert TENSOR_KEY in actual["model_input"]["chunks"][0]["tokens"]
+        assert TENSOR_KEY in actual["loss_fn_inputs"]["target_tokens"]
+        assert TENSOR_KEY in actual["loss_fn_inputs"]["weights"]
+        actual_mask = actual["loss_fn_inputs"]["sampling_mask"]
+        if ragged:
+            assert actual_mask == mask
+        else:
+            assert actual_mask[TENSOR_KEY]["shape"] == [3, 2]
+            assert actual_mask[TENSOR_KEY]["dtype"] == "int64"
+            decoded = prepared.tensor_pack.path.read_bytes()
+            if compression == "zstd":
+                decoded = zstandard.ZstdDecompressor().decompress(
+                    decoded, max_output_size=prepared.tensor_pack.decoded_size_bytes
+                )
+            assert materialize_http_tensor(actual_mask, io.BytesIO(decoded)).tolist() == mask
+    finally:
+        prepared.close()
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float64, torch.int32, torch.bool]
+)
+def test_http_binary_rl_field_dtype_matches_inline(dtype):
+    datum = _datum()
+    datum.loss_fn_inputs["loss_mask"] = torch.tensor([0, 1, 1], dtype=dtype)
+    expected = datum.to_payload()["loss_fn_inputs"]["loss_mask"]
+    prepared = _prepare(transport="http-binary", loss_fn="ppo_clip", data=[datum])
+    try:
+        reference = prepared.body["payload"]["forward_backward_input"]["data"][0]["loss_fn_inputs"][
+            "loss_mask"
+        ]
+        assert reference[TENSOR_KEY]["dtype"] == expected["dtype"]
+        with prepared.tensor_pack.path.open("rb") as source:
+            assert materialize_http_tensor(reference, source).tolist() == expected["data"]
+    finally:
+        prepared.close()
+
+
+@pytest.mark.parametrize(
+    "transport,compression", [("default", "raw"), ("http-binary", "raw"), ("http-binary", "zstd")]
+)
+@pytest.mark.parametrize("invalid_token", [True, 12.5, -1])
+def test_mutated_input_tokens_are_rejected_for_all_transports(
+    transport, compression, invalid_token
+):
+    datum = _datum()
+    datum.model_input.chunks[0].tokens[1] = invalid_token
+    with pytest.raises(ValueError, match="model input tokens must be"):
+        _prepare(
+            transport=transport, compression=compression, loss_fn="forward_logprob", data=[datum]
+        )
+
+
+@pytest.mark.parametrize("compression", ["raw", "zstd"])
+def test_http_binary_empty_and_scalar_extra_tensors_roundtrip(compression):
+    datum = _datum()
+    datum.loss_fn_inputs.update(
+        empty_extra=torch.empty((0, 2), dtype=torch.float32),
+        scalar_extra=torch.tensor(0.5, dtype=torch.float64),
+    )
+    expected = datum.to_payload()["loss_fn_inputs"]
+    prepared = _prepare(
+        transport="http-binary", compression=compression, loss_fn="forward_logprob", data=[datum]
+    )
+    try:
+        refs = prepared.body["payload"]["forward_backward_input"]["data"][0]["loss_fn_inputs"]
+        decoded = prepared.tensor_pack.path.read_bytes()
+        if compression == "zstd":
+            decoded = zstandard.ZstdDecompressor().decompress(
+                decoded, max_output_size=prepared.tensor_pack.decoded_size_bytes
+            )
+        source = io.BytesIO(decoded)
+        for name, shape in [("empty_extra", [0, 2]), ("scalar_extra", []), ("target_tokens", [3])]:
+            actual = materialize_http_tensor(refs[name], source)
+            assert list(actual.shape) == shape
+            assert refs[name][TENSOR_KEY]["dtype"] == expected[name]["dtype"]
+            assert actual.tolist() == expected[name]["data"]
+    finally:
+        prepared.close()
 
 
 def test_http_binary_rejects_protocol_limit_before_upload(monkeypatch):
@@ -1189,7 +1345,30 @@ def test_async_custom_loss_downloads_one_operation_pack():
     asyncio.run(exercise())
 
 
-def test_cancelled_async_payload_build_removes_eventual_temp_pack(tmp_path):
+@pytest.mark.parametrize("loss_fn", ["cross_entropy", "forward_logprob", "ppo_clip"])
+def test_async_binary_payload_build_uses_worker_thread(loss_fn):
+    async def exercise():
+        loop_thread = threading.get_ident()
+        threads = []
+
+        def builder(**kwargs):
+            threads.append(threading.get_ident())
+            return _prepare(transport=kwargs["tensor_transport"], loss_fn=kwargs["loss_fn"])
+
+        prepared = await _build_training_payload(
+            builder, loss_fn=loss_fn, tensor_transport="http-binary"
+        )
+        try:
+            assert prepared.tensor_pack is not None
+            assert threads and threads[0] != loop_thread
+        finally:
+            prepared.close()
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("loss_fn", ["cross_entropy", "forward_logprob", "ppo_clip"])
+def test_cancelled_async_payload_build_removes_eventual_temp_pack(tmp_path, loss_fn):
     started = threading.Event()
     release = threading.Event()
     pack_path = tmp_path / "cancelled-pack.bin"
@@ -1207,7 +1386,7 @@ def test_cancelled_async_payload_build_removes_eventual_temp_pack(tmp_path):
         task = asyncio.create_task(
             _build_training_payload(
                 builder,
-                loss_fn="cross_entropy",
+                loss_fn=loss_fn,
                 tensor_transport="http-binary",
             )
         )

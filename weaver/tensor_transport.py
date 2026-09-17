@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Binary transport for dense cross-entropy training tensors."""
+"""Binary transport for dense training tensors."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ import zstandard
 from .config import TensorCompression, TensorTransport
 from .types import Datum
 from .types.datum import normalize_mixed_datum_ids, validate_sample_ref_loss_inputs
-from .types.tensor import TensorData, tensor_payload
+from .types.tensor import TensorData, _coerce_tensor
 
 TENSOR_KEY = "$tensor"
 _RAW_CODEC = "raw"
@@ -169,7 +169,7 @@ class _PackWriter:
         if dtype_name is None:
             raise TypeError(f"unsupported dtype for tensor transport: {tensor.dtype}")
         array = tensor.detach().cpu().contiguous().numpy()
-        raw = memoryview(array).cast("B")  # type: ignore[arg-type]
+        raw = memoryview(array).cast("B") if array.size else memoryview(b"")  # type: ignore[arg-type]
 
         offset = self._offset
         size_bytes = raw.nbytes
@@ -225,11 +225,11 @@ def serialize_training_data(
     transport: TensorTransport,
     compression: TensorCompression = "zstd",
 ) -> SerializedTrainingData:
-    """Serialize datums, optimizing dense cross-entropy tensors only."""
+    """Pack dense tensors; retain ragged fields and metadata inline."""
 
     normalized_data = normalize_mixed_datum_ids(data)
     validate_sample_ref_loss_inputs(normalized_data, loss_fn)
-    if loss_fn != "cross_entropy" or transport == "default":
+    if transport == "default":
         return SerializedTrainingData([datum.to_payload() for datum in normalized_data])
 
     if all(datum.is_sample_ref for datum in normalized_data):
@@ -245,21 +245,19 @@ def serialize_training_data(
             assert datum.model_input is not None
             chunks: list[dict[str, Any]] = []
             for chunk in datum.model_input.chunks:
+                # Mutable token lists must not silently truncate floats or coerce booleans.
+                if any(type(token) is not int or token < 0 for token in chunk.tokens):
+                    chunk.__post_init__()
                 tokens = torch.as_tensor(chunk.tokens, dtype=torch.int64)
                 chunks.append({"type": chunk.type, "tokens": writer.put_tensor(tokens)})
 
             loss_inputs: dict[str, Any] = {}
             for name, value in datum.loss_fn_inputs.items():
-                if name in {"target_tokens", "weights"} and isinstance(
-                    value, (torch.Tensor, TensorData)
-                ):
-                    tensor = value if isinstance(value, torch.Tensor) else value.to_tensor()
-                    wire_dtype = torch.int64 if name == "target_tokens" else torch.float32
-                    loss_inputs[name] = writer.put_tensor(tensor.to(dtype=wire_dtype))
-                elif isinstance(value, TensorData):
-                    loss_inputs[name] = value.to_dict()
+                if isinstance(value, TensorData):
+                    loss_inputs[name] = writer.put_tensor(value.to_tensor())
                 elif isinstance(value, torch.Tensor):
-                    loss_inputs[name] = tensor_payload(value).to_dict()
+                    # Match inline JSON's dtype normalization without making Python lists.
+                    loss_inputs[name] = writer.put_tensor(_coerce_tensor(value))
                 else:
                     loss_inputs[name] = value
             datum_payload: dict[str, Any] = {
