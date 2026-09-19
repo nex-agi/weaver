@@ -32,6 +32,7 @@ from .tensor_transport import (
     result_tensor_pack_metadata,
     result_uses_http_tensor_pack,
 )
+from .types.metrics import MetricObservations
 
 if TYPE_CHECKING:
     from ._async_http import AsyncAPIClient
@@ -140,6 +141,11 @@ class _OperationHandleMixin:
         if self._response_cache is not _RESPONSE_UNSET:
             return self._response_cache
         return lookup_case_insensitive(self._cached, "response")
+
+    @property
+    def metric_observations(self) -> MetricObservations | None:
+        """Decode cached observations without IO; available after refresh/result."""
+        return MetricObservations.from_response(self.response)
 
     def _cache_response(self, response: Any) -> None:
         self._response_cache = response
