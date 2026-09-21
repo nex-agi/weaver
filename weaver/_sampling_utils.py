@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from transformers import PreTrainedTokenizer
 
 from ._utils import lookup_case_insensitive
+from .score_centering import SAMPLER_FIELDS
 from .types import LogprobsParams, ModelInput, SamplingParams
 from .types.sampling_control import coerce_pause_mode
 
@@ -54,8 +55,22 @@ def build_sample_body(
     return_sampling_mask: bool,
     return_old_logprob: bool,
     return_moe_topk_indices: bool,
+    topk_output_logprobs: int = 0,
 ) -> Dict[str, Any]:
     params = sampling_params or SamplingParams()
+    if type(topk_output_logprobs) is not int or not 0 <= topk_output_logprobs <= 128:
+        raise ValueError("topk_output_logprobs must be an integer between 0 and 128")
+    if topk_output_logprobs:
+        if params.temperature != 1 or params.top_p != 1 or params.top_k != -1:
+            raise ValueError("topk_output_logprobs requires temperature=1, top_p=1, top_k=-1")
+        if return_sampling_mask or return_old_logprob or return_moe_topk_indices:
+            raise ValueError(
+                "topk_output_logprobs does not yet support sampling masks, old logprobs or router replay"
+            )
+        if include_prompt_logprobs or topk_prompt_logprobs:
+            raise ValueError(
+                "topk_output_logprobs is decode-only; prompt logprobs must be disabled"
+            )
     body: Dict[str, Any] = {
         "prompt": sampling_prompt_payload(prompt),
         "sampling_params": params.to_payload(),
@@ -63,6 +78,8 @@ def build_sample_body(
         "prompt_logprobs": include_prompt_logprobs,
         "topk_prompt_logprobs": topk_prompt_logprobs,
     }
+    if topk_output_logprobs:
+        body["topk_output_logprobs"] = topk_output_logprobs
     if return_sampling_mask:
         body["return_sampling_mask"] = True
     if return_old_logprob:
@@ -244,6 +261,9 @@ def sequences_from_result(
                 sequence["moe_topk_indices_ref"] = raw["moe_topk_indices_ref"]
             elif "moe_topk_indices" in raw and raw["moe_topk_indices"] is not None:
                 sequence["moe_topk_indices"] = raw["moe_topk_indices"]
+            for field in SAMPLER_FIELDS:
+                if field in raw:
+                    sequence[field] = raw[field]
             weight_version = lookup_case_insensitive(raw, "weight_version")
             if weight_version is not None:
                 sequence["weight_version"] = weight_version

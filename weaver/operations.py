@@ -23,7 +23,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Mapping, Optional
 
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
@@ -123,6 +123,8 @@ class WeaverOperationError(RuntimeError):
 
 
 class _OperationHandleMixin:
+    _result_validator: Optional[Callable[[Any], None]] = None
+
     """Pure (IO-free) status accessors shared by sync and async handles."""
 
     operation_id: str
@@ -269,7 +271,11 @@ class OperationHandle(_OperationHandleMixin):
 
     def result(self) -> Any:
         self.wait()
-        return self.response
+        result = self.response
+        validator = getattr(self, "_result_validator", None)
+        if validator is not None:
+            validator(result)
+        return result
 
     @classmethod
     def wait_all(cls, handles: List["OperationHandle"]) -> List[Any]:
@@ -388,7 +394,11 @@ class AsyncOperationHandle(_OperationHandleMixin):
 
     async def result(self) -> Any:
         await self.wait()
-        return self.response
+        result = self.response
+        validator = getattr(self, "_result_validator", None)
+        if validator is not None:
+            validator(result)
+        return result
 
     def __await__(self):
         return self.result().__await__()

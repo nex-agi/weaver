@@ -1,0 +1,62 @@
+# Copyright (c) Nex-AGI. All rights reserved.
+"""Validation of rollout-time distributions used by score centering."""
+
+from __future__ import annotations
+
+import math
+from typing import Any
+
+SCHEMA = "behavior/unfiltered/v1"
+SAMPLER_FIELDS = (
+    "sampler_logprobs",
+    "sampler_topk_ids",
+    "sampler_topk_logprobs",
+    "sampler_topk_mask",
+    "sampler_distribution",
+)
+
+
+def validate_sampler_sequence(sequence: dict[str, Any], k: int) -> None:
+    """Reject missing/truncated distributions rather than silently disabling SC."""
+    if not isinstance(sequence, dict):
+        raise ValueError("Sampler sequence must be an object")
+    if any(key not in sequence for key in SAMPLER_FIELDS):
+        raise ValueError("Sampler does not support topk_output_logprobs: missing sampler fields")
+    distribution = sequence["sampler_distribution"]
+    if not isinstance(distribution, dict) or distribution.get("schema") != SCHEMA:
+        raise ValueError("Unsupported sampler_distribution schema")
+    tokens = sequence.get("tokens", [])
+    for key in SAMPLER_FIELDS[:-1]:
+        if not isinstance(sequence[key], list) or len(sequence[key]) != len(tokens):
+            raise ValueError(f"{key} must align with generated tokens")
+    for index, token in enumerate(tokens):
+        ids = sequence["sampler_topk_ids"][index]
+        probs = sequence["sampler_topk_logprobs"][index]
+        mask = sequence["sampler_topk_mask"][index]
+        if any(not isinstance(row, list) or len(row) != k for row in (ids, probs, mask)):
+            raise ValueError("Sampler top-k width differs from the requested width")
+        if any(type(v) is not int or v < 0 for v in ids) or len(set(ids)) != k:
+            raise ValueError("Sampler top-k IDs must be unique nonnegative integers")
+        if any(v != 1 for v in mask):
+            raise ValueError("Unfiltered sampler head mask must be all ones")
+        sampled = sequence["sampler_logprobs"][index]
+        if any(
+            isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v > 0
+            for v in [sampled, *probs]
+        ):
+            raise ValueError("Sampler log probabilities must be finite and nonpositive")
+        if sum(math.exp(v) for v in probs) > 1 + 1e-5:
+            raise ValueError("Sampler head probability mass exceeds one")
+        if token in ids and abs(probs[ids.index(token)] - sampled) > 1e-4:
+            raise ValueError("Sampler head and sampled-token probabilities disagree")
+
+
+def validate_sampler_result(payload: Any, k: int) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError("Sampler result must be an object")
+    result = payload.get("result", payload)
+    sequences = result.get("sequences") if isinstance(result, dict) else None
+    if not isinstance(sequences, list) or not sequences:
+        raise ValueError("Sampler result is missing sequences for topk_output_logprobs")
+    for sequence in sequences:
+        validate_sampler_sequence(sequence, k)
