@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
+from ._wandb_metrics import WandbMetricView
 from .types.metrics import MetricObservations
 
 logger = logging.getLogger(__name__)
@@ -92,7 +93,7 @@ class MetricPersistence:
         self._persisted_operations: set[str] = set()
         self._wandb_run: Any = None
         self._owns_wandb_run = False
-        self._defined_metrics: set[str] = set()
+        self._wandb_view: WandbMetricView | None = None
 
     def persist(self, operation_id: str, response: Any) -> None:
         """Persist one completion; failures are visible without changing its result."""
@@ -127,8 +128,8 @@ class MetricPersistence:
             record: dict[str, Any] = {
                 "operation_id": operation_id,
                 "model_id": observations.model_id,
-                "attempt": observations.attempt,
-                "epoch": observations.epoch,
+                "step": observations.attempt,
+                "trainer_run_id": observations.epoch,
                 "counter_scope": observations.counter_scope,
                 "name": point.name,
                 "status": point.status,
@@ -187,33 +188,14 @@ class MetricPersistence:
         return self._wandb_run
 
     def _persist_wandb(self, operation_id: str, observations: MetricObservations) -> None:
-        available = [p for p in observations.points if p.status == "ok"]
-        if not available:
+        if not observations.points:
             return
         run = self._ensure_wandb_run()
-        # Model and process epoch are part of series identity: attempts restart
-        # on trainer restart, and different adapters have independent counters.
-        prefix = f"weaver/{_safe_component(observations.model_id)}/{_safe_component(observations.epoch or 'unknown')}"
-        if observations.attempt is None:
-            prefix += "/forward_only"
-            axis, step = f"{prefix}/operation_index", len(self._persisted_operations) + 1
-        else:
-            axis, step = f"{prefix}/attempt", observations.attempt
-        values: dict[str, Any] = {axis: step, f"{prefix}/operation_id": operation_id}
-        for point in available:
-            key = f"{prefix}/{point.name}"
-            for label, value in sorted(point.labels.items()):
-                # Correlation IDs change every batch: keeping them in chart
-                # names creates one new series per operation instead of a curve.
-                if label != "batch_id":
-                    key += f"/{_safe_component(label)}={_safe_component(value)}"
-            if key not in self._defined_metrics and not isinstance(point.value, str):
-                run.define_metric(key, step_metric=axis, step_sync=False)
-                self._defined_metrics.add(key)
-            values[key] = point.value
+        if self._wandb_view is None:
+            self._wandb_view = WandbMetricView(run)
         # NexRL supplies explicit step=N itself. Advancing its implicit W&B
         # history here would cause subsequent NexRL log(step=N) calls to drop.
-        run.log(values, commit=self._owns_wandb_run)
+        self._wandb_view.log(operation_id, observations, commit=self._owns_wandb_run)
 
     def close(self) -> None:
         """Flush only an SDK-owned W&B run; never finish a caller/NexRL run."""

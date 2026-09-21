@@ -21,6 +21,15 @@ from weaver import AsyncOperationHandle, OperationHandle
 from weaver.metric_persistence import MetricPersistence
 
 
+class FakeConfig(dict):
+    def update(self, values, **_kwargs):
+        super().update(values)
+
+
+def fake_table(**kwargs):
+    return {"_type": "table", **kwargs}
+
+
 def response():
     return {
         "metric_observations": {
@@ -65,8 +74,8 @@ def test_local_metrics_are_partitioned_by_model_and_metric(tmp_path):
     assert json.loads(loss_file.read_text()) == {
         "operation_id": "operation-1",
         "model_id": "model-a",
-        "attempt": 4,
-        "epoch": "epoch-a",
+        "step": 4,
+        "trainer_run_id": "epoch-a",
         "counter_scope": "trainer_lifetime",
         "name": "loss/task",
         "status": "ok",
@@ -86,6 +95,7 @@ def test_wandb_link_logs_scalar_points(monkeypatch, tmp_path):
         entity = "entity"
         project = "project"
         settings = SimpleNamespace(base_url="https://api.wandb.ai", mode="online")
+        config = FakeConfig()
 
         def define_metric(self, *args, **kwargs):
             pass
@@ -98,6 +108,7 @@ def test_wandb_link_logs_scalar_points(monkeypatch, tmp_path):
         Settings=lambda **kwargs: SimpleNamespace(**kwargs),
         login=lambda **kwargs: calls.append((kwargs, True)),
         init=lambda **kwargs: (calls.append((kwargs, True)) or Run()),
+        Table=fake_table,
     )
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
@@ -111,8 +122,9 @@ def test_wandb_link_logs_scalar_points(monkeypatch, tmp_path):
     assert init_call["project"] == "project"
     assert init_call["reinit"] is False  # W&B 0.19.8 accepts booleans, not string modes.
     logged = calls[-1][0]
-    assert any(key.endswith("/loss/task/scope=operation") for key in logged)
-    assert any(key.endswith("/grad/norm/per_layer/layer=decoder%2F1") for key in logged)
+    assert logged["loss/task"] == 1.25
+    assert logged["grad/norm/per_layer/decoder/1"] == 2.5
+    assert "metrics/status" in logged
     assert not any("params/norm/total" in key for key in logged)
     assert calls[-1][1] is True
 
@@ -189,6 +201,7 @@ def test_wandb_link_uses_matching_active_run_without_finishing_it(monkeypatch, t
         entity = "entity"
         project = "project"
         settings = SimpleNamespace(base_url="https://api.wandb.ai", mode="online")
+        config = FakeConfig()
 
         def define_metric(self, *args, **kwargs):
             pass
@@ -200,7 +213,7 @@ def test_wandb_link_uses_matching_active_run_without_finishing_it(monkeypatch, t
             calls.append(("finish", True))
 
     active = Run()
-    fake_wandb = SimpleNamespace(run=active)
+    fake_wandb = SimpleNamespace(run=active, Table=fake_table)
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
 
     sink = MetricPersistence(

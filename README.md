@@ -96,9 +96,36 @@ with ServiceClient(
 W&B support is optional (`pip install nex-weaver[wandb]`); version 0.19.8 is supported.
 The run URL identifies the destination, not the credentials. Configure a W&B API
 key via `WANDB_API_KEY` (or `WANDB_KEY`) or an existing W&B login. A self-hosted
-run URL selects that server. Only available observations are published to W&B;
-local JSONL also retains unavailable statuses. Use the client as a context
+run URL selects that server. Use the client as a context
 manager, or close it explicitly, to flush an SDK-owned W&B run.
+
+**Local record fields:** `step` is the model's training-step counter in this
+trainer run, including skipped optimizer updates. Sampled metrics can have gaps
+(for example, steps 5, 10, 15). It is not a count of successful updates.
+`trainer_run_id` identifies the trainer lifetime so that step 5 before a restart
+is not confused with step 5 afterward. It is an opaque ID, **not a dataset epoch**.
+Use `(model_id, trainer_run_id, step)` to identify a training window and
+`operation_id` to distinguish its forward/backward and optimizer results.
+Forward-only results have `step: null`. The server wire names remain `attempt`
+and `epoch`; older local files also use those names. Existing files are not rewritten.
+
+**W&B presentation:** scalar charts use names such as `grad/norm/total` and the
+`step` axis. Booleans become 0/1 for plotting; local records retain booleans.
+Reasons and unavailable statuses appear in `metrics/status`, a table—not broken
+scalar/media panels. Descriptive labels and model/run IDs live in W&B run config,
+not chart titles. Additional models/restarts get short `model_2/` or `restart_2/`
+prefixes to prevent mixing independent counters.
+
+Per-layer diagnostics use ordinary scalar time-series, for example
+`grad/norm/per_layer/decoder/0`, rather than custom snapshot charts. Router expert
+counts use one native W&B histogram per layer: bin `[i, i+1)` identifies expert
+`i`, and its height is that expert's assignment count. This is not a histogram
+of count values, which would lose expert identity. W&B 0.19.8 allows at most 512
+bins; oversized, incomplete or ambiguous observations remain in a table instead
+of being dropped, merged or filled with invented zeros. No plotting library is
+required. Local JSONL retains all original scalar observations and labels.
+Use a fresh W&B run when changing chart layouts; existing runs/panels are not
+silently rewritten.
 
 ## Quickstart
 
