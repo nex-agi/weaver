@@ -75,6 +75,31 @@ public response shape automatically. `Datum` construction, training calls, and r
 handling therefore do not need to change. Keep the `default` transport when connecting
 to an older Weaver server/trainer deployment that does not support binary tensor packs.
 
+### Trainer metric persistence
+
+Completed v1 metric observations are persisted by the SDK in JSONL by default.
+`metrics_path=None` selects `./weaver/.logs`, while an explicit path selects a
+different parent directory. The layout is
+`metrics-<model-id>/<metric path>/observations.jsonl`. To publish the same
+observations to an existing W&B run, pass its run URL as `wandb_link`; the SDK
+uses a matching active run in the current process when one already exists and
+never finishes a caller-owned run.
+
+```python
+with ServiceClient(
+    wandb_link="https://wandb.ai/<entity>/<project>/runs/<run-id>",
+    metrics_path=None,  # local persistence remains enabled at ./weaver/.logs
+) as client:
+    ...
+```
+
+W&B support is optional (`pip install nex-weaver[wandb]`); version 0.19.8 is supported.
+The run URL identifies the destination, not the credentials. Configure a W&B API
+key via `WANDB_API_KEY` (or `WANDB_KEY`) or an existing W&B login. A self-hosted
+run URL selects that server. Only available observations are published to W&B;
+local JSONL also retains unavailable statuses. Use the client as a context
+manager, or close it explicitly, to flush an SDK-owned W&B run.
+
 ## Quickstart
 
 ```python

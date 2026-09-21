@@ -84,6 +84,7 @@ from ._safeio import (
 from ._utils import extract_id, lookup_case_insensitive, optional_scope_id
 from .config import TensorCompression, TensorTransport, WeaverConfig
 from .managed_dataset_client import ManagedDatasetsClient
+from .metric_persistence import MetricPersistence
 from .operations import OperationHandle, build_operation_handle
 from .tensor_transport import TensorPack
 from .types import LoraConfig
@@ -123,6 +124,8 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         heartbeat_interval: float = 30.0,
         tensor_transport: TensorTransport | None = None,
         tensor_compression: TensorCompression | None = None,
+        wandb_link: str | None = None,
+        metrics_path: str | os.PathLike[str] | None = None,
     ) -> None:
         """Initialize ServiceClient.
 
@@ -143,6 +146,10 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                 ``WEAVER_TENSOR_TRANSPORT`` or ``"default"``.
             tensor_compression: HTTP tensor-pack compression. Defaults to
                 ``WEAVER_TENSOR_COMPRESSION`` or ``"zstd"``.
+            wandb_link: Optional existing W&B run URL/URI for trainer metrics.
+            metrics_path: Parent directory for client-side metric JSONL. None uses
+                ./weaver/.logs relative to the client construction directory;
+                it does not disable storage. Files are created on first metrics.
         """
         self._config = WeaverConfig.from_env(
             base_url=base_url,
@@ -160,6 +167,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         self._project_reference = optional_scope_id(project, "WEAVER_PROJECT")
         self._session_user_metadata = dict(user_metadata or {})
         self._heartbeat_interval = heartbeat_interval
+        self._metric_persistence = MetricPersistence(local_path=metrics_path, wandb_link=wandb_link)
 
         self._http: APIClient | None = None
         self._session: Dict[str, Any] | None = None
@@ -207,6 +215,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
 
         if self._http is None:
             self._http = APIClient(self._config)
+            self._http.metric_sink = self._metric_persistence
             atexit.register(self.close)
         if not ensure_session or self._session is not None:
             return
@@ -259,6 +268,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         if self._http is not None:
             self._http.close()
         self._http = None
+        self._metric_persistence.close()
 
     def ensure_session(
         self,
