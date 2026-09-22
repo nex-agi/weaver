@@ -30,3 +30,22 @@ Both sync and async clients return these fields. When preparing training data,
 align the generated-token statistics with the corresponding target-token
 positions and exclude prompt positions from the loss mask. Training requests
 support the default JSON and http-binary transports, with raw or zstd encoding.
+
+For large training inputs, enable compressed binary tensors when creating the
+service client:
+
+```python
+service = weaver.ServiceClient(
+    tensor_transport="http-binary",
+    tensor_compression="zstd",
+)
+```
+
+The equivalent environment variables are `WEAVER_TENSOR_TRANSPORT=http-binary`
+and `WEAVER_TENSOR_COMPRESSION=zstd`. These settings apply to training tensors;
+top-k sampling results currently return as JSON arrays.
+
+Each training tensor pack is limited to 8 GiB both before and after compression.
+Budget for token IDs, masks, and other inputs as well as log probabilities.
+Compression reduces transfer size but does not reduce the decoded tensor size
+or automatically split a large batch into smaller requests.
