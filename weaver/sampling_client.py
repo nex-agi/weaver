@@ -61,6 +61,7 @@ class SamplingClient:
         topk_output_logprobs: int = 0,
         sampler_distribution_transport: str = "inline",
         return_sampling_mask: bool = False,
+        sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
         wait: bool = True,
@@ -74,6 +75,7 @@ class SamplingClient:
             topk_output_logprobs=topk_output_logprobs,
             sampler_distribution_transport=sampler_distribution_transport,
             return_sampling_mask=return_sampling_mask,
+            sampling_mask_transport=sampling_mask_transport,
             return_old_logprob=return_old_logprob,
             return_moe_topk_indices=return_moe_topk_indices,
         )
@@ -84,9 +86,15 @@ class SamplingClient:
         if topk_output_logprobs:
             from .score_centering import validate_sampler_result
 
-            handle._result_validator = lambda result: validate_sampler_result(
-                result, topk_output_logprobs, sampler_distribution_transport
+            handle._result_validator = (  # pylint: disable=protected-access
+                lambda result: validate_sampler_result(
+                    result, topk_output_logprobs, sampler_distribution_transport
+                )
             )
+        if sampling_mask_transport == "ref":
+            from .sampling_masks import validate_mask_result
+
+            handle._result_validator = validate_mask_result  # pylint: disable=protected-access
         if not wait:
             return handle
         raw_result = handle.result()
@@ -94,6 +102,8 @@ class SamplingClient:
             validate_sampler_result(
                 raw_result, topk_output_logprobs, sampler_distribution_transport
             )
+        if sampling_mask_transport == "ref":
+            validate_mask_result(raw_result)
         return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)  # type: ignore[return-value]
 
     def compute_logprobs(

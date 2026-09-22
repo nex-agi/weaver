@@ -57,13 +57,22 @@ def build_sample_body(
     return_moe_topk_indices: bool,
     topk_output_logprobs: int = 0,
     sampler_distribution_transport: str = "inline",
+    sampling_mask_transport: str = "inline",
 ) -> Dict[str, Any]:
+    if sampling_mask_transport not in ("inline", "ref"):
+        raise ValueError("sampling_mask_transport must be inline or ref")
+    if sampling_mask_transport == "ref" and not return_sampling_mask:
+        raise ValueError("sampling mask refs require return_sampling_mask=True")
     params = sampling_params or SamplingParams()
     if sampler_distribution_transport not in ("inline", "ref"):
         raise ValueError("sampler_distribution_transport must be inline or ref")
     if sampler_distribution_transport == "ref" and not topk_output_logprobs:
         raise ValueError("distribution refs require topk_output_logprobs > 0")
-    if type(topk_output_logprobs) is not int or not 0 <= topk_output_logprobs <= 128:
+    if (
+        not isinstance(topk_output_logprobs, int)
+        or isinstance(topk_output_logprobs, bool)
+        or not 0 <= topk_output_logprobs <= 128
+    ):
         raise ValueError("topk_output_logprobs must be an integer between 0 and 128")
     if topk_output_logprobs:
         if params.temperature != 1 or params.top_p != 1 or params.top_k != -1:
@@ -88,6 +97,8 @@ def build_sample_body(
         body["sampler_distribution_transport"] = sampler_distribution_transport
     if return_sampling_mask:
         body["return_sampling_mask"] = True
+        if sampling_mask_transport == "ref":
+            body["sampling_mask_transport"] = "ref"
     if return_old_logprob:
         body["return_old_logprob"] = True
     if return_moe_topk_indices:
@@ -256,6 +267,8 @@ def sequences_from_result(
                 sequence["old_logprobs"] = raw["old_logprobs"]
             if "sampling_masks" in raw and raw["sampling_masks"] is not None:
                 sequence["sampling_masks"] = raw["sampling_masks"]
+            if "sampling_mask_ref" in raw:
+                sequence["sampling_mask_ref"] = raw["sampling_mask_ref"]
             # The server offloads the large routing-index tensor to a GPFS
             # safetensors shard and returns an opaque ref instead of the inline
             # array; surface it verbatim so NexRL can attach it as a datum ref
