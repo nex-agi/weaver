@@ -62,10 +62,10 @@ def test_sync_sampling_preserves_distribution_and_opt_in():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"topk_output_logprobs": True},
-        {"topk_output_logprobs": 129},
-        {"sampling_params": SamplingParams(temperature=0)},
-        {"sampling_params": SamplingParams(top_p=0.9)},
+        {"sampling_params": SamplingParams(score_centering={"head_size": True})},
+        {"sampling_params": SamplingParams(score_centering={"head_size": 129})},
+        {"sampling_params": SamplingParams(temperature=0, score_centering={"head_size": 2})},
+        {"sampling_params": SamplingParams(top_p=0.9, score_centering={"head_size": 2})},
         {"return_old_logprob": True},
         {"include_prompt_logprobs": True},
     ],
@@ -74,7 +74,10 @@ def test_invalid_request_fails_before_enqueue(kwargs):
     service = MagicMock()
     client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
     with pytest.raises(ValueError):
-        client.sample(prompt=ModelInput.from_ints([1]), **({"topk_output_logprobs": 2} | kwargs))
+        client.sample(
+            prompt=ModelInput.from_ints([1]),
+            **({"sampling_params": SamplingParams(score_centering={"head_size": 2})} | kwargs),
+        )
     service.enqueue_operation.assert_not_called()
 
 
@@ -120,7 +123,10 @@ def test_async_normalization():
     service.enqueue_operation = AsyncMock(return_value=handle)
     client = AsyncSamplingClient(service=service, sampling_session_id="s", base_model="m")
     result = asyncio.run(
-        client.sample(prompt=ModelInput.from_ints([1]), score_centering={"head_size": 2})
+        client.sample(
+            prompt=ModelInput.from_ints([1]),
+            sampling_params=SamplingParams(score_centering={"head_size": 2}),
+        )
     )
     assert result["sequences"][0]["sampler_topk_ids"] == sequence()["sampler_topk_ids"]
 
@@ -175,8 +181,7 @@ def test_ref_sampling_preserves_opaque_handle(async_mode):
     payload = {"sequences": [ref_sequence()]}
     kwargs = dict(
         prompt=ModelInput.from_ints([1, 2]),
-        topk_output_logprobs=2,
-        sampler_distribution_transport="ref",
+        sampling_params=SamplingParams(score_centering={"head_size": 2, "transport": "ref"}),
     )
     if async_mode:
         handle.result = AsyncMock(return_value=payload)
@@ -215,8 +220,8 @@ def test_sc_options_are_independent_of_sampling_params():
     from weaver import _sampling_utils as su
     from weaver.types import SamplingParams, ScoreCenteringConfig
 
-    params = SamplingParams(temperature=1, top_p=1, top_k=-1)
     config = ScoreCenteringConfig(head_size=128, transport="ref")
+    params = SamplingParams(temperature=1, top_p=1, top_k=-1, score_centering=config)
     body = su.build_sample_body(
         prompt=ModelInput.from_ints([1]),
         sampling_params=params,
@@ -226,7 +231,6 @@ def test_sc_options_are_independent_of_sampling_params():
         return_sampling_mask=False,
         return_old_logprob=False,
         return_moe_topk_indices=False,
-        score_centering=config,
     )
     assert body["score_centering"] == config
     assert body["sampling_params"]["top_k"] == -1
@@ -250,16 +254,6 @@ def test_sc_options_validation(config):
     with pytest.raises(ValueError):
         client.sample(
             prompt=ModelInput.from_ints([1]), sampling_params=SamplingParams(score_centering=config)
-        )
-
-
-def test_reject_mixed_sc_option_versions():
-    client = SamplingClient(service=MagicMock(), sampling_session_id="s")
-    with pytest.raises(ValueError, match="legacy"):
-        client.sample(
-            prompt=ModelInput.from_ints([1]),
-            score_centering={"head_size": 2},
-            topk_output_logprobs=2,
         )
 
 
@@ -301,15 +295,14 @@ def test_sampling_params_collects_sc_without_mutation(async_mode, transport):
         {"sampler_distribution_transport": "ref"},
     ],
 )
-def test_sampling_params_rejects_duplicate_sc_options(legacy):
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_sample_rejects_removed_sc_keywords(legacy, async_mode):
     service = MagicMock()
     client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
-    with pytest.raises(ValueError):
-        client.sample(
-            prompt=ModelInput.from_ints([1]),
-            sampling_params=SamplingParams(score_centering={"head_size": 2}),
-            **legacy,
-        )
+    if async_mode:
+        client = AsyncSamplingClient(service=service, sampling_session_id="s", base_model="m")
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        client.sample(prompt=ModelInput.from_ints([1]), **legacy)
     service.enqueue_operation.assert_not_called()
 
 

@@ -80,6 +80,5 @@ held constant during differentiation. Bounds must be finite and positive,
 and `mis_min` must not exceed `mis_max`.
 
 `weaver.types.ScoreCenteringConfig` provides type hints for this dictionary.
-Unknown configuration keys are rejected. The earlier experimental request-level
-`score_centering`, `topk_output_logprobs` and `sampler_distribution_transport`
-keywords remain compatibility aliases. Use only one configuration form per request.
+Unknown configuration keys are rejected. Configure score centering only through
+`SamplingParams.score_centering`.
