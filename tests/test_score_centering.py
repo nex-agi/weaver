@@ -45,7 +45,10 @@ def test_sync_sampling_preserves_distribution_and_opt_in():
     service = MagicMock()
     service.enqueue_operation.return_value.result.return_value = {"sequences": [sequence()]}
     client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
-    result = client.sample(prompt=ModelInput.from_ints([1, 2]), score_centering={"head_size": 2})
+    result = client.sample(
+        prompt=ModelInput.from_ints([1, 2]),
+        sampling_params=SamplingParams(score_centering={"head_size": 2}),
+    )
     assert service.enqueue_operation.call_args.args[1]["score_centering"] == {
         "head_size": 2,
         "transport": "inline",
@@ -88,7 +91,9 @@ def test_deferred_operation_cannot_silently_accept_old_server(async_mode):
 
         async def run():
             pending = await client.sample(
-                prompt=ModelInput.from_ints([1]), score_centering={"head_size": 2}, wait=False
+                prompt=ModelInput.from_ints([1]),
+                sampling_params=SamplingParams(score_centering={"head_size": 2}),
+                wait=False,
             )
             with pytest.raises(ValueError, match="missing sampler fields"):
                 await pending.result()
@@ -100,7 +105,9 @@ def test_deferred_operation_cannot_silently_accept_old_server(async_mode):
         service.enqueue_operation.return_value = handle
         client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
         pending = client.sample(
-            prompt=ModelInput.from_ints([1]), score_centering={"head_size": 2}, wait=False
+            prompt=ModelInput.from_ints([1]),
+            sampling_params=SamplingParams(score_centering={"head_size": 2}),
+            wait=False,
         )
         with pytest.raises(ValueError, match="missing sampler fields"):
             pending.result()
@@ -241,7 +248,9 @@ def test_sc_options_are_independent_of_sampling_params():
 def test_sc_options_validation(config):
     client = SamplingClient(service=MagicMock(), sampling_session_id="s")
     with pytest.raises(ValueError):
-        client.sample(prompt=ModelInput.from_ints([1]), score_centering=config)
+        client.sample(
+            prompt=ModelInput.from_ints([1]), sampling_params=SamplingParams(score_centering=config)
+        )
 
 
 def test_reject_mixed_sc_option_versions():
@@ -252,3 +261,63 @@ def test_reject_mixed_sc_option_versions():
             score_centering={"head_size": 2},
             topk_output_logprobs=2,
         )
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("transport", ["inline", "ref"])
+def test_sampling_params_collects_sc_without_mutation(async_mode, transport):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from weaver.async_sampling_client import AsyncSamplingClient
+
+    params = SamplingParams(score_centering={"head_size": 2, "transport": transport})
+    response = {"sequences": [ref_sequence() if transport == "ref" else sequence()]}
+    service = MagicMock()
+    if async_mode:
+        service.enqueue_operation = AsyncMock(return_value=MagicMock())
+        client = AsyncSamplingClient(service=service, sampling_session_id="s", base_model="m")
+        service.enqueue_operation.return_value.result = AsyncMock(return_value=response)
+        result = asyncio.run(
+            client.sample(prompt=ModelInput.from_ints([1, 2]), sampling_params=params)
+        )
+    else:
+        service.enqueue_operation.return_value.result.return_value = response
+        client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
+        result = client.sample(prompt=ModelInput.from_ints([1, 2]), sampling_params=params)
+    body = service.enqueue_operation.call_args.args[1]
+    assert body["score_centering"] == params.score_centering
+    assert "score_centering" not in body["sampling_params"]
+    assert body["sampling_params"]["top_k"] == -1
+    assert params.to_payload()["score_centering"] == {"head_size": 2, "transport": transport}
+    assert result["sequences"][0]["tokens"] == response["sequences"][0]["tokens"]
+
+
+@pytest.mark.parametrize(
+    "legacy",
+    [
+        {"score_centering": {"head_size": 2}},
+        {"topk_output_logprobs": 2},
+        {"sampler_distribution_transport": "ref"},
+    ],
+)
+def test_sampling_params_rejects_duplicate_sc_options(legacy):
+    service = MagicMock()
+    client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
+    with pytest.raises(ValueError):
+        client.sample(
+            prompt=ModelInput.from_ints([1]),
+            sampling_params=SamplingParams(score_centering={"head_size": 2}),
+            **legacy,
+        )
+    service.enqueue_operation.assert_not_called()
+
+
+def test_sampling_params_sc_does_not_override_sampling_top_k():
+    service = MagicMock()
+    client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
+    params = SamplingParams(top_k=8, score_centering={"head_size": 128})
+    with pytest.raises(ValueError, match="top_k=-1"):
+        client.sample(prompt=ModelInput.from_ints([1]), sampling_params=params)
+    assert params.top_k == 8
+    service.enqueue_operation.assert_not_called()
