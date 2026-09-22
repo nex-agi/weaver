@@ -33,7 +33,7 @@ import torch
 import zstandard
 
 from weaver._async_http import AsyncAPIClient
-from weaver._http import APIClient
+from weaver._http import APIClient, WeaverAPIError
 from weaver._payloads import (
     parse_logprob_tensors,
     prepare_forward_backward_operation,
@@ -1402,3 +1402,91 @@ def test_cancelled_async_payload_build_removes_eventual_temp_pack(tmp_path, loss
 
     asyncio.run(exercise())
     assert not pack_path.exists()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("failure", ["read", "400"])
+def test_multipart_failure_keeps_request_id_and_original_error(caplog, async_mode, failure):
+    prepared = _prepare(transport="http-binary", compression="zstd")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if failure == "read":
+            raise httpx.ReadError("", request=request)
+        return httpx.Response(
+            400,
+            json={
+                "error": "invalid_request",
+                "message": "bad manifest",
+                "retryable": False,
+                "request_id": request.headers["X-Trace-ID"],
+            },
+        )
+
+    async def exercise_async():
+        client = AsyncAPIClient(WeaverConfig(base_url="https://example.test"))
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(
+            base_url="https://example.test", transport=httpx.MockTransport(handler)
+        )
+        try:
+            await client.post_tensor_multipart(
+                "/api/v1/models/model-1/forward-backward-passes",
+                request=prepared.body,
+                tensor_pack=prepared.tensor_pack,
+            )
+        finally:
+            await client.aclose()
+
+    def exercise_sync():
+        client = APIClient(WeaverConfig(base_url="https://example.test"))
+        client._client.close()
+        client._client = httpx.Client(
+            base_url="https://example.test", transport=httpx.MockTransport(handler)
+        )
+        try:
+            client.post_tensor_multipart(
+                "/api/v1/models/model-1/forward-backward-passes",
+                request=prepared.body,
+                tensor_pack=prepared.tensor_pack,
+            )
+        finally:
+            client.close()
+
+    try:
+        error_type = httpx.ReadError if failure == "read" else WeaverAPIError
+        with pytest.raises(error_type) as caught:
+            if async_mode:
+                asyncio.run(exercise_async())
+            else:
+                exercise_sync()
+        assert len(calls) == 1
+        request_id = calls[0].headers["X-Trace-ID"]
+        assert request_id
+        records = [r for r in caplog.records if r.msg == "Multipart request failed: %s"]
+        assert len(records) == 1
+        record = records[0]
+        assert record.request_id == request_id
+        assert record.manifest_bytes > 0
+        assert record.tensor_codec == "zstd"
+        assert record.tensor_pack_bytes == prepared.tensor_pack.size_bytes
+        assert record.tensor_pack_decoded_bytes == prepared.tensor_pack.decoded_size_bytes
+        assert record.elapsed_seconds >= 0
+        assert record.exc_info[1] is caught.value
+        if failure == "400":
+            assert caught.value.status_code == 400
+            assert caught.value.message == "bad manifest"
+            assert caught.value.request_id == request_id
+    finally:
+        prepared.close()
+
+
+def test_multipart_manifest_limit_is_checked_before_upload():
+    prepared = _prepare(transport="http-binary", compression="zstd")
+    try:
+        prepared.body["private_metadata"] = "x" * (16 << 20)
+        with pytest.raises(ValueError, match="tensor manifest has .* maximum is 16777216"):
+            MultipartLayout(prepared.body, prepared.tensor_pack)
+    finally:
+        prepared.close()

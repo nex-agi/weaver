@@ -54,6 +54,7 @@ from ._http import (
     extract_model_id_from_path,
     raise_for_response,
 )
+from ._request_diagnostics import multipart_request_diagnostics
 from ._telemetry import get_tracer
 from .config import TensorCompression, WeaverConfig
 from .tensor_transport import MultipartLayout, TensorPack, decompress_zstd_tensor_pack
@@ -251,29 +252,30 @@ class AsyncAPIClient:
         with self._tracer.start_as_current_span("weaver.post", kind=trace.SpanKind.CLIENT) as span:
             apply_request_span_attributes(span, "POST", path, model_id)
             self._ensure_fresh_client()
-            headers = dict(self._client.headers or {})
+            headers = httpx.Headers(self._client.headers)
             headers["Content-Type"] = layout.content_type
             headers["Content-Length"] = str(layout.content_length)
             inject(headers)
-            try:
-                response = await self._client.request(
-                    "POST",
-                    path,
-                    content=layout.async_stream(),
-                    headers=headers,
-                )
-                span.set_attribute("http.status_code", response.status_code)
-                if not response.is_success:
-                    span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
-                    raise_for_response(response)
-                span.set_status(Status(StatusCode.OK))
-                if response.status_code == httpx.codes.NO_CONTENT or not response.content:
-                    return None
-                return response.json()
-            except Exception as exc:
-                span.record_exception(exc)
-                span.set_status(Status(StatusCode.ERROR, str(exc)))
-                raise
+            with multipart_request_diagnostics(logger, headers, path, layout, tensor_pack):
+                try:
+                    response = await self._client.request(
+                        "POST",
+                        path,
+                        content=layout.async_stream(),
+                        headers=headers,
+                    )
+                    span.set_attribute("http.status_code", response.status_code)
+                    if not response.is_success:
+                        span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                        raise_for_response(response)
+                    span.set_status(Status(StatusCode.OK))
+                    if response.status_code == httpx.codes.NO_CONTENT or not response.content:
+                        return None
+                    return response.json()
+                except Exception as exc:
+                    span.record_exception(exc)
+                    span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    raise
 
     async def download_tensor_pack(
         self,
