@@ -30,6 +30,7 @@ from ._utils import lookup_case_insensitive
 from .score_centering import REF_FIELD, SAMPLER_FIELDS
 from .types import LogprobsParams, ModelInput, SamplingParams
 from .types.sampling_control import coerce_pause_mode
+from .types.score_centering import ScoreCenteringConfig
 
 if TYPE_CHECKING:
     from .types import PauseMode
@@ -55,6 +56,7 @@ def build_sample_body(
     return_sampling_mask: bool,
     return_old_logprob: bool,
     return_moe_topk_indices: bool,
+    score_centering: ScoreCenteringConfig | None = None,
     topk_output_logprobs: int = 0,
     sampler_distribution_transport: str = "inline",
     sampling_mask_transport: str = "inline",
@@ -64,6 +66,23 @@ def build_sample_body(
     if sampling_mask_transport == "ref" and not return_sampling_mask:
         raise ValueError("sampling mask refs require return_sampling_mask=True")
     params = sampling_params or SamplingParams()
+    if score_centering is not None:
+        if topk_output_logprobs != 0 or sampler_distribution_transport != "inline":
+            raise ValueError("score_centering cannot be combined with legacy SC options")
+        if not isinstance(score_centering, dict) or set(score_centering) - {
+            "head_size",
+            "transport",
+        }:
+            raise ValueError("score_centering accepts only head_size and transport")
+        head_size = score_centering.get("head_size")
+        if (
+            not isinstance(head_size, int)
+            or isinstance(head_size, bool)
+            or not 1 <= head_size <= 128
+        ):
+            raise ValueError("score_centering.head_size must be an integer in [1,128]")
+        topk_output_logprobs = head_size
+        sampler_distribution_transport = score_centering.get("transport", "inline")
     if sampler_distribution_transport not in ("inline", "ref"):
         raise ValueError("sampler_distribution_transport must be inline or ref")
     if sampler_distribution_transport == "ref" and not topk_output_logprobs:
@@ -76,15 +95,13 @@ def build_sample_body(
         raise ValueError("topk_output_logprobs must be an integer between 0 and 128")
     if topk_output_logprobs:
         if params.temperature != 1 or params.top_p != 1 or params.top_k != -1:
-            raise ValueError("topk_output_logprobs requires temperature=1, top_p=1, top_k=-1")
+            raise ValueError("score_centering requires temperature=1, top_p=1, top_k=-1")
         if return_sampling_mask or return_old_logprob or return_moe_topk_indices:
             raise ValueError(
-                "topk_output_logprobs does not yet support sampling masks, old logprobs or router replay"
+                "score_centering does not yet support sampling masks, old logprobs or router replay"
             )
         if include_prompt_logprobs or topk_prompt_logprobs:
-            raise ValueError(
-                "topk_output_logprobs is decode-only; prompt logprobs must be disabled"
-            )
+            raise ValueError("score_centering is decode-only; prompt logprobs must be disabled")
     body: Dict[str, Any] = {
         "prompt": sampling_prompt_payload(prompt),
         "sampling_params": params.to_payload(),
@@ -93,8 +110,10 @@ def build_sample_body(
         "topk_prompt_logprobs": topk_prompt_logprobs,
     }
     if topk_output_logprobs:
-        body["topk_output_logprobs"] = topk_output_logprobs
-        body["sampler_distribution_transport"] = sampler_distribution_transport
+        body["score_centering"] = {
+            "head_size": topk_output_logprobs,
+            "transport": sampler_distribution_transport,
+        }
     if return_sampling_mask:
         body["return_sampling_mask"] = True
         if sampling_mask_transport == "ref":

@@ -45,12 +45,15 @@ def test_sync_sampling_preserves_distribution_and_opt_in():
     service = MagicMock()
     service.enqueue_operation.return_value.result.return_value = {"sequences": [sequence()]}
     client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
-    result = client.sample(prompt=ModelInput.from_ints([1, 2]), topk_output_logprobs=2)
-    assert service.enqueue_operation.call_args.args[1]["topk_output_logprobs"] == 2
+    result = client.sample(prompt=ModelInput.from_ints([1, 2]), score_centering={"head_size": 2})
+    assert service.enqueue_operation.call_args.args[1]["score_centering"] == {
+        "head_size": 2,
+        "transport": "inline",
+    }
     for key in SAMPLER_FIELDS:
         assert result["sequences"][0][key] == sequence()[key]
     client.sample(prompt=ModelInput.from_ints([1, 2]))
-    assert "topk_output_logprobs" not in service.enqueue_operation.call_args.args[1]
+    assert "score_centering" not in service.enqueue_operation.call_args.args[1]
 
 
 @pytest.mark.parametrize(
@@ -85,7 +88,7 @@ def test_deferred_operation_cannot_silently_accept_old_server(async_mode):
 
         async def run():
             pending = await client.sample(
-                prompt=ModelInput.from_ints([1]), topk_output_logprobs=2, wait=False
+                prompt=ModelInput.from_ints([1]), score_centering={"head_size": 2}, wait=False
             )
             with pytest.raises(ValueError, match="missing sampler fields"):
                 await pending.result()
@@ -97,7 +100,7 @@ def test_deferred_operation_cannot_silently_accept_old_server(async_mode):
         service.enqueue_operation.return_value = handle
         client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
         pending = client.sample(
-            prompt=ModelInput.from_ints([1]), topk_output_logprobs=2, wait=False
+            prompt=ModelInput.from_ints([1]), score_centering={"head_size": 2}, wait=False
         )
         with pytest.raises(ValueError, match="missing sampler fields"):
             pending.result()
@@ -109,7 +112,9 @@ def test_async_normalization():
     handle.result = AsyncMock(return_value={"result": {"sequences": [sequence()]}})
     service.enqueue_operation = AsyncMock(return_value=handle)
     client = AsyncSamplingClient(service=service, sampling_session_id="s", base_model="m")
-    result = asyncio.run(client.sample(prompt=ModelInput.from_ints([1]), topk_output_logprobs=2))
+    result = asyncio.run(
+        client.sample(prompt=ModelInput.from_ints([1]), score_centering={"head_size": 2})
+    )
     assert result["sequences"][0]["sampler_topk_ids"] == sequence()["sampler_topk_ids"]
 
 
@@ -176,7 +181,7 @@ def test_ref_sampling_preserves_opaque_handle(async_mode):
         service.enqueue_operation.return_value = handle
         client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
         result = client.sample(**kwargs)
-    assert service.enqueue_operation.call_args.args[1]["sampler_distribution_transport"] == "ref"
+    assert service.enqueue_operation.call_args.args[1]["score_centering"]["transport"] == "ref"
     assert (
         result["sequences"][0]["sampler_distribution_ref"]
         == ref_sequence()["sampler_distribution_ref"]
@@ -197,3 +202,53 @@ def test_ref_response_fails_closed(mutation):
         s["tokens"] = [3, 5]
     with pytest.raises(ValueError):
         validate_sampler_result({"sequences": [s]}, 2, transport="ref")
+
+
+def test_sc_options_are_independent_of_sampling_params():
+    from weaver import _sampling_utils as su
+    from weaver.types import SamplingParams, ScoreCenteringConfig
+
+    params = SamplingParams(temperature=1, top_p=1, top_k=-1)
+    config = ScoreCenteringConfig(head_size=128, transport="ref")
+    body = su.build_sample_body(
+        prompt=ModelInput.from_ints([1]),
+        sampling_params=params,
+        num_samples=1,
+        include_prompt_logprobs=False,
+        topk_prompt_logprobs=0,
+        return_sampling_mask=False,
+        return_old_logprob=False,
+        return_moe_topk_indices=False,
+        score_centering=config,
+    )
+    assert body["score_centering"] == config
+    assert body["sampling_params"]["top_k"] == -1
+    assert "topk_output_logprobs" not in body and "sampler_distribution_transport" not in body
+    assert params.top_k == -1 and config == {"head_size": 128, "transport": "ref"}
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"head_size": 0},
+        {"head_size": True},
+        {"head_size": 129},
+        {"head_size": 2, "top_k": 2},
+        {"head_size": 2, "transport": "bad"},
+    ],
+)
+def test_sc_options_validation(config):
+    client = SamplingClient(service=MagicMock(), sampling_session_id="s")
+    with pytest.raises(ValueError):
+        client.sample(prompt=ModelInput.from_ints([1]), score_centering=config)
+
+
+def test_reject_mixed_sc_option_versions():
+    client = SamplingClient(service=MagicMock(), sampling_session_id="s")
+    with pytest.raises(ValueError, match="legacy"):
+        client.sample(
+            prompt=ModelInput.from_ints([1]),
+            score_centering={"head_size": 2},
+            topk_output_logprobs=2,
+        )

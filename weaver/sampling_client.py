@@ -26,6 +26,7 @@ from ._utils import lookup_case_insensitive
 from .operations import OperationHandle
 from .service_client import ServiceClient
 from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
+from .types.score_centering import ScoreCenteringConfig
 
 
 class SamplingClient:
@@ -58,6 +59,7 @@ class SamplingClient:
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
+        score_centering: ScoreCenteringConfig | None = None,
         topk_output_logprobs: int = 0,
         sampler_distribution_transport: str = "inline",
         return_sampling_mask: bool = False,
@@ -72,6 +74,7 @@ class SamplingClient:
             num_samples=num_samples,
             include_prompt_logprobs=include_prompt_logprobs,
             topk_prompt_logprobs=topk_prompt_logprobs,
+            score_centering=score_centering,
             topk_output_logprobs=topk_output_logprobs,
             sampler_distribution_transport=sampler_distribution_transport,
             return_sampling_mask=return_sampling_mask,
@@ -79,6 +82,9 @@ class SamplingClient:
             return_old_logprob=return_old_logprob,
             return_moe_topk_indices=return_moe_topk_indices,
         )
+        sc_options = body.get("score_centering", {})
+        topk_output_logprobs = sc_options.get("head_size", 0)
+        sampler_distribution_transport = sc_options.get("transport", "inline")
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
             body,
