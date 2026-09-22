@@ -67,3 +67,13 @@ Each training tensor pack is limited to 8 GiB both before and after compression.
 Budget for token IDs, masks, and other inputs as well as log probabilities.
 Compression reduces transfer size but does not reduce the decoded tensor size
 or automatically split a large batch into smaller requests.
+
+### Optional probability-ratio weighting
+
+`loss_fn_config` accepts `importance_weighting="none"` (default), `"tis"`, or
+`"mis"`. The ratio is the current sampled-token probability divided by its
+rollout-time probability. TIS caps this ratio at `tis_cap` (default `2.0`);
+MIS keeps it only inside the inclusive `[mis_min, mis_max]` interval
+(defaults `0.5` and `5.0`), assigning zero weight outside it. The weight is
+held constant during differentiation. Bounds must be finite and positive,
+and `mis_min` must not exceed `mis_max`.
