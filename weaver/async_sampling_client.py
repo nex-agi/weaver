@@ -26,7 +26,6 @@ from ._utils import lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle
 from .types import LogprobsParams, ModelInput, PauseMode, SamplingParams
-from .types.score_centering import ScoreCenteringConfig
 
 if TYPE_CHECKING:
     from typing import Literal
@@ -63,9 +62,6 @@ class AsyncSamplingClient:
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
-        score_centering: ScoreCenteringConfig | None = None,
-        topk_output_logprobs: int = 0,
-        sampler_distribution_transport: str = "inline",
         return_sampling_mask: bool = False,
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
@@ -81,9 +77,6 @@ class AsyncSamplingClient:
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
-        score_centering: ScoreCenteringConfig | None = None,
-        topk_output_logprobs: int = 0,
-        sampler_distribution_transport: str = "inline",
         return_sampling_mask: bool = False,
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
@@ -98,9 +91,6 @@ class AsyncSamplingClient:
         num_samples: int = 1,
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
-        score_centering: ScoreCenteringConfig | None = None,
-        topk_output_logprobs: int = 0,
-        sampler_distribution_transport: str = "inline",
         return_sampling_mask: bool = False,
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
@@ -112,25 +102,22 @@ class AsyncSamplingClient:
             num_samples=num_samples,
             include_prompt_logprobs=include_prompt_logprobs,
             topk_prompt_logprobs=topk_prompt_logprobs,
-            score_centering=score_centering,
-            topk_output_logprobs=topk_output_logprobs,
-            sampler_distribution_transport=sampler_distribution_transport,
             return_sampling_mask=return_sampling_mask,
             return_old_logprob=return_old_logprob,
             return_moe_topk_indices=return_moe_topk_indices,
         )
         sc_options = body.get("score_centering", {})
-        topk_output_logprobs = sc_options.get("head_size", 0)
-        sampler_distribution_transport = sc_options.get("transport", "inline")
+        sc_head_size = sc_options.get("head_size", 0)
+        sc_transport = sc_options.get("transport", "inline")
         handle = await self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
             body,
         )
-        if topk_output_logprobs:
+        if sc_head_size:
             from .score_centering import validate_sampler_result
 
             handle._result_validator = lambda result: validate_sampler_result(
-                result, topk_output_logprobs, sampler_distribution_transport
+                result, sc_head_size, sc_transport
             )
         if not wait:
             return handle
@@ -138,10 +125,8 @@ class AsyncSamplingClient:
         # Resolve the tokenizer source up front so result normalization (which
         # may need to decode token ids) stays synchronous.
         await self._ensure_tokenizer_source()
-        if topk_output_logprobs:
-            validate_sampler_result(
-                raw_result, topk_output_logprobs, sampler_distribution_transport
-            )
+        if sc_head_size:
+            validate_sampler_result(raw_result, sc_head_size, sc_transport)
         return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)  # type: ignore[return-value]
 
     async def compute_logprobs(

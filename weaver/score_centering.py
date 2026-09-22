@@ -47,7 +47,7 @@ def validate_sampler_sequence(
     if transport == "ref":
         raise ValueError("Sampler did not return the requested distribution reference")
     if any(key not in sequence for key in SAMPLER_FIELDS):
-        raise ValueError("Sampler does not support topk_output_logprobs: missing sampler fields")
+        raise ValueError("Sampler does not support score_centering: missing sampler fields")
     distribution = sequence["sampler_distribution"]
     if not isinstance(distribution, dict) or distribution.get("schema") != SCHEMA:
         raise ValueError("Unsupported sampler_distribution schema")
@@ -83,7 +83,7 @@ def validate_sampler_result(payload: Any, k: int, transport: str | None = None) 
     result = payload.get("result", payload)
     sequences = result.get("sequences") if isinstance(result, dict) else None
     if not isinstance(sequences, list) or not sequences:
-        raise ValueError("Sampler result is missing sequences for topk_output_logprobs")
+        raise ValueError("Sampler result is missing sequences for score_centering")
     for sequence in sequences:
         validate_sampler_sequence(sequence, k, transport)
 
