@@ -61,6 +61,14 @@ def build_sample_body(
     sampler_distribution_transport: str = "inline",
 ) -> Dict[str, Any]:
     params = sampling_params or SamplingParams()
+    sampling_payload = params.to_payload()
+    if params.score_centering is not None:
+        if score_centering is not None:
+            raise ValueError(
+                "score_centering must be set only in sampling_params or as a legacy keyword"
+            )
+        score_centering = params.score_centering
+    sampling_payload.pop("score_centering", None)
     if score_centering is not None:
         if topk_output_logprobs != 0 or sampler_distribution_transport != "inline":
             raise ValueError("score_centering cannot be combined with legacy SC options")
@@ -99,7 +107,7 @@ def build_sample_body(
             raise ValueError("score_centering is decode-only; prompt logprobs must be disabled")
     body: Dict[str, Any] = {
         "prompt": sampling_prompt_payload(prompt),
-        "sampling_params": params.to_payload(),
+        "sampling_params": sampling_payload,
         "num_samples": num_samples,
         "prompt_logprobs": include_prompt_logprobs,
         "topk_prompt_logprobs": topk_prompt_logprobs,

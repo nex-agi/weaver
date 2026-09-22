@@ -6,12 +6,14 @@ at each generated position for use with score-centering objectives.
 ```python
 sample = sampling_client.sample(
     prompt=prompt,
-    sampling_params=weaver.types.SamplingParams(temperature=1, top_p=1, top_k=-1),
-    score_centering={"head_size": 128, "transport": "ref"},
+    sampling_params=weaver.types.SamplingParams(
+        temperature=1, top_p=1, top_k=-1,
+        score_centering={"head_size": 128, "transport": "ref"},
+    ),
 )
 ```
 
-The opt-in flag requests **generated-token** top-k statistics. It does not change
+`SamplingParams.score_centering` requests **generated-token** top-k statistics. It does not change
 sampling top_k and does not request prompt top-k statistics. Omit `score_centering` to preserve existing behavior. `head_size` must be
 between 1 and 128. It never changes `sampling_params.top_k`.
 
@@ -78,6 +80,6 @@ held constant during differentiation. Bounds must be finite and positive,
 and `mis_min` must not exceed `mis_max`.
 
 `weaver.types.ScoreCenteringConfig` provides type hints for this dictionary.
-Unknown configuration keys are rejected. The earlier experimental
-`topk_output_logprobs` / `sampler_distribution_transport` keywords remain compatibility
-aliases; do not combine them with `score_centering`.
+Unknown configuration keys are rejected. The earlier experimental request-level
+`score_centering`, `topk_output_logprobs` and `sampler_distribution_transport`
+keywords remain compatibility aliases. Use only one configuration form per request.
