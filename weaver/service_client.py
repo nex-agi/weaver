@@ -89,6 +89,7 @@ from .operations import OperationHandle, build_operation_handle
 from .tensor_transport import TensorPack
 from .types import LoraConfig
 from .types.deployment import Deployment
+from .types.metrics import MetricsStoreConfig
 from .types.supported_model import SupportedModel
 from .types.weights_artifact import WeightsArtifact
 
@@ -125,6 +126,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         tensor_transport: TensorTransport | None = None,
         tensor_compression: TensorCompression | None = None,
         wandb_link: str | None = None,
+        metrics_store: MetricsStoreConfig | None = None,
         metrics_path: str | os.PathLike[str] | None = None,
     ) -> None:
         """Initialize ServiceClient.
@@ -147,9 +149,12 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             tensor_compression: HTTP tensor-pack compression. Defaults to
                 ``WEAVER_TENSOR_COMPRESSION`` or ``"zstd"``.
             wandb_link: Optional existing W&B run URL/URI for trainer metrics.
-            metrics_path: Parent directory for client-side metric JSONL. None uses
-                ./weaver/.logs relative to the client construction directory;
-                it does not disable storage. Files are created on first metrics.
+                None disables SDK W&B publishing, even if a caller has an active run.
+            metrics_store: Local metric JSONL configuration. None enables storage
+                at ./weaver/.logs; enabled=False disables only local metric writes.
+                Files are created on first metrics; returned results are unchanged.
+            metrics_path: Compatibility shorthand for MetricsStoreConfig(path=...).
+                Do not pass a non-None path together with metrics_store.
         """
         self._config = WeaverConfig.from_env(
             base_url=base_url,
@@ -167,7 +172,9 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         self._project_reference = optional_scope_id(project, "WEAVER_PROJECT")
         self._session_user_metadata = dict(user_metadata or {})
         self._heartbeat_interval = heartbeat_interval
-        self._metric_persistence = MetricPersistence(local_path=metrics_path, wandb_link=wandb_link)
+        self._metric_persistence = MetricPersistence(
+            store=metrics_store, local_path=metrics_path, wandb_link=wandb_link
+        )
 
         self._http: APIClient | None = None
         self._session: Dict[str, Any] | None = None

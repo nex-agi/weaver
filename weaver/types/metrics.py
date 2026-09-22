@@ -12,17 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Typed, read-only access to additive Trainer metric observations."""
+"""Local metric storage configuration and read-only Trainer observations."""
 
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
 
 _STATUSES = {"ok", "disabled", "not_sampled", "not_applicable", "unsupported", "invalid"}
+
+
+@dataclass(frozen=True)
+class MetricsStoreConfig:
+    """Configure SDK-owned local metric storage, independently of W&B.
+
+    Args:
+        enabled: Write metric JSONL files. Disabling storage does not change
+            collection or returned observations.
+        path: Parent directory; None selects ``./weaver/.logs`` relative to the
+            client construction directory. Ignored when storage is disabled.
+    """
+
+    enabled: bool = True
+    path: str | os.PathLike[str] | None = None
 
 
 @dataclass(frozen=True)

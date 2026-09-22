@@ -41,7 +41,7 @@ from .types.managed_dataset import (  # noqa: F401
     SampleRefLength,
     SampleRefOutput,
 )
-from .types.metrics import MetricObservation, MetricObservations  # noqa: F401
+from .types.metrics import MetricObservation, MetricObservations, MetricsStoreConfig  # noqa: F401
 from .types.supported_model import (  # noqa: F401
     SupportedModel,
     SupportedModelPrice,
@@ -52,6 +52,7 @@ from .types.weights_artifact import WeightsArtifact  # noqa: F401
 __all__ = [
     "MetricObservation",
     "MetricObservations",
+    "MetricsStoreConfig",
     "ServiceClient",
     "OperationHandle",
     "AsyncServiceClient",

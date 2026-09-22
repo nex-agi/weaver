@@ -26,7 +26,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from ._wandb_metrics import WandbMetricView
-from .types.metrics import MetricObservations
+from .types.metrics import MetricObservations, MetricsStoreConfig
 
 logger = logging.getLogger(__name__)
 DEFAULT_METRICS_PATH = Path("weaver/.logs")
@@ -65,10 +65,11 @@ def _parse_wandb_link(link: str) -> tuple[str, str, str, str]:
 
 
 class MetricPersistence:
-    """Save every received v1 observation locally; optionally also publish to W&B.
+    """Optionally save received v1 observations locally and/or publish to W&B.
 
-    ``local_path=None`` selects ``./weaver/.logs`` relative to the working
-    directory at construction, not the installed Python package. Files are
+    Local storage is enabled by default. A config with ``path=None`` selects
+    ``./weaver/.logs`` relative to the working directory at construction,
+    not the installed Python package. Files are
     created lazily at ``<parent>/metrics-<model-id>/<metric>/observations.jsonl``.
     Local files retain all values, labels and unavailable statuses.
 
@@ -82,10 +83,15 @@ class MetricPersistence:
     def __init__(
         self,
         *,
+        store: MetricsStoreConfig | None = None,
         local_path: str | os.PathLike[str] | None = None,
         wandb_link: str | None = None,
     ) -> None:
-        self.local_path = Path(local_path if local_path is not None else DEFAULT_METRICS_PATH)
+        if store is not None and local_path is not None:
+            raise ValueError("Pass metrics_store or metrics_path, not both")
+        self.store = store if store is not None else MetricsStoreConfig(path=local_path)
+        path = self.store.path if self.store.enabled else None
+        self.local_path = Path(path if path is not None else DEFAULT_METRICS_PATH)
         self.local_path = self.local_path.expanduser().absolute()
         self.wandb_link = wandb_link
         self._wandb_target = _parse_wandb_link(wandb_link) if wandb_link is not None else None
@@ -97,6 +103,8 @@ class MetricPersistence:
 
     def persist(self, operation_id: str, response: Any) -> None:
         """Persist one completion; failures are visible without changing its result."""
+        if not self.store.enabled and self._wandb_target is None:
+            return
         observations = MetricObservations.from_response(response)
         if observations is None:
             return
@@ -105,12 +113,13 @@ class MetricPersistence:
                 return
             # Independent sinks: a disk failure must not prevent W&B publishing,
             # nor a W&B failure prevent the local record from being written.
-            try:
-                self._persist_local(operation_id, observations)
-            except Exception:
-                logger.exception(
-                    "Local metrics write failed for %s in %s", operation_id, self.local_path
-                )
+            if self.store.enabled:
+                try:
+                    self._persist_local(operation_id, observations)
+                except Exception:
+                    logger.exception(
+                        "Local metrics write failed for %s in %s", operation_id, self.local_path
+                    )
             if self._wandb_target is not None:
                 try:
                     self._persist_wandb(operation_id, observations)
@@ -180,7 +189,7 @@ class MetricPersistence:
                 # supports W&B 0.19.8; newer string modes are unnecessary here.
                 reinit=False,
                 settings=wandb.Settings(base_url=host, init_timeout=30),
-                dir=str(self.local_path),
+                dir=str(self.local_path) if self.store.enabled else None,
             )
             self._owns_wandb_run = True
         if getattr(self._wandb_run.settings, "mode", "online") != "online":

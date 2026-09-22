@@ -78,20 +78,44 @@ to an older Weaver server/trainer deployment that does not support binary tensor
 ### Trainer metric persistence
 
 Completed v1 metric observations are persisted by the SDK in JSONL by default.
-`metrics_path=None` selects `./weaver/.logs`, while an explicit path selects a
-different parent directory. The layout is
+Configure local storage with `metrics_store=MetricsStoreConfig(enabled=True, path=None)`.
+`path=None` selects `./weaver/.logs` relative to the client construction directory,
+while an explicit path selects a different parent directory. The layout is
 `metrics-<model-id>/<metric path>/observations.jsonl`. To publish the same
 observations to an existing W&B run, pass its run URL as `wandb_link`; the SDK
 uses a matching active run in the current process when one already exists and
 never finishes a caller-owned run.
 
 ```python
+from weaver import MetricsStoreConfig, ServiceClient
+
 with ServiceClient(
     wandb_link="https://wandb.ai/<entity>/<project>/runs/<run-id>",
-    metrics_path=None,  # local persistence remains enabled at ./weaver/.logs
+    metrics_store=MetricsStoreConfig(),  # enabled at ./weaver/.logs by default
 ) as client:
     ...
 ```
+
+When an outer training framework owns logging and persistence, explicitly disable
+the SDK's sinks (the same options apply to `AsyncServiceClient`):
+
+```python
+client = ServiceClient(
+    metrics_store=MetricsStoreConfig(enabled=False),
+    wandb_link=None,
+)
+```
+
+Disabling local storage skips Weaver JSONL writes and ignores `path`; it does not
+change metric collection, transport, returned observations, or W&B publishing.
+`wandb_link=None` independently disables SDK W&B publishing, even when a caller
+has an active W&B run. The SDK does not initialize, log to, or finish that run.
+W&B's own cache and the outer application's logs are outside this local-storage
+switch. No framework detection or automatic configuration override is performed.
+
+The existing `metrics_path=...` argument remains a compatibility shorthand for
+`metrics_store=MetricsStoreConfig(path=...)`. Do not supply a non-None
+`metrics_path` together with `metrics_store`; conflicting inputs raise `ValueError`.
 
 W&B support is optional (`pip install nex-weaver[wandb]`); version 0.19.8 is supported.
 The run URL identifies the destination, not the credentials. Configure a W&B API
