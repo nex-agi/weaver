@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from transformers import PreTrainedTokenizer
 
 from ._utils import lookup_case_insensitive
-from .score_centering import SAMPLER_FIELDS
+from .score_centering import REF_FIELD, SAMPLER_FIELDS
 from .types import LogprobsParams, ModelInput, SamplingParams
 from .types.sampling_control import coerce_pause_mode
 
@@ -56,8 +56,13 @@ def build_sample_body(
     return_old_logprob: bool,
     return_moe_topk_indices: bool,
     topk_output_logprobs: int = 0,
+    sampler_distribution_transport: str = "inline",
 ) -> Dict[str, Any]:
     params = sampling_params or SamplingParams()
+    if sampler_distribution_transport not in ("inline", "ref"):
+        raise ValueError("sampler_distribution_transport must be inline or ref")
+    if sampler_distribution_transport == "ref" and not topk_output_logprobs:
+        raise ValueError("distribution refs require topk_output_logprobs > 0")
     if type(topk_output_logprobs) is not int or not 0 <= topk_output_logprobs <= 128:
         raise ValueError("topk_output_logprobs must be an integer between 0 and 128")
     if topk_output_logprobs:
@@ -80,6 +85,7 @@ def build_sample_body(
     }
     if topk_output_logprobs:
         body["topk_output_logprobs"] = topk_output_logprobs
+        body["sampler_distribution_transport"] = sampler_distribution_transport
     if return_sampling_mask:
         body["return_sampling_mask"] = True
     if return_old_logprob:
@@ -261,7 +267,7 @@ def sequences_from_result(
                 sequence["moe_topk_indices_ref"] = raw["moe_topk_indices_ref"]
             elif "moe_topk_indices" in raw and raw["moe_topk_indices"] is not None:
                 sequence["moe_topk_indices"] = raw["moe_topk_indices"]
-            for field in SAMPLER_FIELDS:
+            for field in (*SAMPLER_FIELDS, REF_FIELD):
                 if field in raw:
                     sequence[field] = raw[field]
             weight_version = lookup_case_insensitive(raw, "weight_version")

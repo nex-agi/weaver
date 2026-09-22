@@ -59,6 +59,7 @@ class SamplingClient:
         include_prompt_logprobs: bool = False,
         topk_prompt_logprobs: int = 0,
         topk_output_logprobs: int = 0,
+        sampler_distribution_transport: str = "inline",
         return_sampling_mask: bool = False,
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
@@ -71,6 +72,7 @@ class SamplingClient:
             include_prompt_logprobs=include_prompt_logprobs,
             topk_prompt_logprobs=topk_prompt_logprobs,
             topk_output_logprobs=topk_output_logprobs,
+            sampler_distribution_transport=sampler_distribution_transport,
             return_sampling_mask=return_sampling_mask,
             return_old_logprob=return_old_logprob,
             return_moe_topk_indices=return_moe_topk_indices,
@@ -83,13 +85,15 @@ class SamplingClient:
             from .score_centering import validate_sampler_result
 
             handle._result_validator = lambda result: validate_sampler_result(
-                result, topk_output_logprobs
+                result, topk_output_logprobs, sampler_distribution_transport
             )
         if not wait:
             return handle
         raw_result = handle.result()
         if topk_output_logprobs:
-            validate_sampler_result(raw_result, topk_output_logprobs)
+            validate_sampler_result(
+                raw_result, topk_output_logprobs, sampler_distribution_transport
+            )
         return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)  # type: ignore[return-value]
 
     def compute_logprobs(

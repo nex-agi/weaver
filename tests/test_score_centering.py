@@ -134,3 +134,66 @@ def test_rejects_malformed_distribution(mutation):
         s["sampler_distribution"]["schema"] = "unknown"
     with pytest.raises(ValueError):
         validate_sampler_result({"sequences": [s]}, 2)
+
+
+def ref_sequence():
+    import hashlib
+    import struct
+
+    s = sequence()
+    for key in list(s):
+        if key.startswith("sampler_topk_"):
+            del s[key]
+    s["sampler_distribution"]["weight_version"] = "v1"
+    s["sampler_distribution_ref"] = {
+        "schema": "weaver.sampler_distribution.v1",
+        "distribution_schema": "behavior/unfiltered/v1",
+        "top_k": 2,
+        "token_count": 2,
+        "weight_version": "v1",
+        "tokens_sha256": hashlib.sha256(struct.pack("<ii", 3, 4)).hexdigest(),
+    }
+    return s
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_ref_sampling_preserves_opaque_handle(async_mode):
+    service = MagicMock()
+    handle = MagicMock()
+    payload = {"sequences": [ref_sequence()]}
+    kwargs = dict(
+        prompt=ModelInput.from_ints([1, 2]),
+        topk_output_logprobs=2,
+        sampler_distribution_transport="ref",
+    )
+    if async_mode:
+        handle.result = AsyncMock(return_value=payload)
+        service.enqueue_operation = AsyncMock(return_value=handle)
+        client = AsyncSamplingClient(service=service, sampling_session_id="s", base_model="m")
+        result = asyncio.run(client.sample(**kwargs))
+    else:
+        handle.result.return_value = payload
+        service.enqueue_operation.return_value = handle
+        client = SamplingClient(service=service, sampling_session_id="s", base_model="m")
+        result = client.sample(**kwargs)
+    assert service.enqueue_operation.call_args.args[1]["sampler_distribution_transport"] == "ref"
+    assert (
+        result["sequences"][0]["sampler_distribution_ref"]
+        == ref_sequence()["sampler_distribution_ref"]
+    )
+    assert "sampler_topk_ids" not in result["sequences"][0]
+
+
+@pytest.mark.parametrize("mutation", ["missing", "mixed", "version", "tokens"])
+def test_ref_response_fails_closed(mutation):
+    s = ref_sequence()
+    if mutation == "missing":
+        del s["sampler_distribution_ref"]
+    if mutation == "mixed":
+        s["sampler_topk_ids"] = [[3, 5], [5, 6]]
+    if mutation == "version":
+        s["sampler_distribution_ref"]["weight_version"] = "v2"
+    if mutation == "tokens":
+        s["tokens"] = [3, 5]
+    with pytest.raises(ValueError):
+        validate_sampler_result({"sequences": [s]}, 2, transport="ref")
