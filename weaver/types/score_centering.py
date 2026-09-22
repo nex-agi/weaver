@@ -14,6 +14,7 @@
 
 
 """Options for collecting score-centering statistics independently of sampling."""
+
 from typing import Literal
 
 from typing_extensions import NotRequired, TypedDict
