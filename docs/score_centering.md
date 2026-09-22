@@ -1,6 +1,7 @@
 # Score-centering sampling (experimental)
 
-Requires the coordinated server, trainer and NexRL score-centering changes.
+Request the sampled token's log probability and the top-k token log probabilities
+at each generated position for use with score-centering objectives.
 
 ```python
 sample = sampling_client.sample(
@@ -19,16 +20,13 @@ sampler_topk_ids/logprobs/mask [R,K], and sampler_distribution metadata with
 schema behavior/unfiltered/v1. These are the probabilities reported at rollout
 time; keep them separate from logprobs recomputed later for importance sampling.
 
-The initial mode requires temperature=1, top_p=1, top_k=-1, no other distribution
-processors, router replay, sampling masks, or prompt logprob requests. Server
-validation additionally rejects penalties, minimum generation lengths and
-structured/constrained sampling. An unsupported server returning incomplete
-fields fails explicitly, including OperationHandle.result() after wait=False.
+Use temperature=1, top_p=1, and top_k=-1. This option cannot be combined with
+penalties, minimum generation lengths, structured/constrained sampling, other
+distribution processors, router replay, sampling masks, or prompt logprob
+requests. Incomplete response fields raise an error, including when retrieving
+OperationHandle.result() after wait=False.
 
-Both sync and async clients preserve all fields. Dense target-aligned SC tensors
-use the existing default JSON or http-binary training transport (raw or zstd).
-Do not send a full vocabulary distribution: the trainer computes probabilities
-only at the selected IDs, with exact vocabulary normalization and gradients.
-
-See tests/test_score_centering.py. Live GPU rollout/training and payload throughput
-remain deployment acceptance checks.
+Both sync and async clients return these fields. When preparing training data,
+align the generated-token statistics with the corresponding target-token
+positions and exclude prompt positions from the loss mask. Training requests
+support the default JSON and http-binary transports, with raw or zstd encoding.
