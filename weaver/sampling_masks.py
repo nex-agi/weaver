@@ -13,6 +13,7 @@
 # limitations under the License.
 
 """Validate opaque sampling support handles without loading candidate tensors."""
+
 from __future__ import annotations
 
 import hashlib
