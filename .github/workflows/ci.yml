@@ -18,7 +18,7 @@ on:
   push:
     branches: [main, dev, develop]
   pull_request:
-    branches: [main, dev, develop]
+    branches: [main, dev, develop, codex/score-centering]
 
 jobs:
   lint:
