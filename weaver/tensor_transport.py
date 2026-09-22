@@ -296,10 +296,10 @@ class MultipartLayout:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        self.manifest_bytes = len(manifest)
-        if self.manifest_bytes > _MAX_TENSOR_MANIFEST_BYTES:
+        manifest_bytes = len(manifest)
+        if manifest_bytes > _MAX_TENSOR_MANIFEST_BYTES:
             raise ValueError(
-                f"tensor manifest has {self.manifest_bytes} bytes, "
+                f"tensor manifest has {manifest_bytes} bytes, "
                 f"maximum is {_MAX_TENSOR_MANIFEST_BYTES} bytes; "
                 "reduce batch metadata or batch size"
             )

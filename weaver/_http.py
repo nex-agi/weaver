@@ -30,7 +30,6 @@ from opentelemetry.propagate import inject
 from opentelemetry.trace import Status, StatusCode
 
 from . import __version__
-from ._request_diagnostics import multipart_request_diagnostics
 from ._telemetry import get_tracer
 from .config import TensorCompression, WeaverConfig
 from .tensor_transport import (
@@ -487,30 +486,29 @@ class APIClient:
         with self._tracer.start_as_current_span("weaver.post", kind=trace.SpanKind.CLIENT) as span:
             apply_request_span_attributes(span, "POST", path, model_id)
             self._ensure_fresh_client()
-            headers = httpx.Headers(self._client.headers)
+            headers = dict(self._client.headers or {})
             headers["Content-Type"] = layout.content_type
             headers["Content-Length"] = str(layout.content_length)
             inject(headers)
-            with multipart_request_diagnostics(logger, headers, path, layout, tensor_pack):
-                try:
-                    response = self._client.request(
-                        "POST",
-                        path,
-                        content=layout.sync_stream(),
-                        headers=headers,
-                    )
-                    span.set_attribute("http.status_code", response.status_code)
-                    if not response.is_success:
-                        span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
-                        self._raise_error(response)
-                    span.set_status(Status(StatusCode.OK))
-                    if response.status_code == httpx.codes.NO_CONTENT or not response.content:
-                        return None
-                    return response.json()
-                except Exception as exc:
-                    span.record_exception(exc)
-                    span.set_status(Status(StatusCode.ERROR, str(exc)))
-                    raise
+            try:
+                response = self._client.request(
+                    "POST",
+                    path,
+                    content=layout.sync_stream(),
+                    headers=headers,
+                )
+                span.set_attribute("http.status_code", response.status_code)
+                if not response.is_success:
+                    span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
+                    self._raise_error(response)
+                span.set_status(Status(StatusCode.OK))
+                if response.status_code == httpx.codes.NO_CONTENT or not response.content:
+                    return None
+                return response.json()
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
 
     def download_tensor_pack(
         self,

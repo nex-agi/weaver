@@ -75,15 +75,6 @@ public response shape automatically. `Datum` construction, training calls, and r
 handling therefore do not need to change. Keep the `default` transport when connecting
 to an older Weaver server/trainer deployment that does not support binary tensor packs.
 
-Binary uploads include an `X-Trace-ID` for matching client failures to server logs.
-The SDK logs the request ID, manifest and pack sizes, compression codec, and elapsed
-time on failure without logging the payload or credentials. Enable INFO logging for
-`weaver._http` and `weaver._async_http` to also record submission metadata before upload.
-A complete HTTP error response raises `WeaverAPIError` with `status_code`, `code`,
-`message`, and `request_id`. If the connection fails before a complete response arrives,
-the original transport exception is preserved and the request ID is in the failure log.
-Training submissions are not automatically retried after an ambiguous upload failure.
-
 Zstandard compresses the tensor pack, not the JSON manifest. The SDK rejects manifests
 larger than 16 MiB before upload; reduce batch metadata or batch size if this check fails.
 
