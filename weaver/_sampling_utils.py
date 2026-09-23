@@ -55,7 +55,12 @@ def build_sample_body(
     return_sampling_mask: bool,
     return_old_logprob: bool,
     return_moe_topk_indices: bool,
+    sampling_mask_transport: str = "inline",
 ) -> Dict[str, Any]:
+    if sampling_mask_transport not in ("inline", "ref"):
+        raise ValueError("sampling_mask_transport must be inline or ref")
+    if sampling_mask_transport == "ref" and not return_sampling_mask:
+        raise ValueError("sampling mask refs require return_sampling_mask=True")
     params = sampling_params or SamplingParams()
     sampling_payload = params.to_payload()
     score_centering = params.score_centering
@@ -98,6 +103,8 @@ def build_sample_body(
         }
     if return_sampling_mask:
         body["return_sampling_mask"] = True
+        if sampling_mask_transport == "ref":
+            body["sampling_mask_transport"] = "ref"
     if return_old_logprob:
         body["return_old_logprob"] = True
     if return_moe_topk_indices:
@@ -266,6 +273,8 @@ def sequences_from_result(
                 sequence["old_logprobs"] = raw["old_logprobs"]
             if "sampling_masks" in raw and raw["sampling_masks"] is not None:
                 sequence["sampling_masks"] = raw["sampling_masks"]
+            if "sampling_mask_ref" in raw:
+                sequence["sampling_mask_ref"] = raw["sampling_mask_ref"]
             # The server offloads the large routing-index tensor to a GPFS
             # safetensors shard and returns an opaque ref instead of the inline
             # array; surface it verbatim so NexRL can attach it as a datum ref
