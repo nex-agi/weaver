@@ -73,13 +73,24 @@ class SamplingClient:
             return_old_logprob=return_old_logprob,
             return_moe_topk_indices=return_moe_topk_indices,
         )
+        sc_options = body.get("score_centering", {})
+        sc_head_size = sc_options.get("head_size", 0)
+        sc_transport = sc_options.get("transport", "inline")
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
             body,
         )
+        if sc_head_size:
+            from .score_centering import validate_sampler_result
+
+            handle._result_validator = lambda result: validate_sampler_result(
+                result, sc_head_size, sc_transport
+            )
         if not wait:
             return handle
         raw_result = handle.result()
+        if sc_head_size:
+            validate_sampler_result(raw_result, sc_head_size, sc_transport)
         return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)  # type: ignore[return-value]
 
     def compute_logprobs(

@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Union
 
+from .score_centering import ScoreCenteringConfig
+
 
 @dataclass(slots=True)
 class SamplingParams:
@@ -29,6 +31,7 @@ class SamplingParams:
     stop: List[Union[str, int]] = field(default_factory=list)
     seed: Optional[int] = None
     sampling_seed: Optional[int] = None
+    score_centering: Optional[ScoreCenteringConfig] = None
 
     def to_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {
@@ -54,4 +57,6 @@ class SamplingParams:
             payload["seed"] = self.seed
         if self.sampling_seed is not None:
             payload["sampling_seed"] = self.sampling_seed
+        if self.score_centering is not None:
+            payload["score_centering"] = self.score_centering
         return payload
