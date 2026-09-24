@@ -413,6 +413,10 @@ class APIClient:
         self._client = self._build_client()
         self._pid = os.getpid()
         self._max_retries = max_retries
+        # Optional client-side structured-metric sink installed by
+        # ServiceClient; keeping it on the transport lets operation handles
+        # persist results without changing the HTTP protocol.
+        self.metric_sink: Any = None
 
         # Initialize tracer for distributed tracing
         self._tracer = get_tracer()

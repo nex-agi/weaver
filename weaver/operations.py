@@ -32,6 +32,7 @@ from .tensor_transport import (
     result_tensor_pack_metadata,
     result_uses_http_tensor_pack,
 )
+from .types.metrics import MetricObservations
 
 if TYPE_CHECKING:
     from ._async_http import AsyncAPIClient
@@ -127,10 +128,12 @@ class _OperationHandleMixin:
 
     """Pure (IO-free) status accessors shared by sync and async handles."""
 
+    client: APIClient | AsyncAPIClient
     operation_id: str
     _cached: Dict[str, Any]
     _response_cache: Any
     _response_source: Any
+    _metrics_persisted: bool
 
     @property
     def status(self) -> Optional[str]:
@@ -143,6 +146,11 @@ class _OperationHandleMixin:
             return self._response_cache
         return lookup_case_insensitive(self._cached, "response")
 
+    @property
+    def metric_observations(self) -> MetricObservations | None:
+        """Decode cached observations without IO; available after refresh/result."""
+        return MetricObservations.from_response(self.response)
+
     def _cache_response(self, response: Any) -> None:
         self._response_cache = response
         for key in self._cached:
@@ -150,6 +158,19 @@ class _OperationHandleMixin:
                 self._cached[key] = response
                 return
         self._cached["response"] = response
+
+    def _persist_metrics(self) -> None:
+        """Best-effort client-side persistence; never alter operation results."""
+        if self._metrics_persisted:
+            return
+        self._metrics_persisted = True
+        sink = getattr(self.client, "metric_sink", None)
+        if sink is None:
+            return
+        try:
+            sink.persist(self.operation_id, self.response)
+        except Exception as exc:  # pragma: no cover - persistence is optional
+            logger.warning("Metric persistence failed for operation %s: %s", self.operation_id, exc)
 
     def _install_refreshed_payload(self, payload: Dict[str, Any]) -> bool:
         response = lookup_case_insensitive(payload, "response")
@@ -191,6 +212,7 @@ class OperationHandle(_OperationHandleMixin):
     _cached: Dict[str, Any]
     _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
     _response_source: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _metrics_persisted: bool = field(default=False, init=False, repr=False, compare=False)
     _response_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -207,6 +229,8 @@ class OperationHandle(_OperationHandleMixin):
             reused_cache = self._install_refreshed_payload(payload)
             if self.status == "done" and not reused_cache:
                 self._materialize_response_locked()
+            if self.status == "done":
+                self._persist_metrics()
             return self._cached
 
     def _materialize_response(self) -> None:
@@ -241,6 +265,7 @@ class OperationHandle(_OperationHandleMixin):
         if self.done():
             self._raise_if_failed()
             self._materialize_response()
+            self._persist_metrics()
             return self._cached
         for delay in _operation_poll_delays():
             time.sleep(delay)
@@ -305,6 +330,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
     _cached: Dict[str, Any]
     _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
     _response_source: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _metrics_persisted: bool = field(default=False, init=False, repr=False, compare=False)
     _response_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, init=False, repr=False, compare=False
     )
@@ -323,7 +349,22 @@ class AsyncOperationHandle(_OperationHandleMixin):
             reused_cache = self._install_refreshed_payload(payload)
             if self.status == "done" and not reused_cache:
                 await self._materialize_response_locked()
+            if self.status == "done":
+                await self._persist_metrics_async()
             return self._cached
+
+    async def _persist_metrics_async(self) -> None:
+        """Run optional persistence off the event loop."""
+        if self._metrics_persisted:
+            return
+        self._metrics_persisted = True
+        sink = getattr(self.client, "metric_sink", None)
+        if sink is None:
+            return
+        try:
+            await asyncio.to_thread(sink.persist, self.operation_id, self.response)
+        except Exception as exc:  # pragma: no cover - persistence is optional
+            logger.warning("Metric persistence failed for operation %s: %s", self.operation_id, exc)
 
     async def _materialize_response(self) -> None:
         async with self._response_lock:
@@ -364,6 +405,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
         if self.done():
             self._raise_if_failed()
             await self._materialize_response()
+            await self._persist_metrics_async()
             return self._cached
         for delay in _operation_poll_delays():
             await asyncio.sleep(delay)
@@ -390,6 +432,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
             raise WeaverAPIError(504, "timeout", "Operation polling timed out", True)
         self._raise_if_failed()
         await self._materialize_response()
+        await self._persist_metrics_async()
         return self._cached
 
     async def result(self) -> Any:
