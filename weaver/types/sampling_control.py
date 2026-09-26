@@ -30,7 +30,7 @@ class PauseMode(str, Enum):
       used for partial/async rollout weight swaps
       (abort -> drain -> sync_weights -> continue).
     - ``RETRACT``: retract running requests back into the waiting queue so they
-      resume from scratch after ``continue``.
+      retain generated tokens, rebuild KV as needed, and continue after resume.
     - ``IN_PLACE``: freeze requests where they are and resume them in place
       after ``continue``.
 

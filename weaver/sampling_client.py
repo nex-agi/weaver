@@ -207,13 +207,9 @@ class SamplingClient:
     def paused(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Iterator[Dict[str, Any]]:
         """Pause the engine for the duration of the block, then request a guarded resume.
 
-        A bare :meth:`pause_generation` that never reaches its
-        :meth:`continue_generation` — because the block raised, or the caller
-        returned early — leaves the engine frozen for good: nothing on the
-        server auto-resumes it. This pairs the two so the resume survives errors.
-
-        The resume is issued on *this* client even if the block replaced it with
-        a new one, which is correct: both address the same engine.
+        The server checks the pause identity and control state before resuming.
+        An uncertain weight update keeps the model paused; a rejected resume
+        does not replace the original exception from the block.
 
         Example:
             >>> with sampling_client.paused(mode=PauseMode.ABORT) as pause:
