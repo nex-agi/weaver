@@ -20,7 +20,7 @@ the sync and async sampling clients (issue #84).
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -95,20 +95,20 @@ class TestPauseMode:
 class TestSyncClient:
     def test_pause_generation_default_abort(self):
         client, mock_service = _make_sync_client()
-        mock_service.http.post.return_value = {"ok": True}
+        mock_service.http.post.return_value = {"ok": True, "pause_id": MODEL_ID}
 
         result = client.pause_generation()
 
         path, kwargs = mock_service.http.post.call_args[0], mock_service.http.post.call_args[1]
         assert path[0] == "/api/v1/sampling-sessions/sess-001/pause-generation"
-        assert kwargs["json"] == {"mode": "abort"}
-        assert result == {"ok": True}
+        assert kwargs["json"] == {"mode": "abort", "pause_id": ANY}
+        assert result == {"ok": True, "pause_id": MODEL_ID}
 
     def test_pause_generation_explicit_mode(self):
         client, mock_service = _make_sync_client()
-        mock_service.http.post.return_value = {}
+        mock_service.http.post.return_value = {"pause_id": MODEL_ID}
         client.pause_generation(mode=PauseMode.RETRACT)
-        assert mock_service.http.post.call_args[1]["json"] == {"mode": "retract"}
+        assert mock_service.http.post.call_args[1]["json"] == {"mode": "retract", "pause_id": ANY}
 
     def test_pause_generation_invalid_mode(self):
         client, _ = _make_sync_client()
@@ -117,20 +117,20 @@ class TestSyncClient:
 
     def test_continue_generation(self):
         client, mock_service = _make_sync_client()
-        mock_service.http.post.return_value = {"ok": True}
-        result = client.continue_generation()
+        mock_service.http.post.return_value = {"ok": True, "pause_id": MODEL_ID}
+        result = client.continue_generation(pause_id=MODEL_ID)
         assert (
             mock_service.http.post.call_args[0][0]
             == "/api/v1/sampling-sessions/sess-001/continue-generation"
         )
-        assert result == {"ok": True}
+        assert result == {"ok": True, "pause_id": MODEL_ID}
 
     def test_paused_resumes_on_success(self):
         client, mock_service = _make_sync_client()
-        mock_service.http.post.return_value = {"ok": True}
+        mock_service.http.post.return_value = {"ok": True, "pause_id": MODEL_ID}
 
         with client.paused() as result:
-            assert result == {"ok": True}
+            assert result == {"ok": True, "pause_id": MODEL_ID}
 
         paths = [call[0][0] for call in mock_service.http.post.call_args_list]
         assert paths == [
@@ -142,7 +142,7 @@ class TestSyncClient:
         """The whole point of the context manager: a frozen engine must not
         survive an error inside the block, since nothing auto-resumes it."""
         client, mock_service = _make_sync_client()
-        mock_service.http.post.return_value = {}
+        mock_service.http.post.return_value = {"pause_id": MODEL_ID}
 
         with pytest.raises(RuntimeError, match="boom"):
             with client.paused():
@@ -182,7 +182,7 @@ class TestSyncFullFTRestriction:
         client, mock_service = _make_sync_client(
             model_id=None, model_path=f"weaver://{MODEL_ID}/checkpoints/step-42"
         )
-        mock_service.http.post.return_value = {}
+        mock_service.http.post.return_value = {"pause_id": MODEL_ID}
 
         client.pause_generation()
 
@@ -190,7 +190,7 @@ class TestSyncFullFTRestriction:
 
     def test_eligibility_is_checked_once(self):
         client, mock_service = _make_sync_client()
-        mock_service.http.post.return_value = {}
+        mock_service.http.post.return_value = {"pause_id": MODEL_ID}
 
         client.pause_generation()
         client.continue_generation()
@@ -207,7 +207,7 @@ class TestSyncFullFTRestriction:
 class TestAsyncClient:
     def test_pause_generation_default_abort(self):
         client, mock_service = _make_async_client()
-        mock_service.http.post.return_value = {"ok": True}
+        mock_service.http.post.return_value = {"ok": True, "pause_id": MODEL_ID}
 
         result = asyncio.run(client.pause_generation())
 
@@ -215,13 +215,13 @@ class TestAsyncClient:
             mock_service.http.post.call_args[0][0]
             == "/api/v1/sampling-sessions/sess-001/pause-generation"
         )
-        assert mock_service.http.post.call_args[1]["json"] == {"mode": "abort"}
-        assert result == {"ok": True}
+        assert mock_service.http.post.call_args[1]["json"] == {"mode": "abort", "pause_id": ANY}
+        assert result == {"ok": True, "pause_id": MODEL_ID}
 
     def test_continue_generation(self):
         client, mock_service = _make_async_client()
-        mock_service.http.post.return_value = {"ok": True}
-        asyncio.run(client.continue_generation())
+        mock_service.http.post.return_value = {"ok": True, "pause_id": MODEL_ID}
+        asyncio.run(client.continue_generation(pause_id=MODEL_ID))
         assert (
             mock_service.http.post.call_args[0][0]
             == "/api/v1/sampling-sessions/sess-001/continue-generation"
@@ -234,11 +234,11 @@ class TestAsyncClient:
 
     def test_paused_resumes_on_success(self):
         client, mock_service = _make_async_client()
-        mock_service.http.post.return_value = {"ok": True}
+        mock_service.http.post.return_value = {"ok": True, "pause_id": MODEL_ID}
 
         async def _run():
             async with client.paused() as result:
-                assert result == {"ok": True}
+                assert result == {"ok": True, "pause_id": MODEL_ID}
 
         asyncio.run(_run())
 
@@ -250,7 +250,7 @@ class TestAsyncClient:
 
     def test_paused_resumes_on_exception(self):
         client, mock_service = _make_async_client()
-        mock_service.http.post.return_value = {}
+        mock_service.http.post.return_value = {"pause_id": MODEL_ID}
 
         async def _run():
             async with client.paused():
@@ -276,14 +276,14 @@ class TestAsyncFullFTRestriction:
         client, mock_service = _make_async_client(model_id=None, model_path=None)
 
         with pytest.raises(ValueError, match="not bound"):
-            asyncio.run(client.continue_generation())
+            asyncio.run(client.continue_generation(pause_id=MODEL_ID))
 
         mock_service.get_model.assert_not_called()
         mock_service.http.post.assert_not_called()
 
     def test_eligibility_is_checked_once(self):
         client, mock_service = _make_async_client()
-        mock_service.http.post.return_value = {}
+        mock_service.http.post.return_value = {"pause_id": MODEL_ID}
 
         async def _run():
             await client.pause_generation()
@@ -372,3 +372,26 @@ class TestResultSchema:
         kept = out["sequences"]
         assert len(kept) == 1
         assert kept[0]["stop_reason"] == "abort"
+
+
+def test_pause_id_is_retained_for_retry_and_resume():
+    client, service = _make_sync_client()
+    client.pause_generation(mode="retract", pause_id=MODEL_ID)
+    client.continue_generation()
+    assert service.http.post.call_args.kwargs["json"] == {"pause_id": MODEL_ID}
+
+
+def test_missing_pause_id_rejected_before_resume():
+    client, service = _make_sync_client()
+    with pytest.raises(ValueError, match="pause_id"):
+        client.continue_generation()
+    service.http.post.assert_not_called()
+
+
+def test_context_preserves_update_error_if_resume_is_rejected():
+    client, service = _make_sync_client()
+    service.http.post.side_effect = [{"pause_id": MODEL_ID}, RuntimeError("unknown weights")]
+    with pytest.raises(ValueError, match="update failed") as exc:
+        with client.paused():
+            raise ValueError("update failed")
+    assert str(exc.value.__cause__) == "unknown weights"

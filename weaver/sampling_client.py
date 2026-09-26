@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import uuid
+from typing import Optional
+
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List
 
@@ -168,84 +171,56 @@ class SamplingClient:
         )
         self._is_full_ft = True
 
-    def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Dict[str, Any]:
-        """Pause in-flight generation on the engine serving this model.
+    def pause_generation(
+        self, *, mode: PauseMode | str = PauseMode.ABORT, pause_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Pause all sampling sessions of this full-FT model at a confirmed barrier.
 
-        This is a stateless control primitive: it freezes the engine until
-        :meth:`continue_generation` is called. With the default
-        ``mode="abort"`` the waiting + running requests are aborted on the spot
-        and their partial output is returned to the callers of :meth:`sample`
-        (with ``stop_reason="abort"``) — this is the recovery shape used for
-        partial/async rollout weight swaps
-        (abort -> drain -> sync_weights -> continue).
-
-        **Scope**: the pause is engine-wide, not scoped to this sampling
-        session. It freezes every in-flight request on the engine, including
-        ones issued through an earlier sampling session of the same model —
-        which is exactly what a weight swap needs, since the requests to abort
-        are the ones belonging to the previous weight epoch.
-
-        **Full fine-tuning only.** A LoRA adapter is served from one shared
-        engine per base model, so pausing it would abort generation for
-        unrelated tenants; such a call is rejected before any request is sent.
-
-        Prefer :meth:`paused` over calling this directly: a pause that is never
-        continued leaves the engine frozen indefinitely, and there is no
-        server-side auto-resume.
-
-        Args:
-            mode: How to treat in-flight requests. One of :class:`PauseMode`
-                (``abort`` / ``retract`` / ``in_place``) or its string value.
-
-        Returns:
-            An acknowledgement, ``{"ok": True, "status": "paused", "mode": ...}``.
-            The engine's own reply is deliberately not surfaced: it carries
-            replica topology and backend details, and varies by engine version.
-
-        Raises:
-            ValueError: If ``mode`` is not a supported pause mode, or this
-                client is not bound to a full fine-tuning model.
+        Retract and in_place keep existing sample operations pending. Abort
+        terminates them. Retain the returned pause_id for weight updates and
+        recovery from a different client. Reuse an explicit ID after a timeout.
         """
         body = _su.build_pause_generation_body(mode)
+        body["pause_id"] = pause_id or str(uuid.uuid4())
         self._ensure_full_ft()
+        self._pause_id = body["pause_id"]
         return self._service.http.post(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation",
             json=body,
         )
 
-    def continue_generation(self) -> Dict[str, Any]:
-        """Resume generation after a :meth:`pause_generation` call.
-
-        Engine-wide and full-fine-tuning-only, like :meth:`pause_generation`.
-
-        Returns:
-            An acknowledgement, ``{"ok": True, "status": "running"}``.
-
-        Raises:
-            ValueError: If this client is not bound to a full fine-tuning model.
-        """
+    def continue_generation(self, *, pause_id: Optional[str] = None) -> Dict[str, Any]:
+        """Resume only the identified pause; reject stale IDs and failed updates."""
         self._ensure_full_ft()
+        token = pause_id or getattr(self, "_pause_id", None)
+        if not token:
+            raise ValueError("pause_id is required; use the ID returned by pause_generation")
         return self._service.http.post(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation",
+            json={"pause_id": token},
+        )
+
+    def generation_control(self) -> Dict[str, Any]:
+        """Read model-wide control status, revision, and supported cache policies."""
+        self._ensure_full_ft()
+        return self._service.http.get(
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/generation-control"
         )
 
     @contextmanager
     def paused(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Iterator[Dict[str, Any]]:
-        """Pause the engine for the duration of the block, then always resume.
+        """Pause the engine for the duration of the block, then request a guarded resume.
 
-        A bare :meth:`pause_generation` that never reaches its
-        :meth:`continue_generation` — because the block raised, or the caller
-        returned early — leaves the engine frozen for good: nothing on the
-        server auto-resumes it. This pairs the two so the resume survives errors.
-
-        The resume is issued on *this* client even if the block replaced it with
-        a new one, which is correct: both address the same engine.
+        The server checks the pause identity and control state before resuming.
+        An uncertain weight update keeps the model paused; a rejected resume
+        does not replace the original exception from the block.
 
         Example:
-            >>> with sampling_client.paused(mode=PauseMode.ABORT):
+            >>> with sampling_client.paused(mode=PauseMode.ABORT) as pause:
             ...     path = training_client.save_weights_for_sampler(name="step-42")
             ...     new_client = service.create_sampling_client(
-            ...         model_path=path, model_id=model_id, base_model=base_model
+            ...         model_path=path, model_id=model_id, base_model=base_model,
+            ...         pause_id=pause["pause_id"]
             ...     )
 
         Args:
@@ -261,8 +236,14 @@ class SamplingClient:
         result = self.pause_generation(mode=mode)
         try:
             yield result
-        finally:
-            self.continue_generation()
+        except BaseException as original:
+            try:
+                self.continue_generation(pause_id=result["pause_id"])
+            except BaseException as resume_error:
+                raise original from resume_error
+            raise
+        else:
+            self.continue_generation(pause_id=result["pause_id"])
 
     def _normalize_sample_result(self, payload: Any) -> Any:
         return _su.normalize_sample_result(payload, self._ensure_tokenizer)
