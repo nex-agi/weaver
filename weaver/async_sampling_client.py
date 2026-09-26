@@ -189,7 +189,9 @@ class AsyncSamplingClient:
         )
         self._is_full_ft = True
 
-    async def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT, pause_id: Optional[str] = None) -> Dict[str, Any]:
+    async def pause_generation(
+        self, *, mode: PauseMode | str = PauseMode.ABORT, pause_id: Optional[str] = None
+    ) -> Dict[str, Any]:
         """Pause all sampling sessions of this full-FT model at a confirmed barrier.
 
         Retract and in_place keep existing sample operations pending. Abort
@@ -201,7 +203,8 @@ class AsyncSamplingClient:
         await self._ensure_full_ft()
         self._pause_id = body["pause_id"]
         return await self._service.http.post(
-            f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation", json=body,
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation",
+            json=body,
         )
 
     async def continue_generation(self, *, pause_id: Optional[str] = None) -> Dict[str, Any]:
@@ -211,7 +214,8 @@ class AsyncSamplingClient:
         if not token:
             raise ValueError("pause_id is required; use the ID returned by pause_generation")
         return await self._service.http.post(
-            f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation", json={"pause_id": token},
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation",
+            json={"pause_id": token},
         )
 
     async def generation_control(self) -> Dict[str, Any]:
