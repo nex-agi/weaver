@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+import uuid
+from typing import Optional
+
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, overload
 
@@ -186,46 +189,61 @@ class AsyncSamplingClient:
         )
         self._is_full_ft = True
 
-    async def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT) -> Dict[str, Any]:
-        """Pause in-flight generation on the engine serving this model.
+    async def pause_generation(self, *, mode: PauseMode | str = PauseMode.ABORT, pause_id: Optional[str] = None) -> Dict[str, Any]:
+        """Pause all sampling sessions of this full-FT model at a confirmed barrier.
 
-        Engine-wide and full-fine-tuning-only. See
-        :meth:`weaver.sampling_client.SamplingClient.pause_generation`.
+        Retract and in_place keep existing sample operations pending. Abort
+        terminates them. Retain the returned pause_id for weight updates and
+        recovery from a different client. Reuse an explicit ID after a timeout.
         """
         body = _su.build_pause_generation_body(mode)
+        body["pause_id"] = pause_id or str(uuid.uuid4())
         await self._ensure_full_ft()
+        self._pause_id = body["pause_id"]
         return await self._service.http.post(
-            f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation",
-            json=body,
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/pause-generation", json=body,
         )
 
-    async def continue_generation(self) -> Dict[str, Any]:
-        """Resume generation after a :meth:`pause_generation` call.
-
-        See :meth:`weaver.sampling_client.SamplingClient.continue_generation`.
-        """
+    async def continue_generation(self, *, pause_id: Optional[str] = None) -> Dict[str, Any]:
+        """Resume only the identified pause; reject stale IDs and failed updates."""
         await self._ensure_full_ft()
+        token = pause_id or getattr(self, "_pause_id", None)
+        if not token:
+            raise ValueError("pause_id is required; use the ID returned by pause_generation")
         return await self._service.http.post(
-            f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation",
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/continue-generation", json={"pause_id": token},
+        )
+
+    async def generation_control(self) -> Dict[str, Any]:
+        """Read model-wide control status, revision, and supported cache policies."""
+        await self._ensure_full_ft()
+        return await self._service.http.get(
+            f"/api/v1/sampling-sessions/{self.sampling_session_id}/generation-control"
         )
 
     @asynccontextmanager
     async def paused(
         self, *, mode: PauseMode | str = PauseMode.ABORT
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Pause the engine for the duration of the block, then always resume.
+        """Pause the engine for the duration of the block, then request a guarded resume.
 
         See :meth:`weaver.sampling_client.SamplingClient.paused`.
 
         Example:
-            >>> async with sampling_client.paused(mode=PauseMode.ABORT):
+            >>> async with sampling_client.paused(mode=PauseMode.ABORT) as pause:
             ...     path = await training_client.save_weights_for_sampler(name="step-42")
         """
         result = await self.pause_generation(mode=mode)
         try:
             yield result
-        finally:
-            await self.continue_generation()
+        except BaseException as original:
+            try:
+                await self.continue_generation(pause_id=result["pause_id"])
+            except BaseException as resume_error:
+                raise original from resume_error
+            raise
+        else:
+            await self.continue_generation(pause_id=result["pause_id"])
 
     async def _ensure_tokenizer_source(self) -> None:
         """Make sure a tokenizer path or base_model is known (may fetch the session)."""

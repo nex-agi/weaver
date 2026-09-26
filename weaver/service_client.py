@@ -505,6 +505,9 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         sampling_session_id: Optional[str] = None,
         model_id: Optional[str] = None,
         tokenizer_path: Optional[str] = None,
+        cache_policy: str = "rebuild",
+        pause_id: Optional[str] = None,
+        weight_version: Optional[str] = None,
     ) -> "SamplingClient":
         from .sampling_client import SamplingClient  # local import to avoid cycles
 
@@ -519,6 +522,15 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             }
             if model_id:
                 body["model_id"] = model_id
+
+            if cache_policy not in ("rebuild", "preserve"):
+                raise ValueError("cache_policy must be rebuild or preserve")
+            if model_path:
+                body["cache_policy"] = cache_policy
+                if pause_id is not None:
+                    body["pause_id"] = pause_id
+                if weight_version is not None:
+                    body["weight_version"] = weight_version
 
             resp = self.http.post(
                 f"/api/v1/sessions/{self.session_id}/sampling-sessions",
