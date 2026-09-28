@@ -29,6 +29,8 @@ from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any, Mapping
 
+from .composite_ref import CompositeRef, is_composite_ref
+
 
 @dataclass(slots=True)
 class PayloadRef:
@@ -95,7 +97,7 @@ class PayloadRefMaterializationError(RuntimeError):
 
 
 def materialize_payload_ref(
-    ref: PayloadRef | Mapping[str, Any],
+    ref: PayloadRef | CompositeRef | Mapping[str, Any],
     *,
     field: str | None = None,
 ) -> Any:
@@ -105,9 +107,23 @@ def materialize_payload_ref(
     top-k indices as ``torch.save`` files on a shared filesystem. S3 refs are
     intentionally represented by the same schema, but should be resolved via a
     server-backed resolver once that backend is wired in.
+
+    Supported leaf formats are ``torch.save``, ``json`` and ``safetensors``
+    (the latter returns a ``{name: tensor}`` dict, e.g. ``{"indices": ...}``).
+
+    Composite refs (see :mod:`weaver.types.composite_ref`) materialize to a
+    single tensor: each leaf is loaded (``field`` selects the tensor inside it,
+    defaulting to ``"indices"`` or the leaf's only tensor), its segment rows
+    are sliced, and the slices are concatenated along dim 0. Trailing dims must
+    match; integer dtypes are upcast to the widest one.
     """
 
-    payload_ref = ref if isinstance(ref, PayloadRef) else PayloadRef.from_payload(ref)
+    if isinstance(ref, CompositeRef) or is_composite_ref(ref):
+        return _materialize_composite(CompositeRef.from_payload(ref), field=field)
+    if isinstance(ref, PayloadRef):
+        payload_ref = ref
+    else:
+        payload_ref = PayloadRef.from_payload(ref)
     storage = payload_ref.storage.lower()
     if storage not in {"gpfs", "filesystem", "local"}:
         raise PayloadRefMaterializationError(
@@ -131,6 +147,15 @@ def materialize_payload_ref(
         value = torch.load(local_path, map_location="cpu", weights_only=False)
     elif fmt == "json":
         value = json.loads(local_path.read_text(encoding="utf-8"))
+    elif fmt == "safetensors":
+        try:
+            from safetensors.torch import load_file
+        except ImportError as exc:  # pragma: no cover - depends on optional install
+            raise PayloadRefMaterializationError(
+                "Materializing safetensors payload refs requires the 'safetensors' and "
+                "'torch' packages (pip install safetensors torch)."
+            ) from exc
+        value = load_file(str(local_path), device="cpu")
     else:
         raise PayloadRefMaterializationError(
             f"Unsupported payload ref format for local materialization: {payload_ref.format!r}"
@@ -142,6 +167,77 @@ def materialize_payload_ref(
                 f"Materialized payload does not contain field {field!r}."
             )
         return value[field]
+    return value
+
+
+def _materialize_composite(composite: CompositeRef, *, field: str | None) -> Any:
+    try:
+        import torch
+    except ImportError as exc:  # pragma: no cover - depends on optional torch install
+        raise PayloadRefMaterializationError(
+            "Materializing composite payload refs requires torch."
+        ) from exc
+
+    segments = composite.segments
+    if not segments:
+        raise PayloadRefMaterializationError("Cannot materialize an empty composite ref.")
+
+    parts: list[Any] = []
+    for index, segment in enumerate(segments):
+        leaf_value = materialize_payload_ref(segment.ref)
+        tensor = _leaf_tensor(leaf_value, field=field, torch=torch, where=f"segment {index}")
+        rows = int(tensor.shape[0]) if tensor.dim() > 0 else 0
+        if segment.stop > rows:
+            raise PayloadRefMaterializationError(
+                f"segment {index}: rows [{segment.start}, {segment.stop}) exceed the "
+                f"materialized leaf's {rows} rows"
+            )
+        parts.append(tensor[segment.start : segment.stop])
+
+    trailing = tuple(parts[0].shape[1:])
+    for index, part in enumerate(parts[1:], start=1):
+        if tuple(part.shape[1:]) != trailing:
+            raise PayloadRefMaterializationError(
+                f"segment {index}: trailing dims {tuple(part.shape[1:])} do not match "
+                f"segment 0 trailing dims {trailing}"
+            )
+    dtypes = {part.dtype for part in parts}
+    if len(dtypes) > 1:
+        if any(
+            dtype.is_floating_point or dtype.is_complex or dtype == torch.bool for dtype in dtypes
+        ):
+            raise PayloadRefMaterializationError(
+                f"composite segments have incompatible dtypes: {sorted(map(str, dtypes))}"
+            )
+        target = parts[0].dtype
+        for dtype in dtypes:
+            target = torch.promote_types(target, dtype)
+        parts = [part.to(target) for part in parts]
+    return torch.cat(parts, dim=0)
+
+
+def _leaf_tensor(value: Any, *, field: str | None, torch: Any, where: str) -> Any:
+    if isinstance(value, Mapping):
+        if field is not None:
+            key = field
+        elif "indices" in value:
+            key = "indices"
+        elif len(value) == 1:
+            key = next(iter(value))
+        else:
+            raise PayloadRefMaterializationError(
+                f"{where}: leaf holds {sorted(value)}; pass field= to select one."
+            )
+        if key not in value:
+            raise PayloadRefMaterializationError(f"{where}: leaf does not contain field {key!r}.")
+        value = value[key]
+    if not isinstance(value, torch.Tensor):
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise PayloadRefMaterializationError(
+                f"{where}: leaf content is not tensor-like ({type(value).__name__})."
+            ) from exc
     return value
 
 
