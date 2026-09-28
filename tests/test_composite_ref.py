@@ -105,6 +105,7 @@ def test_from_leaf_deep_copies_input():
         (lambda leaf: (leaf.pop("uri"), leaf.pop("relative_path")), "relative_path"),
         (lambda leaf: leaf.update(kind="composite"), "nested"),
         (lambda leaf: leaf.update(segments=[]), "nested"),
+        (lambda leaf: leaf.update(path="/gpfs/elsewhere/seq-0.safetensors"), "path"),
     ],
 )
 def test_leaf_validation_errors(mutate, match):

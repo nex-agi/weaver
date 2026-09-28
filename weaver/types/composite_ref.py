@@ -423,6 +423,10 @@ def _validated_leaf(ref: Any, *, where: str) -> Mapping[str, Any]:
             raise ValueError(f"{where}: leaf ref requires a non-empty string {key!r}")
     if not any(isinstance(ref.get(key), str) and ref.get(key) for key in ("relative_path", "uri")):
         raise ValueError(f"{where}: leaf ref requires a non-empty 'relative_path' or 'uri'")
+    if "path" in ref:
+        # The server and trainer reject client-supplied absolute paths on
+        # composite leaves; fail here instead of at submission time.
+        raise ValueError(f"{where}: leaf ref must not carry 'path'; use 'relative_path'")
     return copy.deepcopy(dict(ref))
 
 
