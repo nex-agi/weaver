@@ -520,8 +520,16 @@ def _validated_leaf(ref: Any, *, where: str) -> Mapping[str, Any]:
         value = ref.get(key)
         if not isinstance(value, str) or not value:
             raise ValueError(f"{where}: leaf ref requires a non-empty string {key!r}")
-    if not any(isinstance(ref.get(key), str) and ref.get(key) for key in ("relative_path", "uri")):
-        raise ValueError(f"{where}: leaf ref requires a non-empty 'relative_path' or 'uri'")
+    # relative_path is the canonical locator (storage + relative_path); uri is
+    # only a convenience handle, so it may not stand alone or disagree.
+    relative_path = ref.get("relative_path")
+    if not isinstance(relative_path, str) or not relative_path:
+        raise ValueError(f"{where}: leaf ref requires a non-empty 'relative_path'")
+    uri = ref.get("uri")
+    if uri is not None and uri != f"weaver://{relative_path}":
+        raise ValueError(
+            f"{where}: leaf ref uri {uri!r} does not match relative_path {relative_path!r}"
+        )
     if "path" in ref:
         # The server and trainer reject client-supplied absolute paths on
         # composite leaves; fail here instead of at submission time.

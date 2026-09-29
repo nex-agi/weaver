@@ -116,13 +116,18 @@ def test_leaf_validation_errors(mutate, match):
         CompositeRef.from_leaf(leaf, num_rows=4)
 
 
-def test_leaf_only_uri_or_only_relative_path_is_enough():
+def test_leaf_relative_path_is_canonical_locator():
     leaf = r3_leaf("a", 4)
     leaf.pop("uri")
     assert len(CompositeRef.from_leaf(leaf)) == 4
     leaf = r3_leaf("a", 4)
     leaf.pop("relative_path")
-    assert len(CompositeRef.from_leaf(leaf)) == 4
+    with pytest.raises(ValueError, match="requires a non-empty 'relative_path'"):
+        CompositeRef.from_leaf(leaf)
+    leaf = r3_leaf("a", 4)
+    leaf["uri"] = "weaver://somewhere/else.safetensors"
+    with pytest.raises(ValueError, match="does not match relative_path"):
+        CompositeRef.from_leaf(leaf)
 
 
 def test_leaf_must_be_dict():
