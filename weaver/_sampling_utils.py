@@ -29,6 +29,7 @@ from transformers import PreTrainedTokenizer
 from ._utils import lookup_case_insensitive
 from .score_centering import REF_FIELD, SAMPLER_FIELDS
 from .types import LogprobsParams, ModelInput, SamplingParams
+from .types.payload_ref import MOE_TOPK_INDICES_REF_KEY, PayloadRef
 from .types.sampling_control import coerce_pause_mode
 
 if TYPE_CHECKING:
@@ -312,15 +313,51 @@ def sequences_from_result(
     return sequences
 
 
+def validate_sequence_payload_refs(sequences: Any) -> None:
+    """Fail loudly on a malformed server ``meta`` in any sequence's routing ref.
+
+    The raw ``moe_topk_indices_ref`` dict is surfaced verbatim (NexRL indexes
+    it), but when the server attached ``meta`` it is parsed here with
+    :class:`~weaver.types.payload_ref.PayloadRef` so a bad meta (wrong types,
+    ``num_rows != num_tokens - 1``, ``num_rows != shape[0]``) is rejected on
+    receipt instead of misaligning routing later. Refs without ``meta`` (older
+    servers) and non-dict refs are left alone.
+    """
+
+    if not isinstance(sequences, list):
+        return
+    for index, sequence in enumerate(sequences):
+        if not isinstance(sequence, dict):
+            continue
+        raw_ref = sequence.get(MOE_TOPK_INDICES_REF_KEY)
+        if not isinstance(raw_ref, dict) or raw_ref.get("meta") is None:
+            continue
+        try:
+            meta = PayloadRef.from_payload(raw_ref).meta
+        except ValueError as exc:
+            raise ValueError(
+                f"sample result sequence {index}: invalid {MOE_TOPK_INDICES_REF_KEY}: {exc}"
+            ) from exc
+        tokens = sequence.get("tokens")
+        if meta is not None and isinstance(tokens, list) and meta.response_tokens != len(tokens):
+            raise ValueError(
+                f"sample result sequence {index}: {MOE_TOPK_INDICES_REF_KEY}.meta describes "
+                f"{meta.response_tokens} response tokens (num_tokens={meta.num_tokens}, "
+                f"prompt_tokens={meta.prompt_tokens}) but the sequence has {len(tokens)}"
+            )
+
+
 def normalize_sample_result(payload: Any, get_tokenizer: TokenizerProvider) -> Any:
     if not isinstance(payload, dict):
         return payload
     if "sequences" in payload:
+        validate_sequence_payload_refs(payload["sequences"])
         return payload
     result = lookup_case_insensitive(payload, "result")
     if not isinstance(result, dict):
         return payload
     sequences = sequences_from_result(result, get_tokenizer)
+    validate_sequence_payload_refs(sequences)
     normalized = dict(payload)
     if sequences:
         normalized["sequences"] = sequences
