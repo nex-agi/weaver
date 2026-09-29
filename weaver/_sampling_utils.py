@@ -333,11 +333,18 @@ def validate_sequence_payload_refs(sequences: Any) -> None:
         if not isinstance(raw_ref, dict) or raw_ref.get("meta") is None:
             continue
         try:
-            PayloadRef.from_payload(raw_ref)
+            meta = PayloadRef.from_payload(raw_ref).meta
         except ValueError as exc:
             raise ValueError(
                 f"sample result sequence {index}: invalid {MOE_TOPK_INDICES_REF_KEY}: {exc}"
             ) from exc
+        tokens = sequence.get("tokens")
+        if meta is not None and isinstance(tokens, list) and meta.response_tokens != len(tokens):
+            raise ValueError(
+                f"sample result sequence {index}: {MOE_TOPK_INDICES_REF_KEY}.meta describes "
+                f"{meta.response_tokens} response tokens (num_tokens={meta.num_tokens}, "
+                f"prompt_tokens={meta.prompt_tokens}) but the sequence has {len(tokens)}"
+            )
 
 
 def normalize_sample_result(payload: Any, get_tokenizer: TokenizerProvider) -> Any:

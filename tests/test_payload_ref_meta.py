@@ -314,3 +314,12 @@ def test_sync_and_async_sample_without_meta(async_mode):
     seq = _run_sample(async_mode, _sample_payload(copy.deepcopy(ref)))["sequences"][0]
     assert seq["moe_topk_indices_ref"] == ref
     assert parse_moe_topk_indices_ref(seq).meta is None
+
+
+def test_normalize_rejects_meta_response_count_mismatch():
+    ref = r3_ref()  # meta describes 3 response tokens
+    payload = _sample_payload(ref)
+    seqs = payload["result"]["sequences"] if "result" in payload else payload["sequences"]
+    seqs[0]["tokens"] = seqs[0]["tokens"][:-1]
+    with pytest.raises(ValueError, match=r"sequence 0: .*describes 3 response tokens .* has 2"):
+        normalize_sample_result(payload, lambda: None)
