@@ -25,6 +25,7 @@ from weaver.types import (
     CompositeRef,
     is_composite_ref,
     merge_router_replay_prefix,
+    ref_meta,
 )
 from weaver.types.payload_ref import PayloadRefMaterializationError, materialize_payload_ref
 
@@ -370,6 +371,202 @@ def test_merge_errors():
         merge_router_replay_prefix(r3_leaf("a", 9), 10.0, r3_leaf("b", 15), 16)
     with pytest.raises(TypeError):
         merge_router_replay_prefix("nope", 10, r3_leaf("b", 15), 16)
+
+
+# ------------------------------------------------------------------ leaf meta
+
+
+def meta_leaf(rid: str, prompt: int, response: int, *, shape: bool = True, **overrides) -> dict:
+    """An R3 leaf as newer servers return it: ``meta`` over P prompt + R response tokens."""
+    num_tokens = prompt + response
+    leaf = r3_leaf(rid, num_tokens - 1 if shape else None)
+    leaf["meta"] = {
+        "token_alignment": "target_aligned",
+        "num_tokens": num_tokens,
+        "prompt_tokens": prompt,
+        "num_rows": num_tokens - 1,
+        **overrides,
+    }
+    return leaf
+
+
+def test_ref_meta_returns_copy_or_none():
+    leaf = meta_leaf("a", 4, 3)
+    meta = ref_meta(leaf)
+    assert meta == {
+        "token_alignment": "target_aligned",
+        "num_tokens": 7,
+        "prompt_tokens": 4,
+        "num_rows": 6,
+    }
+    meta["num_rows"] = 99
+    assert leaf["meta"]["num_rows"] == 6
+    assert ref_meta(r3_leaf("a", 6)) is None
+    assert ref_meta(CompositeRef.from_leaf(leaf)) is None
+    assert ref_meta(CompositeRef.from_leaf(leaf).to_payload()) is None
+    assert ref_meta("nope") is None
+
+
+FULL_META = {
+    "token_alignment": "target_aligned",
+    "num_tokens": 7,
+    "prompt_tokens": 4,
+    "num_rows": 6,
+}
+
+
+@pytest.mark.parametrize(
+    "meta, match",
+    [
+        ("x", "meta must be an object"),
+        ({"num_tokens": 7}, "meta is missing required keys"),
+        ({**FULL_META, "token_alignment": ""}, "token_alignment must be a non-empty string"),
+        ({**FULL_META, "num_rows": -1}, "meta.num_rows must be >= 0"),
+        ({**FULL_META, "num_tokens": 7.0}, "meta.num_tokens must be an int"),
+        ({**FULL_META, "num_tokens": True}, "meta.num_tokens must be an int"),
+        ({**FULL_META, "prompt_tokens": 8}, "exceeds meta.num_tokens"),
+        ({**FULL_META, "num_rows": 7}, "requires num_rows == num_tokens - 1"),
+    ],
+)
+def test_malformed_meta_rejected(meta, match):
+    leaf = r3_leaf("a", None)
+    leaf["meta"] = meta
+    with pytest.raises(ValueError, match=match):
+        ref_meta(leaf)
+    with pytest.raises(ValueError, match=match):
+        CompositeRef.from_leaf(leaf, num_rows=1)
+    with pytest.raises(ValueError, match=match):
+        merge_router_replay_prefix(leaf, 7, r3_leaf("b", 11), 12)
+
+
+def test_meta_null_is_treated_as_absent():
+    leaf = r3_leaf("a", 6)
+    leaf["meta"] = None
+    assert ref_meta(leaf) is None
+    assert len(CompositeRef.from_leaf(leaf)) == 6
+
+
+def test_from_leaf_row_count_precedence():
+    # meta.num_rows alone (no shape) is enough
+    assert len(CompositeRef.from_leaf(meta_leaf("a", 4, 3, shape=False))) == 6
+    # meta.num_rows beats token_count
+    leaf = meta_leaf("a", 4, 3, shape=False)
+    leaf["token_count"] = 3
+    assert len(CompositeRef.from_leaf(leaf)) == 6
+    # explicit num_rows beats meta (a prefix of the leaf)
+    assert len(CompositeRef.from_leaf(meta_leaf("a", 4, 3), num_rows=2)) == 2
+    # without meta: shape, then token_count (unchanged)
+    assert len(CompositeRef.from_leaf(r3_leaf("a", 5))) == 5
+    assert len(CompositeRef.from_leaf(mask_leaf("m", 8))) == 8
+
+
+def test_from_leaf_meta_rows_bound_explicit_num_rows():
+    with pytest.raises(ValueError, match="exceed the leaf's 6 rows"):
+        CompositeRef.from_leaf(meta_leaf("a", 4, 3, shape=False), num_rows=7)
+
+
+def test_meta_and_shape_disagreement_is_inconsistent():
+    leaf = meta_leaf("a", 4, 3)
+    leaf["shape"][0] = 5
+    with pytest.raises(
+        ValueError, match=r"inconsistent leaf ref: meta.num_rows=6 but shape\[0\]=5"
+    ):
+        CompositeRef.from_leaf(leaf)
+    with pytest.raises(ValueError, match="inconsistent leaf ref"):
+        CompositeRef.from_leaf(leaf, num_rows=5)
+    payload = {
+        "kind": "composite",
+        "schema": "weaver.payload_ref.composite.v1",
+        "segments": [{"ref": leaf, "start": 0, "count": 1}],
+    }
+    with pytest.raises(ValueError, match="inconsistent leaf ref"):
+        CompositeRef.from_payload(payload)
+
+
+def test_meta_survives_into_composite_payload_verbatim():
+    leaf = meta_leaf("a", 4, 3)
+    payload = CompositeRef.from_leaf(leaf)[:3].to_payload()
+    assert payload["segments"][0]["ref"] == leaf
+    assert CompositeRef.from_payload(json.loads(json.dumps(payload))).to_payload() == payload
+
+
+def test_merge_counts_from_meta_only():
+    # turn 1: 4 prompt + 3 response = 7 tokens; turn 2 extends it to 12 tokens.
+    leaf1, leaf2 = meta_leaf("t1", 4, 3, shape=False), meta_leaf("t2", 9, 3, shape=False)
+    merged = merge_router_replay_prefix(leaf1, None, leaf2, None)
+    assert merged == merge_router_replay_prefix(leaf1, 7, leaf2, 12)
+    assert merged == merge_router_replay_prefix(leaf1, nxt=leaf2)
+    assert spans(merged) == [(leaf1["uri"], 0, 6), (leaf2["uri"], 6, 11)]
+
+
+def test_merge_three_turn_chain_using_only_meta():
+    # 7 -> 12 -> 17 tokens; leaves carry meta but no shape.
+    leaves = [
+        meta_leaf("t1", 4, 3, shape=False),
+        meta_leaf("t2", 9, 3, shape=False),
+        meta_leaf("t3", 13, 4, shape=False),
+    ]
+    merged = merge_router_replay_prefix(leaves[0], nxt=leaves[1])
+    assert len(merged) == 11
+    # prev is a CompositeRef: its token count is len(ref) + 1
+    merged = merge_router_replay_prefix(merged, nxt=leaves[2])
+    assert len(merged) == 16
+    assert spans(merged) == [
+        (leaves[0]["uri"], 0, 6),
+        (leaves[1]["uri"], 6, 11),
+        (leaves[2]["uri"], 11, 16),
+    ]
+    # ...and the same for composite payload dicts
+    step = merge_router_replay_prefix(leaves[0], None, leaves[1], None).to_payload()
+    assert merge_router_replay_prefix(step, None, leaves[2], None) == merged
+    # identical to the explicit-count form
+    explicit = merge_router_replay_prefix(
+        merge_router_replay_prefix(leaves[0], 7, leaves[1], 12), 12, leaves[2], 17
+    )
+    assert explicit == merged
+
+
+def test_merge_counts_without_meta_fall_back_to_rows_plus_one():
+    leaf1, leaf2 = r3_leaf("t1", 9), r3_leaf("t2", 15)
+    assert merge_router_replay_prefix(leaf1, None, leaf2, None) == merge_router_replay_prefix(
+        leaf1, 10, leaf2, 16
+    )
+
+
+def test_merge_count_required_without_meta_or_rows():
+    with pytest.raises(ValueError, match="prev_num_tokens is required"):
+        merge_router_replay_prefix(r3_leaf("t1", None), None, r3_leaf("t2", None), 7)
+    with pytest.raises(ValueError, match="next_num_tokens is required"):
+        merge_router_replay_prefix(r3_leaf("t1", None), 4, r3_leaf("t2", None), None)
+
+
+def test_merge_explicit_count_disagreeing_with_meta_raises():
+    leaf1, leaf2 = meta_leaf("t1", 4, 3), meta_leaf("t2", 9, 3)
+    with pytest.raises(
+        ValueError, match=r"prev_num_tokens=8 disagrees with prev meta.num_tokens=7"
+    ):
+        merge_router_replay_prefix(leaf1, 8, leaf2, 12)
+    with pytest.raises(
+        ValueError, match=r"next_num_tokens=13 disagrees with nxt meta.num_tokens=12"
+    ):
+        merge_router_replay_prefix(leaf1, 7, leaf2, 13)
+
+
+def test_merge_mixed_meta_and_legacy_leaves():
+    leaf1, leaf2 = meta_leaf("t1", 4, 3), r3_leaf("t2", 11)
+    merged = merge_router_replay_prefix(leaf1, None, leaf2, None)
+    assert spans(merged) == [(leaf1["uri"], 0, 6), (leaf2["uri"], 6, 11)]
+
+
+def test_merge_rejects_non_target_aligned_meta():
+    leaf = meta_leaf("t1", 4, 3, token_alignment="input_aligned")
+    with pytest.raises(ValueError, match="must be 'target_aligned'"):
+        merge_router_replay_prefix(leaf, None, meta_leaf("t2", 9, 3), None)
+
+
+def test_merge_requires_nxt():
+    with pytest.raises(TypeError, match="nxt"):
+        merge_router_replay_prefix(meta_leaf("t1", 4, 3))
 
 
 # ------------------------------------------------------------------ materialize

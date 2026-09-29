@@ -30,6 +30,7 @@ from .composite_ref import (
     CompositeSegment,
     is_composite_ref,
     merge_router_replay_prefix,
+    ref_meta,
 )
 from .datum import Datum
 from .deployment import Deployment
@@ -46,7 +47,13 @@ from .managed_dataset import (
 )
 from .model_input import ModelInput, ModelInputChunk
 from .optim import AdamParams
-from .payload_ref import PayloadRef, PayloadRefMaterializationError, materialize_payload_ref
+from .payload_ref import (
+    PayloadRef,
+    PayloadRefMaterializationError,
+    PayloadRefMeta,
+    materialize_payload_ref,
+    parse_moe_topk_indices_ref,
+)
 from .router_replay import (
     ROUTER_REPLAY_DATUM_SCHEMA,
     ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK,

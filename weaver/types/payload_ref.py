@@ -22,19 +22,150 @@ helpers when they explicitly want to inspect the referenced bytes/content.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
-from .composite_ref import CompositeRef, is_composite_ref
+if TYPE_CHECKING:  # composite_ref imports this module; import it lazily at runtime.
+    from .composite_ref import CompositeRef
+
+TOKEN_ALIGNMENT_TARGET_ALIGNED = "target_aligned"
+MOE_TOPK_INDICES_REF_KEY = "moe_topk_indices_ref"
+
+_META_REQUIRED_KEYS = ("token_alignment", "num_tokens", "prompt_tokens", "num_rows")
+
+
+@dataclass(frozen=True, slots=True)
+class PayloadRefMeta:
+    """Server-attached description of the token sequence behind a leaf ref.
+
+    Newer servers attach this to each R3 router-replay leaf ref
+    (``sequence["moe_topk_indices_ref"]["meta"]``); older servers omit it::
+
+        {"token_alignment": "target_aligned", "num_tokens": P + R,
+         "prompt_tokens": P, "num_rows": P + R - 1}
+
+    ``P``/``R`` are the prompt/response token counts of that sampling request.
+
+    Target alignment: row ``i`` holds the routing used when input token ``i``
+    was forwarded, and that forward pass predicts token ``i + 1`` (its
+    *target*). The last sampled token is never forwarded, so ``N`` tokens have
+    ``N - 1`` rows. Hence the first response token (index ``P``) is the target
+    of row ``P - 1``, which is :attr:`response_row_start`.
+
+    Keys a newer server adds are kept in :attr:`extra` and written back by
+    :meth:`to_payload`, so parsing never drops information.
+
+    Raises:
+        ValueError: on construction, if a count is not a non-negative int,
+            ``prompt_tokens > num_tokens``, or a target-aligned meta has
+            ``num_rows != num_tokens - 1``.
+    """
+
+    token_alignment: str
+    num_tokens: int
+    prompt_tokens: int
+    num_rows: int
+    extra: dict[str, Any] = dataclass_field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.token_alignment, str) or not self.token_alignment:
+            raise ValueError(
+                f"meta.token_alignment must be a non-empty string, got {self.token_alignment!r}"
+            )
+        for key in ("num_tokens", "prompt_tokens", "num_rows"):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValueError(f"meta.{key} must be an int, got {value!r}")
+            if value < 0:
+                raise ValueError(f"meta.{key} must be >= 0, got {value}")
+        if self.prompt_tokens > self.num_tokens:
+            raise ValueError(
+                f"meta.prompt_tokens={self.prompt_tokens} exceeds "
+                f"meta.num_tokens={self.num_tokens}"
+            )
+        if self.is_target_aligned and self.num_rows != self.num_tokens - 1:
+            raise ValueError(
+                f"target_aligned meta requires num_rows == num_tokens - 1, got "
+                f"num_rows={self.num_rows}, num_tokens={self.num_tokens}"
+            )
+        if not isinstance(self.extra, dict):
+            raise ValueError(f"meta.extra must be a dict, got {type(self.extra).__name__}")
+        overlap = set(self.extra) & set(_META_REQUIRED_KEYS)
+        if overlap:
+            raise ValueError(f"meta.extra must not repeat typed keys: {sorted(overlap)}")
+
+    @classmethod
+    def from_payload(cls, payload: Any) -> PayloadRefMeta:
+        """Parse and validate a wire ``meta`` object; unknown keys go to ``extra``."""
+
+        if isinstance(payload, PayloadRefMeta):
+            return payload
+        if not isinstance(payload, Mapping):
+            raise ValueError(f"meta must be an object, got {type(payload).__name__}")
+        missing = [key for key in _META_REQUIRED_KEYS if key not in payload]
+        if missing:
+            raise ValueError(f"meta is missing required keys: {missing}")
+        return cls(
+            token_alignment=payload["token_alignment"],
+            num_tokens=payload["num_tokens"],
+            prompt_tokens=payload["prompt_tokens"],
+            num_rows=payload["num_rows"],
+            extra={
+                key: copy.deepcopy(value)
+                for key, value in payload.items()
+                if key not in _META_REQUIRED_KEYS
+            },
+        )
+
+    def to_payload(self) -> dict[str, Any]:
+        """Return the wire ``meta`` object (typed keys plus ``extra``)."""
+
+        return {
+            "token_alignment": self.token_alignment,
+            "num_tokens": self.num_tokens,
+            "prompt_tokens": self.prompt_tokens,
+            "num_rows": self.num_rows,
+            **copy.deepcopy(self.extra),
+        }
+
+    @property
+    def is_target_aligned(self) -> bool:
+        return self.token_alignment == TOKEN_ALIGNMENT_TARGET_ALIGNED
+
+    @property
+    def response_tokens(self) -> int:
+        """Number of response tokens: ``num_tokens - prompt_tokens``."""
+
+        return self.num_tokens - self.prompt_tokens
+
+    @property
+    def response_row_start(self) -> int | None:
+        """First row whose target is a response token, or None if not target-aligned.
+
+        Equals ``prompt_tokens - 1``: the row of the last prompt token, whose
+        forward pass produced the first response token. Rows
+        ``[response_row_start, num_rows)`` are the routing that generated the
+        response. With ``prompt_tokens == 0`` the first response token has no
+        row and this is 0.
+        """
+
+        if not self.is_target_aligned:
+            return None
+        return max(self.prompt_tokens - 1, 0)
 
 
 @dataclass(slots=True)
 class PayloadRef:
-    """Reference to a large payload stored outside the HTTP response body."""
+    """Reference to a large payload stored outside the HTTP response body.
+
+    ``meta`` is the typed server-attached :class:`PayloadRefMeta` (``None`` for
+    refs from older servers); other unknown keys are kept in ``metadata``.
+    """
 
     storage: str
     format: str
@@ -45,9 +176,24 @@ class PayloadRef:
     path: str | None = None
     dtype: str | None = None
     metadata: dict[str, Any] = dataclass_field(default_factory=dict)
+    meta: PayloadRefMeta | None = None
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "PayloadRef":
+        """Parse a wire leaf ref; ``payload["meta"]`` is validated into :attr:`meta`.
+
+        Raises:
+            ValueError: if ``meta`` is present but malformed, or its ``num_rows``
+                disagrees with ``shape[0]``.
+        """
+
+        raw_meta = payload.get("meta")
+        meta = None if raw_meta is None else PayloadRefMeta.from_payload(raw_meta)
+        shape_rows = _shape_rows(payload.get("shape"))
+        if meta is not None and shape_rows is not None and shape_rows != meta.num_rows:
+            raise ValueError(
+                f"inconsistent leaf ref: meta.num_rows={meta.num_rows} but shape[0]={shape_rows}"
+            )
         known = {
             "storage",
             "format",
@@ -58,6 +204,8 @@ class PayloadRef:
             "path",
             "dtype",
         }
+        if meta is not None:
+            known.add("meta")
         metadata = {key: value for key, value in payload.items() if key not in known}
         return cls(
             storage=str(payload.get("storage", "")),
@@ -69,6 +217,7 @@ class PayloadRef:
             path=_optional_str(payload.get("path")),
             dtype=_optional_str(payload.get("dtype")),
             metadata=metadata,
+            meta=meta,
         )
 
     def to_payload(self, *, include_private: bool = True) -> dict[str, Any]:
@@ -89,7 +238,35 @@ class PayloadRef:
         if self.dtype is not None:
             payload["dtype"] = self.dtype
         payload.update(self.metadata)
+        if self.meta is not None:
+            payload["meta"] = self.meta.to_payload()
         return payload
+
+
+def parse_moe_topk_indices_ref(sequence: Mapping[str, Any]) -> PayloadRef | None:
+    """Return a sample-result sequence's R3 routing ref as a typed :class:`PayloadRef`.
+
+    ``sequence`` is one entry of ``sample(...)["sequences"]``. Returns None when
+    the sequence has no ``moe_topk_indices_ref`` (R3 not requested, or the
+    indices came back inline). The raw dict stays available as
+    ``sequence["moe_topk_indices_ref"]``::
+
+        ref = parse_moe_topk_indices_ref(seq)
+        if ref is not None and ref.meta is not None:
+            ref.meta.prompt_tokens, ref.meta.num_rows, ref.meta.response_row_start
+
+    Raises:
+        ValueError: if the ref is not an object or its ``meta`` is malformed.
+    """
+
+    raw = sequence.get(MOE_TOPK_INDICES_REF_KEY)
+    if raw is None:
+        return None
+    if isinstance(raw, PayloadRef):
+        return raw
+    if not isinstance(raw, Mapping):
+        raise ValueError(f"{MOE_TOPK_INDICES_REF_KEY} must be an object, got {type(raw).__name__}")
+    return PayloadRef.from_payload(raw)
 
 
 class PayloadRefMaterializationError(RuntimeError):
@@ -117,6 +294,8 @@ def materialize_payload_ref(
     are sliced, and the slices are concatenated along dim 0. Trailing dims must
     match; integer dtypes are upcast to the widest one.
     """
+
+    from .composite_ref import CompositeRef, is_composite_ref
 
     if isinstance(ref, CompositeRef) or is_composite_ref(ref):
         return _materialize_composite(CompositeRef.from_payload(ref), field=field)
@@ -285,6 +464,14 @@ def _resolve_weaver_uri(uri: str) -> Path | None:
         if root:
             return Path(root) / relative
     return Path(relative)
+
+
+def _shape_rows(shape: Any) -> int | None:
+    if isinstance(shape, list | tuple) and shape:
+        first = shape[0]
+        if isinstance(first, int) and not isinstance(first, bool):
+            return first
+    return None
 
 
 def _optional_str(value: Any) -> str | None:

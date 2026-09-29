@@ -39,6 +39,18 @@ Rules:
 * Composites are flat: a segment's ``ref`` is never itself composite.
 * v1 supports only ``ref`` segments (no ``fill``/``inline``).
 
+Leaf meta: newer servers attach a ``meta`` object to each R3 leaf ref::
+
+    {"token_alignment": "target_aligned", "num_tokens": P + R,
+     "prompt_tokens": P, "num_rows": P + R - 1}
+
+It is parsed by :class:`~weaver.types.payload_ref.PayloadRefMeta` and, when
+present, is the authoritative row/token count (see :func:`ref_meta`); older
+servers omit it and everything falls back to ``shape``/``token_count`` or
+explicit counts. Leaves may be raw dicts or typed
+:class:`~weaver.types.payload_ref.PayloadRef` objects; they (meta included) are
+carried verbatim into composites.
+
 Example::
 
     >>> leaf = {"storage": "gpfs", "format": "safetensors", "schema": "s",
@@ -55,9 +67,13 @@ from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from .payload_ref import TOKEN_ALIGNMENT_TARGET_ALIGNED, PayloadRef, PayloadRefMeta
+
 COMPOSITE_REF_KIND = "composite"
 COMPOSITE_REF_SCHEMA = "weaver.payload_ref.composite.v1"
 MAX_COMPOSITE_SEGMENTS = 1024
+
+LeafRef = Mapping[str, Any] | PayloadRef
 
 _TOP_LEVEL_KEYS = frozenset({"kind", "schema", "segments"})
 _SEGMENT_KEYS = frozenset({"ref", "start", "count"})
@@ -93,8 +109,8 @@ class CompositeRef:
     representation stays minimal across repeated slice/concat.
 
     Leaf dicts are never guessed into composites: wrap them explicitly with
-    :meth:`from_leaf`, which needs a row count (explicit, ``shape[0]`` or
-    ``token_count``).
+    :meth:`from_leaf`, which needs a row count (explicit, ``meta.num_rows``,
+    ``shape[0]`` or ``token_count``).
     """
 
     __slots__ = ("_segments", "_len")
@@ -151,12 +167,18 @@ class CompositeRef:
         object.__setattr__(self, "_len", sum(seg.count for seg in normalized))
 
     @classmethod
-    def from_leaf(cls, ref: Mapping[str, Any], num_rows: int | None = None) -> CompositeRef:
+    def from_leaf(cls, ref: LeafRef, num_rows: int | None = None) -> CompositeRef:
         """Wrap a leaf ref covering rows ``[0, num_rows)``.
 
-        ``num_rows`` defaults to ``ref["shape"][0]`` (R3 indices refs), then
-        ``ref["token_count"]`` (sampling-mask refs). If neither is present the
-        row count cannot be inferred and ``num_rows`` must be passed.
+        Row count precedence: explicit ``num_rows`` > ``ref["meta"]["num_rows"]``
+        (server-attached, see :func:`ref_meta`) > ``ref["shape"][0]`` (R3
+        indices refs) > ``ref["token_count"]`` (sampling-mask refs). If none is
+        available ``num_rows`` must be passed. ``ref`` may be a leaf dict or a
+        typed :class:`PayloadRef` (its ``meta`` is used the same way).
+
+        Raises:
+            ValueError: if ``meta.num_rows`` and ``shape[0]`` both exist and
+                differ (inconsistent ref), or ``meta`` is malformed.
         """
 
         leaf = _validated_leaf(ref, where="leaf")
@@ -164,8 +186,8 @@ class CompositeRef:
             num_rows = _leaf_num_rows(leaf)
             if num_rows is None:
                 raise ValueError(
-                    "num_rows is required: leaf ref has neither 'shape' nor 'token_count' "
-                    "to infer its row count from."
+                    "num_rows is required: leaf ref has no 'meta.num_rows', 'shape' or "
+                    "'token_count' to infer its row count from."
                 )
         num_rows = _non_negative_int(num_rows, "num_rows")
         _check_leaf_bounds(leaf, 0, num_rows, where="leaf")
@@ -183,7 +205,7 @@ class CompositeRef:
             result = obj
         elif is_composite_ref(obj):
             result = cls._parse_composite(obj)
-        elif isinstance(obj, Mapping):
+        elif isinstance(obj, Mapping | PayloadRef):
             return cls.from_leaf(obj, num_rows)
         else:
             raise TypeError(f"expected a payload ref mapping or CompositeRef, got {type(obj)!r}")
@@ -329,11 +351,35 @@ class CompositeRef:
         return f"CompositeRef(len={self._len}, segments=[{parts}])"
 
 
+def ref_meta(ref: Any) -> dict[str, Any] | None:
+    """Return a copy of a leaf ref's server-attached ``meta``, or None.
+
+    Newer servers attach, to each R3 leaf ref::
+
+        {"token_alignment": "target_aligned", "num_tokens": P + R,
+         "prompt_tokens": P, "num_rows": P + R - 1}
+
+    where ``P``/``R`` are the prompt/response token counts of that sampling
+    request. Older servers omit it; composites and non-refs return None. For
+    the typed form use :class:`~weaver.types.payload_ref.PayloadRef` ``.meta``.
+
+    Raises:
+        ValueError: if ``meta`` is present but malformed or self-inconsistent.
+    """
+
+    if isinstance(ref, PayloadRef):
+        return None if ref.meta is None else ref.meta.to_payload()
+    if isinstance(ref, CompositeRef) or is_composite_ref(ref) or not isinstance(ref, Mapping):
+        return None
+    meta = _leaf_meta(ref, where="ref")
+    return None if meta is None else meta.to_payload()
+
+
 def merge_router_replay_prefix(
-    prev: Mapping[str, Any] | CompositeRef,
-    prev_num_tokens: int,
-    nxt: Mapping[str, Any] | CompositeRef,
-    next_num_tokens: int,
+    prev: LeafRef | CompositeRef,
+    prev_num_tokens: int | None = None,
+    nxt: LeafRef | CompositeRef | None = None,
+    next_num_tokens: int | None = None,
 ) -> CompositeRef:
     """Merge R3 router-replay refs of a turn and its prefix-extending next turn.
 
@@ -355,20 +401,37 @@ def merge_router_replay_prefix(
     produced by turn 1's own forward passes and are what turn 1 was actually
     sampled with.
 
-    ``prev``/``nxt`` may be leaf dicts (row count from ``shape[0]``, else
-    assumed ``num_tokens - 1``), :class:`CompositeRef` objects, or composite
-    payload dicts, so chained merges over K turns work::
+    ``prev``/``nxt`` may be leaf dicts, typed
+    :class:`~weaver.types.payload_ref.PayloadRef` leaves, :class:`CompositeRef`
+    objects, or composite payload dicts. Token counts are optional; when ``None`` they are
+    derived from the ref:
 
-        merged = merge_router_replay_prefix(ref1, L1, ref2, L2)
-        merged = merge_router_replay_prefix(merged, L2, ref3, L3)
+    * leaf: ``meta.num_tokens`` (see :func:`ref_meta`), else row count + 1
+      (row count from ``meta.num_rows``/``shape[0]``/``token_count``);
+    * composite: ``len(ref) + 1`` (a merged R3 composite over L tokens has
+      L-1 rows).
+
+    When a count is given explicitly and the leaf's ``meta.num_tokens``
+    disagrees, the tokens being merged are not the tokens the sampler saw
+    (e.g. retokenization drift) and a ValueError is raised. For leaves without
+    row information an explicit count is required (rows assumed ``count - 1``).
+    Chained merges over K turns work by feeding the result back as ``prev``::
+
+        merged = merge_router_replay_prefix(ref1, None, ref2, None)  # meta-only
+        merged = merge_router_replay_prefix(merged, nxt=ref3)
+        merged = merge_router_replay_prefix(ref1, L1, ref2, L2)      # explicit counts
 
     Raises:
         ValueError: if ``prev_num_tokens > next_num_tokens``, a token count is
-            not positive, or either side has too few rows.
+            not positive, cannot be derived, disagrees with ``meta``, or either
+            side has too few rows.
     """
 
-    prev_num_tokens = _non_negative_int(prev_num_tokens, "prev_num_tokens")
-    next_num_tokens = _non_negative_int(next_num_tokens, "next_num_tokens")
+    if nxt is None:
+        raise TypeError("merge_router_replay_prefix() missing required argument 'nxt'")
+    prev, nxt = _leaf_mapping(prev), _leaf_mapping(nxt)
+    prev_num_tokens = _router_replay_num_tokens(prev, prev_num_tokens, "prev", "prev_num_tokens")
+    next_num_tokens = _router_replay_num_tokens(nxt, next_num_tokens, "nxt", "next_num_tokens")
     if prev_num_tokens < 1:
         raise ValueError("prev_num_tokens must be >= 1")
     if prev_num_tokens > next_num_tokens:
@@ -396,16 +459,52 @@ def merge_router_replay_prefix(
 # ---------------------------------------------------------------------- helpers
 
 
+def _router_replay_num_tokens(obj: Any, num_tokens: Any, name: str, count_name: str) -> int:
+    """Resolve (or cross-check) the token count of one side of an R3 merge."""
+
+    if num_tokens is not None:
+        num_tokens = _non_negative_int(num_tokens, count_name)
+    if is_composite_ref(obj):
+        if num_tokens is not None:
+            return num_tokens
+        return len(CompositeRef.from_payload(obj)) + 1
+    if not isinstance(obj, Mapping):
+        raise TypeError(f"{name} must be a leaf ref dict or CompositeRef, got {type(obj)!r}")
+    meta = _leaf_meta(obj, where=name)
+    if meta is not None and not meta.is_target_aligned:
+        raise ValueError(
+            f"{name}: router replay refs must be {TOKEN_ALIGNMENT_TARGET_ALIGNED!r}, "
+            f"got meta.token_alignment={meta.token_alignment!r}"
+        )
+    meta_tokens = None if meta is None else meta.num_tokens
+    if num_tokens is not None:
+        if meta_tokens is not None and meta_tokens != num_tokens:
+            raise ValueError(
+                f"{count_name}={num_tokens} disagrees with {name} meta.num_tokens="
+                f"{meta_tokens}: the tokens being merged are not the tokens the sampler "
+                "saw (retokenization drift?)"
+            )
+        return num_tokens
+    if meta_tokens is not None:
+        return meta_tokens
+    rows = _leaf_num_rows(obj, where=name)
+    if rows is None:
+        raise ValueError(
+            f"{count_name} is required: {name} has no 'meta.num_tokens', 'meta.num_rows', "
+            "'shape' or 'token_count' to derive it from"
+        )
+    return rows + 1
+
+
 def _as_router_replay_composite(obj: Any, num_tokens: int, name: str) -> CompositeRef:
     if is_composite_ref(obj):
         return CompositeRef.from_payload(obj)
-    if not isinstance(obj, Mapping):
-        raise TypeError(f"{name} must be a leaf ref dict or CompositeRef, got {type(obj)!r}")
-    num_rows = _leaf_num_rows(obj)
+    num_rows = _leaf_num_rows(obj, where=name)
     return CompositeRef.from_leaf(obj, num_tokens - 1 if num_rows is None else num_rows)
 
 
 def _validated_leaf(ref: Any, *, where: str) -> Mapping[str, Any]:
+    ref = _leaf_mapping(ref)
     if isinstance(ref, CompositeRef) or (
         isinstance(ref, Mapping)
         and (
@@ -427,13 +526,46 @@ def _validated_leaf(ref: Any, *, where: str) -> Mapping[str, Any]:
         # The server and trainer reject client-supplied absolute paths on
         # composite leaves; fail here instead of at submission time.
         raise ValueError(f"{where}: leaf ref must not carry 'path'; use 'relative_path'")
+    _leaf_num_rows(ref, where=where)  # validates meta and meta/shape consistency
     return copy.deepcopy(dict(ref))
 
 
-def _leaf_num_rows(ref: Mapping[str, Any]) -> int | None:
+def _leaf_mapping(obj: Any) -> Any:
+    """Turn a typed :class:`PayloadRef` into its wire dict; pass anything else through."""
+
+    return obj.to_payload() if isinstance(obj, PayloadRef) else obj
+
+
+def _leaf_meta(ref: Mapping[str, Any], *, where: str) -> PayloadRefMeta | None:
+    """Parse ``ref["meta"]`` with :class:`PayloadRefMeta`, or None when absent."""
+
+    meta = ref.get("meta")
+    if meta is None:
+        return None
+    try:
+        return PayloadRefMeta.from_payload(meta)
+    except ValueError as exc:
+        raise ValueError(f"{where}: invalid leaf ref {exc}") from exc
+
+
+def _leaf_num_rows(ref: Mapping[str, Any], *, where: str = "leaf") -> int | None:
+    """Row count: ``meta.num_rows`` > ``shape[0]`` > ``token_count`` > None."""
+
+    meta = _leaf_meta(ref, where=where)
+    meta_rows = None if meta is None else meta.num_rows
+    shape_rows = None
     shape = ref.get("shape")
     if isinstance(shape, list | tuple) and shape and _is_int(shape[0]) and shape[0] >= 0:
-        return int(shape[0])
+        shape_rows = int(shape[0])
+    if meta_rows is not None:
+        if shape_rows is not None and shape_rows != meta_rows:
+            raise ValueError(
+                f"{where}: inconsistent leaf ref: meta.num_rows={meta_rows} but "
+                f"shape[0]={shape_rows}"
+            )
+        return meta_rows
+    if shape_rows is not None:
+        return shape_rows
     token_count = ref.get("token_count")
     if isinstance(token_count, int) and not isinstance(token_count, bool) and token_count >= 0:
         return token_count
@@ -441,7 +573,7 @@ def _leaf_num_rows(ref: Mapping[str, Any]) -> int | None:
 
 
 def _check_leaf_bounds(leaf: Mapping[str, Any], start: int, count: int, *, where: str) -> None:
-    rows = _leaf_num_rows(leaf)
+    rows = _leaf_num_rows(leaf, where=where)
     if rows is not None and start + count > rows:
         raise ValueError(f"{where}: rows [{start}, {start + count}) exceed the leaf's {rows} rows")
 
