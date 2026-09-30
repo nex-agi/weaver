@@ -98,6 +98,11 @@ def parse_args() -> argparse.Namespace:
         help="supported base model; defaults to WEAVER_BASE_MODEL or Qwen/Qwen3-8B",
     )
     parser.add_argument(
+        "--tokenizer-path",
+        default=os.getenv("WEAVER_TOKENIZER_PATH"),
+        help="optional local tokenizer directory for the client machine",
+    )
+    parser.add_argument(
         "--tensor-transport",
         choices=("default", "http-binary"),
         default=None,
@@ -126,6 +131,8 @@ def main() -> None:
             training_mode="full_ft",
         )
         print(f"Model ID: {training_client.model_id}")
+        if args.tokenizer_path:
+            training_client.tokenizer_path = args.tokenizer_path
         tokenizer = training_client.get_tokenizer()
 
         processed_examples = [process_example(example, tokenizer) for example in EXAMPLES]
