@@ -15,7 +15,8 @@
 
 Run with ``--tensor-transport http-binary`` to use binary tensor packs. Zstandard
 compression is enabled by default for binary packs; select ``--tensor-compression raw``
-to disable it.
+to disable it. Select another supported model with ``--base-model`` and give each
+acceptance run a unique ``--checkpoint-name``.
 """
 
 from __future__ import annotations
@@ -61,6 +62,8 @@ def process_example(example: Dict[str, str], tokenizer) -> types.Datum:
 
 
 def visualize(datum: types.Datum, tokenizer) -> None:
+    if datum.model_input is None:
+        raise ValueError("Datum requires model_input")
     print(f"{'Input':<20} {'Target':<20} {'Weight':<10}")
     print("-" * 50)
     for inp, tgt, wgt in zip(
@@ -84,6 +87,11 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line tensor transport options."""
 
     parser = argparse.ArgumentParser(description="Run the Pig Latin full-FT example.")
+    parser.add_argument(
+        "--checkpoint-name",
+        default=os.getenv("WEAVER_CHECKPOINT_NAME", "pig-latin-model"),
+        help="checkpoint name; use a unique name for each acceptance run",
+    )
     parser.add_argument(
         "--base-model",
         default=os.getenv("WEAVER_BASE_MODEL", "Qwen/Qwen3-8B"),
@@ -112,6 +120,7 @@ def main() -> None:
         tensor_transport=args.tensor_transport,
         tensor_compression=args.tensor_compression,
     ) as service_client:
+        print(f"Session ID: {service_client.session_id}")
         training_client = service_client.create_model(
             base_model=base_model,
             training_mode="full_ft",
@@ -138,10 +147,12 @@ def main() -> None:
                 dim=0,
             )
             loss = -torch.dot(logprobs, weights) / weights.sum()
+            if not bool(torch.isfinite(loss)):
+                raise ValueError(f"Step {step} returned non-finite loss: {float(loss)}")
             print(f"Step {step}: loss/token={float(loss):.4f}")
 
         sampling_client = training_client.save_weights_and_get_sampling_client(
-            name="pig-latin-model"
+            name=args.checkpoint_name
         )
         prompt_tokens = tokenizer.encode(
             "English: coffee break\nPig Latin:", add_special_tokens=True
