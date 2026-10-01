@@ -241,6 +241,7 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         self._model_seq_counter = 1
         self._sampling_seq_counter = 1
         self._operation_seq_by_model: Dict[str, int] = {}
+        self._online_bench_guards: Dict[str, Any] = {}
         self._created_models: List[str] = []
         self._atexit_registered = False
 
