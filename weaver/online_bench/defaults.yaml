@@ -1,6 +1,6 @@
 online_bench:
   enabled: false
   every_n_steps: 100
-  timeout_seconds: 3600
   results_path: null
+  save_artifacts: false
   suites: []

@@ -1,0 +1,45 @@
+# Native Harbor configuration. Task revisions are examples, not server rules.
+n_concurrent_trials: 3
+n_attempts: 1
+retry:
+  max_retries: 0
+environment:
+  type: e2b
+  delete: true
+  suppress_override_warnings: true
+  env: {}
+agents:
+- override_timeout_sec: 1800
+  kwargs:
+    working_directory: /testbed
+    version: 2.1.139
+    max_turns: 100
+    reasoning_effort: xhigh
+    disallowed_tools: WebFetch,WebSearch,AskUserQuestion,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,CronCreate,CronDelete,CronList,Task,TaskOutput,TaskStop,NotebookEdit,ScheduleWakeup
+    instruction_suffix: '
+
+
+      <system-reminder>You are an autonomous coding agent running inside a sandboxed
+      Linux environment. You are solving a self-contained task end-to-end with no
+      human in the loop. After making changes, you must run or write appropriate tests
+      to verify that your fix works correctly and does not introduce regressions.</system-reminder>'
+    system_prompt_path: configs/harness/systemprompt_claude_code2.md
+  import_path: nexau_agent.claude_code_direct:ClaudeCodeDirect
+  env: {}
+datasets: []
+artifacts: []
+verifier:
+  override_timeout_sec: 600
+tasks:
+- name: swe-bench/astropy__astropy-12907
+  ref: sha256:ac0ee52cbc40897a3cb6058dbb13d9e0a78f0f237ca77dd206c4e0c2de1bd4b3
+- name: swe-bench/django__django-11099
+  ref: sha256:7d972590a201efeb9d2426c4a7d0fa1f2e6ffd19abb6a6f6574bbd1d38071c4e
+- name: swe-bench/pytest-dev__pytest-7490
+  ref: sha256:54b8bdede24e61d64f43e6dcfee8c5cab7a387dd710d1fbc0bd7320199ec935b
+- name: swe-bench/django__django-11133
+  ref: sha256:48ebf0827ec5fe4b7c6756680396126756ddf53ea18eaa1a86bc5c34628b79c3
+- name: swe-bench/pytest-dev__pytest-7982
+  ref: sha256:59d58f28e7e26c00ba32f621f0c6dae5c8987ab774f6b2999758e2a8992c248a
+metrics:
+- type: mean

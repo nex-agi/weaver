@@ -176,6 +176,10 @@ class BenchState:
             cases = suite.get("cases")
             if not isinstance(cases, list) or not cases:
                 raise ValueError("online-bench suite has no case results")
+            if type(suite.get("expected_cases")) is not int or suite["expected_cases"] != len(
+                cases
+            ):
+                raise ValueError("online-bench suite case count is incomplete")
             identities = set()
             for case in cases:
                 if not isinstance(case, dict) or case.get("status") != "completed":
@@ -183,22 +187,42 @@ class BenchState:
                 name, ref, score = case.get("name"), case.get("ref"), case.get("score")
                 if not isinstance(name, str) or not name or not isinstance(ref, str) or not ref:
                     raise ValueError("online-bench case lacks task identity")
+                attempt = case.get("attempt")
                 if (
-                    name in identities
+                    type(attempt) is not int
+                    or attempt < 1
+                    or (name, attempt) in identities
                     or not isinstance(score, (int, float))
                     or isinstance(score, bool)
                     or not math.isfinite(score)
                 ):
                     raise ValueError("online-bench case has duplicate identity or invalid score")
-                identities.add(name)
+                identities.add((name, attempt))
         return payload
 
     def save_config(self) -> None:
         """Create the ordinary caller-owned output directory at configuration time."""
-        self.directory.mkdir(parents=True, exist_ok=True)
-        (self.directory / "config.yaml").write_text(
-            yaml.safe_dump({"online_bench": self.config.model_dump(mode="json")}), encoding="utf-8"
-        )
+        policy = self.config.server_payload()
+        snapshots = {}
+        for suite in policy["suites"]:
+            filename = "suite-" + suite["name"] + ".yaml"
+            snapshots[filename] = yaml.safe_dump(suite["harbor_config"], sort_keys=False)
+            suite["harbor_config"] = filename
+        snapshots["config.yaml"] = yaml.safe_dump({"online_bench": policy}, sort_keys=False)
+        # Reserve the run directory before publishing anything. A second SDK
+        # instance must never overwrite an active run's frozen config, even when
+        # its subsequent server configure request would be rejected.
+        self.directory.parent.mkdir(parents=True, exist_ok=True)
+        self.directory.mkdir(mode=0o700, exist_ok=False)
+        for filename, contents in snapshots.items():
+            with (self.directory / filename).open("x", encoding="utf-8") as stream:
+                stream.write(contents)
+
+    def save_timing(self, step: int, phase: str, timings: dict[str, float]) -> None:
+        """Record driver blocking time separately from asynchronous benchmark duration."""
+        record = dict(completed_step=step, phase=phase, timings=timings)
+        with (self.directory / "timings.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, allow_nan=False) + "\n")
 
     def save_result(self, result: dict[str, Any]) -> None:
         """Save normal JSON and JSONL with in-process repeated-observation dedup."""

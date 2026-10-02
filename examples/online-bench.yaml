@@ -1,8 +1,0 @@
-online_bench:
-  enabled: true
-  every_n_steps: 100
-  timeout_seconds: 3600
-  results_path: null
-  suites:
-    - name: swe_probe
-      harbor_config: swe-verified-smoke-v1.yaml

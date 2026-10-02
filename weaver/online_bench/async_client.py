@@ -74,6 +74,7 @@ class AsyncOnlineBench:
             ):
                 raise RuntimeError("online-bench is already configured for this training run")
             try:
+                await asyncio.to_thread(self._state.save_config)
                 response = await self._http.post(
                     self._state.path, json=config.server_payload(), max_retries=1
                 )
@@ -83,7 +84,6 @@ class AsyncOnlineBench:
                     await asyncio.sleep(self._poll_interval)
                     response = await self._http.get(self._state.path)
                 self._state.configure(response)
-                await asyncio.to_thread(self._state.save_config)
                 self._configuring = False
             except BaseException as exc:
                 self._state.failure = exc
@@ -104,6 +104,7 @@ class AsyncOnlineBench:
         try:
             if not self._state.config.enabled:
                 return []
+            started = time.monotonic()
             trigger = self._state.check_step(completed_step)
             if trigger:
                 await self._http.post(
@@ -112,8 +113,9 @@ class AsyncOnlineBench:
                     max_retries=1,
                 )
             results = await self._observe(wait=trigger)
+            observed = time.monotonic()
             if trigger:
-                self._state.deadline = time.monotonic() + self._state.config.timeout_seconds
+                self._state.deadline = time.monotonic() + self._state.config.round_timeout_seconds
                 response = await self._http.post(
                     self._state.path + "/evaluations",
                     json={
@@ -129,6 +131,12 @@ class AsyncOnlineBench:
                         break
                     await asyncio.sleep(self._poll_interval)
                     await self._poll()
+            timing = dict(
+                observe_or_boundary_wait_seconds=observed - started,
+                sync_wait_seconds=time.monotonic() - observed if trigger else 0.0,
+                hook_seconds=time.monotonic() - started,
+            )
+            await asyncio.to_thread(self._state.save_timing, completed_step, "after_step", timing)
             return results
         except BaseException as exc:
             self._state.failure = exc
@@ -146,8 +154,13 @@ class AsyncOnlineBench:
             if self._state.finished or not self._state.config.enabled:
                 return []
             self._state.check_live()
+            started = time.monotonic()
             results = await self._observe(wait=True)
             await self._http.post(self._state.path + "/finish", json={}, max_retries=1)
+            timing = dict(final_drain_seconds=time.monotonic() - started)
+            await asyncio.to_thread(
+                self._state.save_timing, self._state.last_step, "finish", timing
+            )
             self._state.finished = True
             return results
         except BaseException as exc:

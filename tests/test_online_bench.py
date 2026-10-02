@@ -86,7 +86,10 @@ class Backend:
             result["suites"] = [
                 dict(
                     name="probe",
-                    cases=[dict(name="task", ref="sha256:abc", score=0, status="completed")],
+                    expected_cases=1,
+                    cases=[
+                        dict(name="task", ref="sha256:abc", score=0, status="completed", attempt=1)
+                    ],
                 )
             ]
         return result
@@ -98,7 +101,9 @@ def config(tmp_path, **overrides):
             enabled=True,
             results_path=str(tmp_path),
             every_n_steps=100,
-            suites=[dict(name="probe", harbor_config="swe-verified-smoke-v1.yaml")],
+            suites=[
+                dict(name="probe", harbor_config={"tasks": [{"name": "task", "ref": "sha256:abc"}]})
+            ],
             **overrides,
         )
     }
@@ -261,6 +266,7 @@ def test_missed_boundary_and_deadline(tmp_path):
     hook = OnlineBench.configure(training(backend), config(tmp_path))
     with pytest.raises(ValueError, match="missed"):
         hook.after_step(completed_step=101)
+    backend = Backend()  # Failed runs are not resumed over their existing snapshots.
     hook = OnlineBench.configure(training(backend), config(tmp_path))
     hook.after_step(completed_step=100)
     hook._state.deadline = time.monotonic() - 1
@@ -483,7 +489,8 @@ def test_boundary_transport_failure_is_sticky(tmp_path, asynchronous, failed_ste
 @pytest.mark.parametrize(
     "override",
     [
-        {"timeout_seconds": 86401},
+        {"suites": [{"name": "probe", "harbor_config": {}, "timeout_seconds": 86401}]},
+        {"timeout_seconds": 3600},  # Removed whole-round setting must not shadow suite budgets.
         {
             "suites": [
                 {"name": f"probe_{index}", "harbor_config": "swe-verified-smoke-v1.yaml"}
