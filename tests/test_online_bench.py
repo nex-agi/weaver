@@ -195,7 +195,7 @@ def test_next_boundary_waits_before_second_export(tmp_path):
         assert at100.wait(2)
         assert not completed.wait(0.05)
         assert len(backend.submissions) == 1
-        assert backend.boundaries == [100, 200]
+        assert backend.boundaries == []
         backend.terminal = True
         assert completed.wait(2)
         assert len(backend.submissions) == 2
@@ -235,16 +235,15 @@ def test_sync_ready_is_a_separate_barrier(tmp_path):
         {"status": "completed", "sync_ready": False},
     ],
 )
-def test_fail_closed_on_bad_status(tmp_path, patch):
+def test_bad_status_fails_round_not_training(tmp_path, patch):
     backend = Backend()
     hook = OnlineBench.configure(training(backend), config(tmp_path))
     hook.after_step(completed_step=100)
     backend.status.update(patch)
-    with pytest.raises((ValueError, RuntimeError)):
-        hook.after_step(completed_step=101)
-    with pytest.raises(RuntimeError, match="previously failed"):
-        hook.after_step(completed_step=200)
-    assert len(backend.submissions) == 1
+    result = hook.after_step(completed_step=101)
+    assert result[0]["status"] == "failed"
+    hook.after_step(completed_step=200)
+    assert len(backend.submissions) == 2
 
 
 def test_missing_result_and_no_submission_replay(tmp_path):
@@ -256,9 +255,9 @@ def test_missing_result_and_no_submission_replay(tmp_path):
     backend.get = lambda path: (
         dict(original(path), suites=[]) if path.endswith("/result") else original(path)
     )
-    with pytest.raises(ValueError, match="missing/extra suites"):
-        hook.after_step(completed_step=200)
-    assert len(backend.submissions) == 1
+    result = hook.after_step(completed_step=200)
+    assert result[0]["status"] == "failed"
+    assert len(backend.submissions) == 2
 
 
 def test_missed_boundary_and_deadline(tmp_path):
@@ -270,8 +269,9 @@ def test_missed_boundary_and_deadline(tmp_path):
     hook = OnlineBench.configure(training(backend), config(tmp_path))
     hook.after_step(completed_step=100)
     hook._state.deadline = time.monotonic() - 1
-    with pytest.raises(TimeoutError):
-        hook.after_step(completed_step=101)
+    assert hook.after_step(completed_step=101)[0]["status"] == "failed"
+    hook.after_step(completed_step=200)
+    assert len(backend.submissions) == 2
 
 
 @pytest.mark.timeout(15)
@@ -318,7 +318,7 @@ def test_async_real_socket_boundary_and_ticker(tmp_path):
                     ticks += 1
                 assert ticks == 15
                 assert len(backend.submissions) == 1
-                assert backend.boundaries == [100, 200]
+                assert backend.boundaries == []
                 backend.terminal = True
 
             ticking = asyncio.create_task(ticker())
@@ -359,13 +359,11 @@ def test_repeat_step_and_sibling_client_guard(tmp_path):
         with pytest.raises(RuntimeError, match="mutation rejected"):
             sibling.load_state("weaver://test/checkpoint", wait=False)
     backend.status.update(status="failed", error="verifier infrastructure failure")
-    with pytest.raises(RuntimeError):
-        hook.after_step(completed_step=101)
+    assert hook.after_step(completed_step=101)[0]["status"] == "failed"
     record = json.loads((hook._state.directory / "evaluations.jsonl").read_text())
     assert record["completed_step"] == 100 and record["status"] == "failed"
     assert record["evaluation_id"] == backend.status["evaluation_id"]
-    with pytest.raises(RuntimeError, match="previously failed"):
-        sibling._next_seq()
+    assert sibling._next_seq() == 1
 
 
 def test_async_failure_and_producer_guard(tmp_path):
@@ -385,18 +383,16 @@ def test_async_failure_and_producer_guard(tmp_path):
 
         await asyncio.create_task(foreign_producer())
         backend.status.update(status="failed", error="sandbox failed")
-        with pytest.raises(RuntimeError):
-            await hook.after_step(completed_step=101)
+        assert (await hook.after_step(completed_step=101))[0]["status"] == "failed"
         record = json.loads((hook._state.directory / "evaluations.jsonl").read_text())
         assert record["status"] == "failed" and record["completed_step"] == 100
-        with pytest.raises(RuntimeError, match="previously failed"):
-            await train.load_state("weaver://test/checkpoint", wait=False)
+        assert train._next_seq() == 1
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
-def test_boundary_precedes_drain_and_only_occurs_at_new_cadence(tmp_path, asynchronous):
+def test_drain_precedes_export_and_only_occurs_at_new_cadence(tmp_path, asynchronous):
     async def scenario():
         backend = Backend()
         train = training(backend, asynchronous=asynchronous)
@@ -416,7 +412,7 @@ def test_boundary_precedes_drain_and_only_occurs_at_new_cadence(tmp_path, asynch
         assert await call(hook.after_step, completed_step=100) == []
         for step in (100, 101, 199):
             assert await call(hook.after_step, completed_step=step) == []
-        assert backend.boundaries == [100]
+        assert backend.boundaries == []
 
         previous_id = backend.status["evaluation_id"]
         backend.terminal = True
@@ -425,24 +421,23 @@ def test_boundary_precedes_drain_and_only_occurs_at_new_cadence(tmp_path, asynch
         assert [result["completed_step"] for result in results] == [100]
         path = hook._state.path
         assert backend.requests == [
-            ("POST", path + "/boundary", {"completed_step": 200}),
             ("GET", path + "/evaluations/" + previous_id, None),
             ("GET", path + "/evaluations/" + previous_id + "/result", None),
-            ("POST", path + "/evaluations", {"completed_step": 200, "seq_id": 2}),
+            ("POST", path + "/evaluations", {"completed_step": 200}),
         ]
-        assert backend.boundaries == [100, 200]
+        assert backend.boundaries == []
         assert await call(hook.after_step, completed_step=200) == []
         backend.terminal = True
         results = await call(hook.finish)
         assert [result["completed_step"] for result in results] == [200]
-        assert backend.boundaries == [100, 200]
+        assert backend.boundaries == []
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("asynchronous", [False, True], ids=["sync", "async"])
 @pytest.mark.parametrize("failed_step", [100, 200])
-def test_boundary_transport_failure_is_sticky(tmp_path, asynchronous, failed_step):
+def test_submission_transport_failure_does_not_poison_training(tmp_path, asynchronous, failed_step):
     async def scenario():
         backend = Backend()
         original_post = backend.post
@@ -450,7 +445,7 @@ def test_boundary_transport_failure_is_sticky(tmp_path, asynchronous, failed_ste
 
         def post(path, *, json, max_retries=1):
             response = original_post(path, json=json, max_retries=max_retries)
-            if path.endswith("/boundary") and json["completed_step"] == failed_step:
+            if path.endswith("/evaluations") and json["completed_step"] == failed_step:
                 raise failure
             return response
 
@@ -468,20 +463,20 @@ def test_boundary_transport_failure_is_sticky(tmp_path, asynchronous, failed_ste
         hook = await call(train.configure_online_bench, config=config(tmp_path))
         if failed_step == 200:
             await call(hook.after_step, completed_step=100)
+        backend.terminal = failed_step == 200
         backend.requests.clear()
-        with pytest.raises(httpx.ConnectError, match="boundary transport unavailable"):
-            await call(hook.after_step, completed_step=failed_step)
-        expected = [("POST", hook._state.path + "/boundary", {"completed_step": failed_step})]
-        assert backend.requests == expected
-        assert len(backend.submissions) == failed_step // 100 - 1
-        for step in (failed_step, failed_step + 1):
-            with pytest.raises(RuntimeError, match="previously failed"):
-                await call(hook.after_step, completed_step=step)
-        with pytest.raises(RuntimeError, match="previously failed"):
-            await call(hook.finish)
-        with pytest.raises(RuntimeError, match="previously failed"):
-            train._next_seq()
-        assert backend.requests == expected
+        results = await call(hook.after_step, completed_step=failed_step)
+        assert results[-1]["status"] == "failed"
+        assert backend.requests[-1] == (
+            "POST",
+            hook._state.path + "/abandon",
+            {"completed_step": failed_step},
+        )
+        assert train._next_seq() == 1  # No benchmark-created hole in training ordering.
+        await call(hook.after_step, completed_step=failed_step + 100)
+        assert backend.submissions[-1]["completed_step"] == failed_step + 100
+        backend.terminal = True
+        await call(hook.finish)
 
     asyncio.run(scenario())
 
@@ -502,3 +497,101 @@ def test_boundary_transport_failure_is_sticky(tmp_path, asynchronous, failed_ste
 def test_config_limits_match_server(override):
     with pytest.raises(ValueError):
         resolve_config({"online_bench": override})
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_poll_failure_preserves_source_identity_and_allows_next_round(tmp_path, asynchronous):
+    async def scenario():
+        backend = Backend()
+        train = training(backend, asynchronous)
+        if asynchronous:
+            train._service.http = SimpleNamespace(
+                post=AsyncMock(side_effect=backend.post),
+                get=AsyncMock(side_effect=lambda path: backend.get(path)),
+            )
+
+        async def call(method, **kwargs):
+            result = method(**kwargs)
+            return await result if asynchronous else result
+
+        hook = await call(train.configure_online_bench, config=config(tmp_path))
+        await call(hook.after_step, completed_step=100)
+        original = copy.deepcopy(backend.status)
+        get = backend.get
+        backend.get = Mock(side_effect=httpx.ConnectError("private provider text"))
+        result = (await call(hook.after_step, completed_step=101))[0]
+        for key in ("evaluation_id", "completed_step", "target_id", "weight_version"):
+            assert result[key] == original[key]
+        assert result["status"] == "failed"
+        assert "private provider text" not in json.dumps(result)
+        assert train._next_seq() == 1
+        backend.get = get
+        await call(hook.after_step, completed_step=200)
+        assert backend.submissions[-1] == {"completed_step": 200}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_error_before_sync_ready_continues_with_next_round(tmp_path, asynchronous):
+    async def scenario():
+        backend = Backend()
+        backend.ready = False
+        original_get = backend.get
+        backend.get = Mock(side_effect=httpx.ConnectError("synthetic status error"))
+        train = training(backend, asynchronous)
+        if asynchronous:
+            train._service.http = SimpleNamespace(
+                post=AsyncMock(side_effect=backend.post),
+                get=AsyncMock(side_effect=lambda path: backend.get(path)),
+            )
+
+        async def call(method, **kwargs):
+            result = method(**kwargs)
+            return await result if asynchronous else result
+
+        hook = await call(train.configure_online_bench, config=config(tmp_path))
+        hook._poll_interval = 0
+        result = (await call(hook.after_step, completed_step=100))[0]
+        assert result["status"] == "failed"
+        assert result["evaluation_id"] == backend.status["evaluation_id"]
+        assert backend.posts[-1].endswith("/abandon")
+        assert train._next_seq() == 1
+        backend.get, backend.ready = original_get, True
+        assert await call(hook.after_step, completed_step=200) == []
+        assert len(backend.submissions) == 2
+
+    asyncio.run(scenario())
+
+
+def test_artifact_write_errors_are_loud_but_nonfatal(tmp_path, caplog):
+    backend = Backend()
+    train = training(backend)
+    hook = train.configure_online_bench(config(tmp_path))
+    hook.after_step(completed_step=100)
+    hook._state.save_result = Mock(side_effect=OSError("private mount details"))
+    hook._state.save_timing = Mock(side_effect=OSError("private mount details"))
+    backend.terminal = True
+    assert hook.after_step(completed_step=101)[0]["status"] == "completed"
+    assert "ONLINE_BENCH_RESULT_WRITE_FAILED" in caplog.text
+    assert "private mount details" not in caplog.text
+    assert train._next_seq() == 1
+    hook.after_step(completed_step=200)
+    assert len(backend.submissions) == 2
+
+
+def test_async_caller_cancellation_is_not_swallowed(tmp_path):
+    async def scenario():
+        backend = Backend()
+        backend.ready = False
+        train = training(backend, True)
+        train._service.http = SimpleNamespace(
+            post=AsyncMock(side_effect=backend.post),
+            get=AsyncMock(side_effect=asyncio.CancelledError),
+        )
+        hook = await train.configure_online_bench(config(tmp_path))
+        hook._poll_interval = 0
+        with pytest.raises(asyncio.CancelledError):
+            await hook.after_step(completed_step=100)
+
+    asyncio.run(scenario())

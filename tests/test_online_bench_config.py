@@ -235,7 +235,7 @@ def test_twenty_training_steps_four_rounds_two_suites_five_tasks(
             return super().post(path, json=json, max_retries=max_retries)
 
         def get(self, path):
-            if self.finishing or self.boundaries[-1] > self.status["completed_step"]:
+            if self.finishing or self.current_step >= self.status["completed_step"] + 5:
                 self.wait_polls += 1
                 if self.wait_polls >= 2:
                     self.terminal = True
@@ -283,6 +283,7 @@ def test_twenty_training_steps_four_rounds_two_suites_five_tasks(
             # The ordinary training mutation guard remains open between hooks.
             train._next_seq()
             completed_steps.append(step)
+            backend.current_step = step
             before = time.monotonic()
             collected.extend(await call(hook.after_step, completed_step=step))
             assert len(backend.submissions) == step // 5
@@ -295,7 +296,7 @@ def test_twenty_training_steps_four_rounds_two_suites_five_tasks(
         backend.finishing = True
         collected.extend(await call(hook.finish))
         assert completed_steps == list(range(1, 21))
-        assert backend.boundaries == [5, 10, 15, 20]
+        assert backend.boundaries == []
         assert [item["completed_step"] for item in backend.submissions] == [5, 10, 15, 20]
         assert [item["completed_step"] for item in collected] == [5, 10, 15, 20]
         assert [item["weight_version"] for item in collected] == ["v5", "v10", "v15", "v20"]
@@ -369,7 +370,7 @@ def test_independent_sdk_cannot_overwrite_existing_run_snapshots(tmp_path, async
         } == original
         assert backend.requests == original_requests  # No replacement configure request was sent.
         first._next_seq()  # The established producer remains usable.
-        with pytest.raises(RuntimeError, match="previously failed"):
+        with pytest.raises(RuntimeError, match="mutation rejected"):
             second._next_seq()
 
     asyncio.run(scenario())
@@ -423,12 +424,12 @@ def test_incomplete_counts_and_invalid_attempts_fail_closed(tmp_path, field, val
         hook = await call(client.configure_online_bench, config=config(tmp_path))
         await call(hook.after_step, completed_step=100)
         backend.terminal = True
-        with pytest.raises(ValueError):
-            await call(hook.after_step, completed_step=101)
-        with pytest.raises(RuntimeError, match="previously failed"):
-            await call(hook.after_step, completed_step=200)
-        assert len(backend.submissions) == 1
-        assert not (hook._state.directory / "evaluations.jsonl").exists()
+        results = await call(hook.after_step, completed_step=101)
+        assert results[0]["status"] == "failed"
+        assert "suites" not in results[0]
+        await call(hook.after_step, completed_step=200)
+        assert len(backend.submissions) == 2
+        assert (hook._state.directory / "evaluations.jsonl").exists()
 
     asyncio.run(scenario())
 
@@ -452,8 +453,7 @@ def test_case_identity_includes_attempt(tmp_path, duplicate):
     hook.after_step(completed_step=100)
     backend.terminal = True
     if duplicate:
-        with pytest.raises(ValueError, match="duplicate identity"):
-            hook.after_step(completed_step=101)
+        assert hook.after_step(completed_step=101)[0]["status"] == "failed"
     else:
         result = hook.after_step(completed_step=101)
         assert [case["attempt"] for case in result[0]["suites"][0]["cases"]] == [1, 2]

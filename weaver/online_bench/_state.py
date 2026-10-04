@@ -17,17 +17,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
-import time
 from pathlib import Path
 from typing import Any, Literal, Mapping
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from .._http import WeaverAPIError
 from .config import OnlineBenchConfig
+
+LOGGER = logging.getLogger(__name__)
 
 
 class EvaluationStatus(BaseModel):
@@ -61,7 +62,6 @@ class BenchState:
         self.deadline = 0.0
         self.last_step = 0
         self.finished = False
-        self.failure: BaseException | None = None
         self.observed: set[str] = set()
 
     def configure(self, response: Mapping[str, Any]) -> None:
@@ -94,11 +94,7 @@ class BenchState:
         return step % interval == 0
 
     def check_live(self) -> None:
-        """A failed/cancelled hook must not silently reopen the training gate."""
-        if self.failure is not None:
-            raise RuntimeError(
-                "online-bench hook previously failed; training must not advance"
-            ) from self.failure
+        """Reject calls after explicit finalization, not after a failed round."""
         if self.finished:
             raise RuntimeError("online-bench hook is already finished")
 
@@ -132,24 +128,6 @@ class BenchState:
         self.active = result
         return result
 
-    def check_status(self) -> None:
-        """Execution failures and expired deadlines are errors, never quality scores."""
-        if self.active is None:
-            return
-        if self.active.status in {"failed", "cancelled"}:
-            raise WeaverAPIError(
-                500,
-                "online_bench_failed",
-                self.active.error or self.active.status,
-                False,
-                details={
-                    "evaluation_id": self.active.evaluation_id,
-                    "completed_step": self.active.completed_step,
-                },
-            )
-        if self.active.status != "completed" and time.monotonic() >= self.deadline:
-            raise TimeoutError("online-bench whole-evaluation deadline exceeded")
-
     def result(self, payload: Any) -> dict[str, Any]:
         """Validate terminal attribution and complete suite results before saving."""
         if not isinstance(payload, dict) or self.active is None:
@@ -164,6 +142,8 @@ class BenchState:
         ):
             if payload.get(key) != getattr(self.active, key):
                 raise ValueError(f"online-bench result attribution mismatch: {key}")
+        if payload.get("status") in {"failed", "cancelled"}:
+            return payload
         if payload.get("status") != "completed":
             raise ValueError("online-bench result is not completed")
         suites = payload.get("suites")
@@ -238,3 +218,104 @@ class BenchState:
         with (self.directory / "evaluations.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(encoded + "\n")
         self.observed.add(evaluation_id)
+
+    def report_failure(
+        self, step: int, phase: str, cause: Exception, evaluation: EvaluationStatus | None = None
+    ) -> dict[str, Any]:
+        """Report a monitoring failure without leaking arbitrary provider exceptions."""
+        result = dict(
+            evaluation_id=str(uuid4()),
+            model_id=self.model_id,
+            completed_step=step,
+            config_digest=self.digest,
+            status="failed",
+            phase=phase,
+            error=f"online-bench {phase} failed ({type(cause).__name__})",
+        )
+        if evaluation is not None:
+            result.update(evaluation.model_dump(mode="json"))
+            result.update(
+                status="failed",
+                phase=phase,
+                error=f"online-bench {phase} failed ({type(cause).__name__})",
+            )
+            step = evaluation.completed_step
+        LOGGER.error(
+            "ONLINE_BENCH_FAILED model=%s step=%s phase=%s cause=%s; "
+            "training continues; later scheduled rounds remain enabled",
+            self.model_id,
+            step,
+            phase,
+            type(cause).__name__,
+        )
+        self.persist_result(result)
+        return result
+
+    def persist_result(self, result: dict[str, Any]) -> None:
+        """Keep result-file errors from terminating an otherwise healthy training run."""
+        if result.get("status") in {"failed", "cancelled"}:
+            LOGGER.error(
+                "ONLINE_BENCH_FAILED model=%s step=%s evaluation=%s status=%s; "
+                "training continues; inspect the evaluation result for diagnostics",
+                self.model_id,
+                result.get("completed_step"),
+                result.get("evaluation_id"),
+                result["status"],
+            )
+            failure = result.get("failure", {})
+            if isinstance(failure, dict):
+                code = failure.get("code")
+                stage = failure.get("stage")
+                suite = failure.get("suite")
+                diagnostics = failure.get("diagnostics")
+                if (
+                    code
+                    in {
+                        "harbor_exit",
+                        "case_count",
+                        "task_identity",
+                        "case_failed",
+                        "invalid_reward",
+                        "invalid_timing",
+                        "cancelled_or_timeout",
+                        "remaining_processes",
+                        "backend_error",
+                    }
+                    and stage
+                    in {
+                        "configuration",
+                        "execution",
+                        "read_results",
+                        "validate_results",
+                        "publish_artifacts",
+                        "worker",
+                    }
+                    and suite in {"", *(s.name for s in self.config.suites)}
+                ):
+                    LOGGER.error(
+                        "ONLINE_BENCH_FAILURE_DETAILS code=%s stage=%s suite=%s diagnostics=%s",
+                        code,
+                        stage,
+                        suite,
+                        (
+                            diagnostics
+                            if diagnostics in {"disabled", "failed", "saved"}
+                            else "unknown"
+                        ),
+                    )
+        try:
+            self.save_result(result)
+        except Exception as exc:
+            LOGGER.error(
+                "ONLINE_BENCH_RESULT_WRITE_FAILED model=%s step=%s cause=%s; training continues",
+                self.model_id,
+                result.get("completed_step"),
+                type(exc).__name__,
+            )
+
+    def persist_timing(self, step: int, phase: str, timings: dict[str, float]) -> None:
+        """Timing persistence is best effort, like score persistence."""
+        try:
+            self.save_timing(step, phase, timings)
+        except Exception as exc:
+            self.report_failure(step, "timing_write", exc)

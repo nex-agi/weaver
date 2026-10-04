@@ -3,8 +3,8 @@
 Online-bench is independent of RL validation. The same hook can be used by an
 SFT or RL driver. It is disabled by default and requires the matching server and
 CPU worker image. A disabled/older server returns 503 for enabled requests.
-The initial three-task SWE SFT E2E qualified the distributed execution path;
-the expanded two-suite recipe still requires a new real GPU/E2B qualification.
+Earlier SFT E2E runs exercised the two-suite GPU/E2B path. The nonfatal failure
+policy below has local regression coverage; updated-runtime E2E is still pending.
 
 ```python
 bench = training.configure_online_bench("examples/online-bench/online-bench.yaml")
@@ -102,21 +102,26 @@ round watchdog accounts for the sum of suite budgets plus bounded weight-sync
 and reporting overhead, rather than allowing one suite to consume another's
 budget.
 
-At step 5 the hook closes the server-side boundary gate, reserves a round,
-submits an ordered export and waits for **sync-ready**, not merely export
+At step 5 the server atomically reserves a round and closes its training gate,
+then submits an ordered, sequence-independent sampler export and waits for **sync-ready**, not merely export
 completion. Training may then continue while Harbor runs. At step 10 it waits
 for all step-5 suites before publishing step-10 weights; do not submit step 11
 first. The same applies at steps 15 and 20. `finish()` drains the final round
 before normal resource release; it never creates an off-cadence evaluation.
 
 Valid low scores are monitoring results, not automatic training stops.
-Execution, synchronization, protocol and storage errors raise; a failed hook
-cannot silently reopen the training gate. A timeout is not a score of zero and
-must not permit loading new weights while old execution is still active.
+Execution, synchronization, protocol and storage errors are logged at ERROR level
+and saved/returned as failed monitoring results; they do not intentionally fail
+main training. Later scheduled rounds remain enabled, without automatic replay
+of failed work. Timeouts are failures, never scores of zero. The server releases
+the training gate, but must drain or fence old work before reusing the target.
+If a remote weight load's completion is uncertain, later scheduled attempts
+report the target unavailable rather than overlap loads. A shared control-plane
+outage can of course also affect ordinary training requests.
 
 Call from one configuring thread/task. Mutation guards apply to sibling training
 clients sharing the same ServiceClient; concurrent optimizer/export/load calls
-are rejected while the hook holds a boundary or after failure. The server also
+are rejected while the hook holds a boundary; round failure does not poison them. The server also
 enforces source-operation admission across separate clients and V1/V2 operation
 submission, and rejects preparation/boundaries with pending trainer work. These
 guards do not cancel prequeued work or support multiple producers. Never prequeue
@@ -178,6 +183,10 @@ records SDK hook observation/boundary wait, sync wait, total hook time and final
 drain. Parallel task durations must not be summed and described as suite wall
 time; asynchronous evaluation duration is not equal to blocked training time.
 
-Call `finish()` before normal session teardown. On operational failure, use
-normal task error/teardown handling rather than submitting another benchmark.
-No special lost-response replay or pod-loss recovery is implemented.
+Call `finish()` before normal session teardown. It reports monitoring/cleanup
+errors without failing training. Keep calling `after_step()` after failed rounds;
+the next cadence attempts a fresh round. Invalid configuration, producer misuse,
+and explicit caller cancellation are not silently swallowed. No automatic
+whole-round retry or pod-loss recovery is implemented. Deploy the SDK, server,
+and CPU worker changes together: benchmark submissions no longer carry `seq_id`,
+and sandbox inference URLs are evaluation-scoped.
