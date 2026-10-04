@@ -76,16 +76,12 @@ def validate_sample_ref_operation(
 
     # Built-in CE configuration is forwarded unchanged for both local and
     # managed datums so a mixed batch shares one aggregation contract.
-    del loss_fn_config
+    del loss_fn_config, tensor_transport
     managed = [(index, datum) for index, datum in enumerate(data) if datum.is_sample_ref]
     if not managed:
         return
     if operation != "forward_backward" or loss_fn != "cross_entropy":
         raise ValueError("SampleRef data only supports built-in cross_entropy forward_backward")
-    if tensor_transport != "default":
-        raise ValueError(
-            "SampleRef cross_entropy forward_backward requires default JSON tensor transport"
-        )
     for index, datum in managed:
         if datum.metadata:
             raise ValueError(
@@ -122,13 +118,13 @@ def _prepare_training_operation(
     payload: Dict[str, Any] = {
         "model_id": model_id,
         "seq_id": seq_id,
-        "tensor_transport": tensor_transport,
+        "tensor_transport": tensor_transport if serialized.tensor_pack is not None else "default",
         input_key: {
             "loss_fn": loss_fn,
             "data": serialized.data,
         },
     }
-    if tensor_transport == "http-binary":
+    if serialized.tensor_pack is not None:
         payload["tensor_compression"] = tensor_compression
     if loss_fn_config:
         payload[input_key]["loss_fn_config"] = dict(loss_fn_config)

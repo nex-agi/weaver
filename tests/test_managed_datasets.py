@@ -1039,7 +1039,9 @@ def test_shared_custom_and_surrogate_helpers_reject_sample_refs():
         build_surrogate_data([datum], [logprobs])
 
 
-def test_http_binary_rejects_mixed_and_managed_only_sample_ref_batches():
+@pytest.mark.parametrize("aggregation", ["sum", "token-mean", "sample-mean"])
+@pytest.mark.parametrize("compression", ["raw", "zstd"])
+def test_http_binary_supports_mixed_and_managed_only_sample_ref_batches(aggregation, compression):
     local = Datum.from_raw(
         model_input=ModelInput.from_ints([1, 2]),
         loss_fn_inputs={"target_tokens": [2, 3], "weights": [0.0, 1.0]},
@@ -1047,16 +1049,33 @@ def test_http_binary_rejects_mixed_and_managed_only_sample_ref_batches():
     )
     managed = Datum.from_sample_ref(dataset="d", version="v1", sample_idx=2, datum_id="managed")
     for data in ([managed, local], [managed]):
-        with pytest.raises(ValueError, match="default JSON tensor transport"):
-            prepare_forward_backward_operation(
-                model_id="model-1",
-                seq_id=1,
-                data=data,
-                loss_fn="cross_entropy",
-                loss_fn_config=None,
-                request_metadata=None,
-                tensor_transport="http-binary",
-            )
+        prepared = prepare_forward_backward_operation(
+            model_id="model-1",
+            seq_id=1,
+            data=data,
+            loss_fn="cross_entropy",
+            loss_fn_config={"loss_agg_mode": aggregation},
+            request_metadata=None,
+            tensor_transport="http-binary",
+            tensor_compression=compression,
+        )
+        try:
+            payload = prepared.body["payload"]
+            request = payload["forward_backward_input"]
+            assert request["loss_fn_config"] == {"loss_agg_mode": aggregation}
+            assert request["data"][0]["kind"] == "sample_ref"
+            assert "model_input" not in request["data"][0]
+            if len(data) == 2:
+                assert prepared.tensor_pack is not None
+                assert payload["tensor_transport"] == "http-binary"
+                assert payload["tensor_compression"] == compression
+                assert "$tensor" in request["data"][1]["model_input"]["chunks"][0]["tokens"]
+            else:
+                assert prepared.tensor_pack is None
+                assert payload["tensor_transport"] == "default"
+                assert "tensor_compression" not in payload
+        finally:
+            prepared.close()
 
 
 def test_create_model_pins_training_max_sequence_length_sync_and_async():
@@ -1142,9 +1161,8 @@ def test_sync_training_client_enforces_sample_ref_sft_only_without_catalog_prefl
     with pytest.raises(ValueError, match="empty metadata"):
         client.forward_backward([with_metadata], "cross_entropy")
     client._service._config.tensor_transport = "http-binary"
-    with pytest.raises(ValueError, match="default JSON tensor transport"):
-        client.forward_backward([managed], "cross_entropy")
-    assert client._service.enqueue_operation.call_count == 3
+    client.forward_backward([managed], "cross_entropy", loss_fn_config={"loss_agg_mode": "sum"})
+    assert client._service.enqueue_operation.call_count == 4
 
 
 def test_async_training_client_matches_sample_ref_sft_only_policy():
@@ -1175,12 +1193,13 @@ def test_async_training_client_matches_sample_ref_sft_only_policy():
         with pytest.raises(ValueError, match="empty metadata"):
             await client.forward_backward([with_metadata], "cross_entropy")
         client._service._config.tensor_transport = "http-binary"
-        with pytest.raises(ValueError, match="default JSON tensor transport"):
-            await client.forward_backward([managed], "cross_entropy")
+        await client.forward_backward(
+            [managed], "cross_entropy", loss_fn_config={"loss_agg_mode": "sum"}
+        )
         return client
 
     client = asyncio.run(run())
-    assert client._service.enqueue_operation.await_count == 3
+    assert client._service.enqueue_operation.await_count == 4
     client._service._http.get.assert_not_called()
 
 
