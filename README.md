@@ -188,8 +188,11 @@ Every `SampleRef`, regardless of `content_visibility`, supports only the built-i
 `cross_entropy` `forward_backward` operation. Managed references cannot be used with
 `forward`, custom/surrogate losses, `sample`, or `compute_logprobs`, and the first release
 does not expose dataset download. These limits do not affect ordinary token-in datums.
-Managed datums use the default JSON tensor transport. Phase-one requests may pass the
-built-in cross-entropy configuration, request metadata, and caller-owned
+Managed and ordinary datums may be mixed with `http-binary` tensor transport.
+Dense ordinary tensors go into the binary pack; SampleRef identifiers stay inline.
+Reference-only requests have no dense pack and use JSON automatically. The built-in
+cross-entropy aggregation configuration is forwarded unchanged, including `sum`.
+Requests may pass request metadata and caller-owned
 `loss_fn_inputs`; those inputs remain attached to their original datum. The server
 supplies `model_input`, `target_tokens`, `loss_mask`, and `weights`, so callers cannot
 use those names in a managed datum's `loss_fn_inputs`.
