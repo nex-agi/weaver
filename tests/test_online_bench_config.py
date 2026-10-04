@@ -477,3 +477,22 @@ def test_non_secret_token_budget_and_deployment_reference_are_allowed(tmp_path):
     }
     resolved = resolve_config(source)
     assert resolved.suites[0].execution_config()["max_tokens"] == 8192
+
+
+def test_checkpoint_retention_defaults_and_snapshot(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    main = write_config(tmp_path / "recipe")
+    assert resolve_config(main).checkpoint_keep_last == 1
+    data = yaml.safe_load(main.read_text())
+    data["online_bench"]["checkpoint_keep_last"] = 3
+    main.write_text(yaml.safe_dump(data))
+    hook = training(Backend()).configure_online_bench(main)
+    assert hook._state.config.server_payload()["checkpoint_keep_last"] == 3
+    saved = yaml.safe_load((hook._state.directory / "config.yaml").read_text())
+    assert saved["online_bench"]["checkpoint_keep_last"] == 3
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "1", None])
+def test_checkpoint_retention_requires_positive_integer(value):
+    with pytest.raises(ValueError):
+        resolve_config({"online_bench": {"checkpoint_keep_last": value}})

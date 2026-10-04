@@ -190,3 +190,28 @@ and explicit caller cancellation are not silently swallowed. No automatic
 whole-round retry or pod-loss recovery is implemented. Deploy the SDK, server,
 and CPU worker changes together: benchmark submissions no longer carry `seq_id`,
 and sandbox inference URLs are evaluation-scoped.
+
+## Online-bench checkpoint retention
+
+`online_bench.checkpoint_keep_last` is a positive integer, default **1**. It
+counts the latest online-bench weights-only exports by source step, not score.
+After the previous round has drained, keep at most N-1 older usable exports and
+remove failed partial exports before writing the next one. This avoids a
+transient two-checkpoint peak with N=1. If the new export fails, no complete
+online-bench checkpoint may remain. The last retained export is not removed by
+normal run teardown.
+
+Retention applies only to this run's explicitly marked online-bench exports.
+The controller validates the evaluation/export-operation/checkpoint identity
+chain, exact path and sampling type. Ordinary training/resume checkpoints, RL
+rollout exports, other runs, unmarked legacy files, scores and trajectories are
+not enrolled. Overlapping checkpoint paths are rejected rather than deleted.
+Do not write unrelated files into an online-bench-owned export directory.
+
+The controller persists an exact removal list. The CPU worker, which must mount
+the checkpoint storage even when `save_artifacts` is false, performs fd-anchored
+deletion without following symlinked ancestors or checkpoint leaves. Only a
+successful receipt retires the corresponding checkpoint metadata; the next
+export waits for that receipt. Cleanup failure fails the round loudly under the
+existing monitoring-only policy, not the training job. Deploy updated controller
+and CPU-worker versions together; older workers lack this cleanup action.

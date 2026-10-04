@@ -119,6 +119,7 @@ class OnlineBenchConfig(BaseModel):
     every_n_steps: int = Field(default=100, ge=1)
     results_path: str | None = None
     save_artifacts: bool = False
+    checkpoint_keep_last: int = Field(default=1, ge=1)
     suites: tuple[OnlineBenchSuite, ...] = Field(default=(), max_length=16)
 
     @model_validator(mode="before")
@@ -157,6 +158,7 @@ class OnlineBenchConfig(BaseModel):
             every_n_steps=self.every_n_steps,
             results_path=self.results_path,
             save_artifacts=self.save_artifacts,
+            checkpoint_keep_last=self.checkpoint_keep_last,
             suites=[
                 dict(
                     name=s.name,
