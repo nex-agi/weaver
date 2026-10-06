@@ -3,8 +3,13 @@
 Online-bench is independent of RL validation. The same hook can be used by an
 SFT or RL driver. It is disabled by default and requires the matching server and
 CPU worker image. A disabled/older server returns 503 for enabled requests.
-Earlier SFT E2E runs exercised the two-suite GPU/E2B path. The nonfatal failure
-policy below has local regression coverage; updated-runtime E2E is still pending.
+A development SFT E2E on the updated runtime completed 20 training steps and four
+rounds, with two suites of five tasks each (40 valid task results). It exercised
+async overlap, busy-boundary waits, artifact persistence, checkpoint retention and
+normal resource cleanup. A separate 11-step development E2E accelerated the SDK
+watchdog on round 5 and verified loud failure, acknowledged cancellation, continued
+training and a successful round 10 on the same worker/target. This does not qualify
+natural per-suite timeout, arbitrary outages or production deployment.
 
 ```python
 bench = training.configure_online_bench("examples/online-bench/online-bench.yaml")
@@ -38,6 +43,7 @@ online_bench:
   every_n_steps: 5
   results_path: ./weaver/.logs
   save_artifacts: true
+  checkpoint_keep_last: 1
   suites:
     - name: swe_probe
       harbor_config: swe-probe.yaml
@@ -138,10 +144,10 @@ are intentional blocking points—not zero-overhead evaluation.
 ## One results root
 
 `results_path` defaults to `./weaver/.logs`. The SDK resolves it once against its
-cwd and sends the absolute location. It must be an approved shared filesystem
-mount writable by the worker; the worker must not resolve a client-relative path
-against its own cwd. A private SDK-only filesystem cannot receive direct worker
-artifacts.
+cwd and sends the absolute location. With artifact retention enabled, it must be
+an approved shared filesystem mount writable by the worker; the worker must not
+resolve a client-relative path against its own cwd. A private SDK-only filesystem
+can receive compact SDK reports, but cannot receive direct worker artifacts.
 
 ```text
 <results_path>/online-bench-<model_id>/
