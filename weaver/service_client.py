@@ -997,8 +997,10 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             from ._artifact_read import download_managed_file
 
             with ThreadPoolExecutor(max_workers=min(max_concurrency, len(files))) as pool:
-                futures = [pool.submit(download_managed_file, self.http, artifact_id, entry, dest_dir)
-                           for entry in files]
+                futures = [
+                    pool.submit(download_managed_file, self.http, artifact_id, entry, dest_dir)
+                    for entry in files
+                ]
                 for future in futures:
                     future.result()
             return dest_dir

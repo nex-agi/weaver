@@ -153,6 +153,7 @@ def test_direct_download_atomic_release_and_integrity(tmp_path, monkeypatch, asy
             return asyncio.run(
                 _artifact_read.async_download_managed_file(client, ARTIFACT, entry, tmp_path)
             )
+
     else:
 
         class Transport:

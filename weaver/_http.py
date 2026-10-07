@@ -34,7 +34,7 @@ from opentelemetry.trace import Status, StatusCode
 from . import __version__
 from ._telemetry import get_tracer
 from ._tensor_read import READ_MEDIA_TYPE, decode_read_metadata, direct_result_stream
-from ._tensor_upload import FALLBACK, submit_remote_tensor, resume_remote_tensor
+from ._tensor_upload import FALLBACK, resume_remote_tensor, submit_remote_tensor
 from .config import TensorCompression, WeaverConfig
 from .tensor_transport import (
     MultipartLayout,

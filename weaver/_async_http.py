@@ -59,7 +59,7 @@ from ._http import (
 )
 from ._telemetry import get_tracer
 from ._tensor_read import READ_MEDIA_TYPE, async_direct_result_stream, decode_read_metadata
-from ._tensor_upload import FALLBACK, async_submit_remote_tensor, async_resume_remote_tensor
+from ._tensor_upload import FALLBACK, async_resume_remote_tensor, async_submit_remote_tensor
 from .config import TensorCompression, WeaverConfig
 from .tensor_transport import MultipartLayout, TensorPack, decompress_zstd_tensor_pack
 

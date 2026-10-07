@@ -136,9 +136,7 @@ async def _async_rpc(
 async def _disk(function: Any, *args: Any) -> Any:
     # File hashing/fsync/part IO can block on GPFS. Cancellation joins the worker
     # before request-finally cleanup can delete its source or abandon a journal.
-    task = asyncio.get_running_loop().run_in_executor(
-        None, functools.partial(function, *args)
-    )
+    task = asyncio.get_running_loop().run_in_executor(None, functools.partial(function, *args))
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:

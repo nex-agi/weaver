@@ -57,16 +57,27 @@ def test_event_loop_shutdown_joins_disk_worker_before_source_cleanup(tmp_path, m
             yield from original(*args)
 
         monkeypatch.setattr(transport, "_part_chunks", blocked)
-    monkeypatch.setattr(transport, "_async_bulk_client", lambda timeout: httpx.MockTransport(fixture.bulk))
+    monkeypatch.setattr(
+        transport, "_async_bulk_client", lambda timeout: httpx.MockTransport(fixture.bulk)
+    )
 
     async def main():
-        client = AsyncAPIClient(WeaverConfig(base_url="https://weaver.example", api_key="existing-sdk-test-key"))
+        client = AsyncAPIClient(
+            WeaverConfig(base_url="https://weaver.example", api_key="existing-sdk-test-key")
+        )
         await client._client.aclose()
-        client._client = httpx.AsyncClient(base_url="https://weaver.example", headers=client._headers, transport=httpx.MockTransport(fixture.control), trust_env=False)
+        client._client = httpx.AsyncClient(
+            base_url="https://weaver.example",
+            headers=client._headers,
+            transport=httpx.MockTransport(fixture.control),
+            trust_env=False,
+        )
 
         async def upload():
             try:
-                await client.post_tensor_multipart(fixture.path, request=fixture.request, tensor_pack=fixture.pack)
+                await client.post_tensor_multipart(
+                    fixture.path, request=fixture.request, tensor_pack=fixture.pack
+                )
             finally:
                 cleanup.set()
                 fixture.pack.close()
@@ -91,7 +102,9 @@ def test_event_loop_shutdown_joins_disk_worker_before_source_cleanup(tmp_path, m
     thread.start()
     try:
         assert main_returned.wait(5)
-        assert not cleanup.wait(0.2), "request cleanup escaped while its disk thread was still running"
+        assert not cleanup.wait(
+            0.2
+        ), "request cleanup escaped while its disk thread was still running"
         assert fixture.pack.path.is_file()
     finally:
         release.set()
@@ -99,7 +112,9 @@ def test_event_loop_shutdown_joins_disk_worker_before_source_cleanup(tmp_path, m
     assert not thread.is_alive() and not errors
     assert cleanup.is_set() and fixture.pack.path.is_file()
     assert fixture.pack._remote_recovery is not None
-    record, retained = transport._load_journal(fixture.pack._remote_recovery, "https://weaver.example")
+    record, retained = transport._load_journal(
+        fixture.pack._remote_recovery, "https://weaver.example"
+    )
     assert retained.path == fixture.pack.path and record["request"] == fixture.request
 
 
@@ -476,6 +491,9 @@ def test_async_public_upload_socket_concurrency_and_ticker(tmp_path, monkeypatch
             with contextlib.suppress(asyncio.CancelledError):
                 await ticker
             await client.aclose()
+
+    async def bounded_main():
+        await asyncio.wait_for(exercise(), 15)
         assert not [
             task
             for task in asyncio.all_tasks()
@@ -483,7 +501,7 @@ def test_async_public_upload_socket_concurrency_and_ticker(tmp_path, monkeypatch
         ]
 
     try:
-        asyncio.run(asyncio.wait_for(exercise(), 15))
+        asyncio.run(bounded_main())
     finally:
         server.shutdown()
         thread.join(5)

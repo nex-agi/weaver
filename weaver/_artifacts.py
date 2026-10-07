@@ -268,8 +268,10 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
     payload = descriptor if isinstance(descriptor, dict) else {}
     managed = payload.get("managed_read")
     if managed is not None and (
-        not isinstance(managed, dict) or set(managed) != {"version"}
-        or type(managed["version"]) is not int or managed["version"] != 1
+        not isinstance(managed, dict)
+        or set(managed) != {"version"}
+        or type(managed["version"]) is not int
+        or managed["version"] != 1
     ):
         raise ValueError("unsupported managed artifact read protocol")
     raw_files = lookup_case_insensitive(payload, "files")
@@ -318,8 +320,12 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
         sha256 = lookup_case_insensitive(raw, "sha256")
         expires = lookup_case_insensitive(raw, "url_expires_at")
         if managed is not None and (
-            url or type(size) is not int or size < 0 or size > 9007199254740991
-            or not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+            url
+            or type(size) is not int
+            or size < 0
+            or size > 9007199254740991
+            or not isinstance(sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
         ):
             raise ValueError("invalid managed artifact file descriptor")
         files.append(

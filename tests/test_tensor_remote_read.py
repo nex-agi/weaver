@@ -318,6 +318,7 @@ def test_stream_renews_and_stops_when_protection_is_lost(monkeypatch, async_mode
                 return await asyncio.wait_for(exercise(), timeout=8)
 
             return asyncio.run(bounded())
+
     else:
 
         class SlowBytes(httpx.SyncByteStream):
