@@ -22,7 +22,9 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, BinaryIO, Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping
+from typing import Any, BinaryIO
+from uuid import uuid4
 
 import httpx
 from opentelemetry import baggage, context, trace
@@ -31,6 +33,8 @@ from opentelemetry.trace import Status, StatusCode
 
 from . import __version__
 from ._telemetry import get_tracer
+from ._tensor_read import READ_MEDIA_TYPE, decode_read_metadata, direct_result_stream
+from ._tensor_upload import FALLBACK, submit_remote_tensor, resume_remote_tensor
 from .config import TensorCompression, WeaverConfig
 from .tensor_transport import (
     MultipartLayout,
@@ -446,7 +450,7 @@ class APIClient:
         self._client = self._build_client()
         self._pid = current_pid
 
-    def __enter__(self) -> "APIClient":
+    def __enter__(self) -> APIClient:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -481,6 +485,10 @@ class APIClient:
     ) -> Any:
         """Submit one non-retryable operation with a binary tensor attachment."""
 
+        remote = submit_remote_tensor(self, path, request, tensor_pack)
+        if remote is not FALLBACK:
+            return remote
+
         layout = MultipartLayout(request, tensor_pack)
         model_id = self._extract_model_id_from_path(path)
         with self._tracer.start_as_current_span("weaver.post", kind=trace.SpanKind.CLIENT) as span:
@@ -510,6 +518,17 @@ class APIClient:
                 span.set_status(Status(StatusCode.ERROR, str(exc)))
                 raise
 
+    def resume_tensor_upload(self, recovery_path: str) -> Any:
+        """Resume an interrupted upload with its original owner/model/nonce.
+
+        Args:
+            recovery_path: Private local journal from TensorUploadInterrupted.
+
+        Returns:
+            The original admitted operation JSON.
+        """
+        return resume_remote_tensor(self, recovery_path)
+
     def download_tensor_pack(
         self,
         operation_id: str,
@@ -533,8 +552,11 @@ class APIClient:
         with self._tracer.start_as_current_span("weaver.get", kind=trace.SpanKind.CLIENT) as span:
             apply_request_span_attributes(span, "GET", path, None)
             self._ensure_fresh_client()
-            headers = dict(self._client.headers or {})
+            headers = httpx.Headers(self._client.headers)
             headers["Accept-Encoding"] = "identity"
+            headers["Accept"] = READ_MEDIA_TYPE
+            headers["X-Weaver-Tensor-Read-ID"] = str(uuid4())
+            started_at = time.monotonic()
             inject(headers)
             try:
                 with self._client.stream("GET", path, headers=headers) as response:
@@ -543,20 +565,46 @@ class APIClient:
                         response.read()
                         span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
                         self._raise_error(response)
-                    _validate_tensor_pack_response_length(response, size_bytes)
-                    _validate_tensor_pack_response_metadata(
-                        response,
-                        codec=codec,
-                        decoded_size_bytes=expected_decoded_size,
-                    )
-                    for chunk in response.iter_raw(chunk_size=TENSOR_PACK_CHUNK_BYTES):
-                        if received + len(chunk) > size_bytes:
-                            raise ValueError(
-                                f"downloaded tensor pack exceeds expected {size_bytes} bytes"
-                            )
-                        wire_destination.write(chunk)
-                        digest.update(chunk)
-                        received += len(chunk)
+
+                    def copy_chunks(chunks):
+                        nonlocal received
+                        for chunk in chunks:
+                            if received + len(chunk) > size_bytes:
+                                raise ValueError(
+                                    f"downloaded tensor pack exceeds expected {size_bytes} bytes"
+                                )
+                            written = wire_destination.write(chunk)
+                            if written != len(chunk):
+                                raise ValueError("short tensor destination write")
+                            digest.update(chunk)
+                            received += len(chunk)
+
+                    if response.headers.get("content-type", "").split(";")[0] == READ_MEDIA_TYPE:
+                        raw = bytearray()
+                        for chunk in response.iter_raw(4096):
+                            raw.extend(chunk)
+                            if len(raw) > 32768:
+                                raise ValueError("result read metadata exceeds bound")
+                        plan = decode_read_metadata(bytes(raw))
+                        response.close()
+                        pack = {
+                            "size_bytes": size_bytes,
+                            "sha256": expected_digest,
+                            "codec": codec,
+                            "decoded_size_bytes": expected_decoded_size,
+                        }
+                        with direct_result_stream(
+                            self, plan, operation_id, pack, started_at
+                        ) as chunks:
+                            copy_chunks(chunks)
+                    else:
+                        _validate_tensor_pack_response_length(response, size_bytes)
+                        _validate_tensor_pack_response_metadata(
+                            response,
+                            codec=codec,
+                            decoded_size_bytes=expected_decoded_size,
+                        )
+                        copy_chunks(response.iter_raw(chunk_size=TENSOR_PACK_CHUNK_BYTES))
                 if received != size_bytes:
                     raise ValueError(
                         f"downloaded tensor pack has {received} bytes, expected {size_bytes}"
@@ -769,7 +817,8 @@ class APIClient:
                         transport_error = WeaverAPIError(
                             503,
                             "transport_unavailable",
-                            f"{method} {path} failed after {connection_error_count} connection attempts",
+                            f"{method} {path} failed after "
+                            f"{connection_error_count} connection attempts",
                             True,
                         )
                         raise transport_error from e

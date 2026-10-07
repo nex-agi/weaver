@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, 
 from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
 from ._async_http import _await_blocking_io
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
+from ._checkpoint_storage import validate_storage_backend, verify_checkpoint_storage_capability
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
@@ -540,6 +541,7 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         ttl_seconds: int | None | _UnsetType = ...,
         wait: "Literal[True]" = True,
     ) -> Checkpoint: ...
@@ -550,6 +552,7 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         ttl_seconds: int | None | _UnsetType = ...,
         wait: "Literal[False]",
     ) -> AsyncOperationHandle: ...
@@ -559,6 +562,7 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         ttl_seconds: int | None | _UnsetType = UNSET,
         wait: bool = True,
     ) -> Checkpoint | AsyncOperationHandle:
@@ -568,7 +572,20 @@ class AsyncTrainingClient:
         :class:`~weaver.types.Checkpoint` when *wait* is True, else an
         ``AsyncOperationHandle``.
         """
+        validate_storage_backend(storage_backend)
+        if storage_backend == "artifact":
+            try:
+                capabilities = await self._service.http.get(
+                    f"/api/v1/models/{self.model_id}/storage-capabilities"
+                )
+            except WeaverAPIError as exc:
+                if exc.status_code in (404, 405):
+                    raise RuntimeError("Server does not support managed checkpoint saves") from exc
+                raise
+            verify_checkpoint_storage_capability(capabilities)
         body: Dict[str, Any] = {"type": checkpoint_type}
+        if storage_backend is not None:
+            body["storage_backend"] = storage_backend
         if name is not None:
             body["name"] = name
         if not isinstance(ttl_seconds, _UnsetType):
@@ -584,7 +601,8 @@ class AsyncTrainingClient:
             else set()
         )
         handle = await self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/checkpoints",
+            f"/api/v1/models/{self.model_id}/checkpoints"
+            + ("/managed" if storage_backend == "artifact" else ""),
             body,
         )
         if not wait:

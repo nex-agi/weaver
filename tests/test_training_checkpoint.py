@@ -24,6 +24,7 @@ import pytest
 
 import weaver.async_training_client as async_training_client_module
 import weaver.training_client as training_client_module
+from weaver._http import WeaverAPIError
 from weaver._utils import DEFAULT_SAMPLER_TTL_SECONDS
 from weaver.async_training_client import AsyncTrainingClient
 from weaver.operations import AsyncOperationHandle, OperationHandle
@@ -716,3 +717,126 @@ class TestSetCheckpointTTL:
         body = tc._service.http.patch.call_args[1]["json"]
         assert body["path"] == "weaver://ckpt-1"
         assert body["ttl_seconds"] == 3600
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("backend", [None, "gpfs", "artifact"])
+def test_checkpoint_backend_selection_compatible_defaults(asynchronous, backend):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.return_value = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+    }
+    if asynchronous:
+        asyncio.run(client.save_state(name="mixed", storage_backend=backend, wait=False))
+    else:
+        client.save_state(name="mixed", storage_backend=backend, wait=False)
+    args = client._service.enqueue_operation.call_args[0]
+    assert args[0] == "/api/v1/models/mdl-123/checkpoints" + (
+        "/managed" if backend == "artifact" else ""
+    )
+    body = args[1]
+    assert body == (
+        {"name": "mixed", "type": "weight"}
+        if backend is None
+        else {"name": "mixed", "type": "weight", "storage_backend": backend}
+    )
+    if backend == "artifact":
+        client._service.http.get.assert_called_once_with(
+            "/api/v1/models/mdl-123/storage-capabilities"
+        )
+    else:
+        client._service.http.get.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        None,
+        {},
+        {"protocol_version": True, "default_backend": "gpfs", "save_state_backends": ["artifact"]},
+        {"protocol_version": 1, "default_backend": "gpfs", "save_state_backends": ["gpfs"]},
+        "old server response",
+    ],
+)
+def test_managed_checkpoint_requires_explicit_capability(asynchronous, capabilities):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.return_value = capabilities
+    with pytest.raises(RuntimeError, match="managed checkpoint saves"):
+        if asynchronous:
+            asyncio.run(client.save_state(name="managed", storage_backend="artifact", wait=False))
+        else:
+            client.save_state(name="managed", storage_backend="artifact", wait=False)
+    client._service.enqueue_operation.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_old_server_rejects_explicit_managed_before_post(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.side_effect = WeaverAPIError(404, "not_found", "old server", False)
+    with pytest.raises(RuntimeError, match="does not support"):
+        if asynchronous:
+            asyncio.run(client.save_state(name="managed", storage_backend="artifact", wait=False))
+        else:
+            client.save_state(name="managed", storage_backend="artifact", wait=False)
+    client._service.enqueue_operation.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_storage_rollback_rechecks_capability_each_save(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.side_effect = [
+        {
+            "protocol_version": 1,
+            "default_backend": "gpfs",
+            "save_state_backends": ["gpfs", "artifact"],
+        },
+        {"protocol_version": 1, "default_backend": "gpfs", "save_state_backends": ["gpfs"]},
+    ]
+
+    def save(name):
+        if asynchronous:
+            return asyncio.run(client.save_state(name=name, storage_backend="artifact", wait=False))
+        return client.save_state(name=name, storage_backend="artifact", wait=False)
+
+    save("before-rollback")
+    with pytest.raises(RuntimeError, match="does not currently allow"):
+        save("after-rollback")
+    assert client._service.enqueue_operation.call_count == 1
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_invalid_checkpoint_backend_has_no_io(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    with pytest.raises(ValueError, match="storage_backend"):
+        if asynchronous:
+            asyncio.run(client.save_state(storage_backend="unknown", wait=False))
+        else:
+            client.save_state(storage_backend="unknown", wait=False)
+    client._service.http.get.assert_not_called()
+    client._service.enqueue_operation.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_new_capability_old_writer_rollout_cannot_silently_write_gpfs(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.return_value = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+    }
+    # An old server has no managed route. It must fail before accepting a write,
+    # even if capability discovery happened on a different, upgraded server.
+    client._service.enqueue_operation.side_effect = WeaverAPIError(
+        404, "not_found", "old writer", False
+    )
+    with pytest.raises(WeaverAPIError):
+        if asynchronous:
+            asyncio.run(
+                client.save_state(name="mixed-rollout", storage_backend="artifact", wait=False)
+            )
+        else:
+            client.save_state(name="mixed-rollout", storage_backend="artifact", wait=False)
+    assert client._service.enqueue_operation.call_args[0][0].endswith("/checkpoints/managed")

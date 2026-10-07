@@ -23,11 +23,13 @@ import math
 import os
 import secrets
 import tempfile
+import threading
+from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Integral
 from pathlib import Path
-from typing import Any, BinaryIO, Iterator, Mapping, Sequence, cast
+from typing import Any, BinaryIO, cast
 
 import httpx
 import torch
@@ -63,6 +65,9 @@ class TensorPack:
     sha256: str
     codec: TensorCompression = "raw"
     decoded_size_bytes: int | None = None
+    _remote_recovery: Path | None = field(default=None, init=False, repr=False)
+    _retain_source: bool = field(default=False, init=False, repr=False)
+    _remote_lock: Any = field(default_factory=threading.Lock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.size_bytes = _bounded_tensor_pack_size(self.size_bytes, "tensor_pack.size_bytes")
@@ -81,7 +86,8 @@ class TensorPack:
     def close(self) -> None:
         """Remove the client-local temporary pack."""
 
-        self.path.unlink(missing_ok=True)
+        if not self._retain_source:
+            self.path.unlink(missing_ok=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -312,10 +318,10 @@ class MultipartLayout:
         self.content_length = len(self.prefix) + tensor_pack.size_bytes + len(self.suffix)
         self.pack_path = tensor_pack.path
 
-    def sync_stream(self) -> "SyncMultipartStream":
+    def sync_stream(self) -> SyncMultipartStream:
         return SyncMultipartStream(self)
 
-    def async_stream(self) -> "AsyncMultipartStream":
+    def async_stream(self) -> AsyncMultipartStream:
         return AsyncMultipartStream(self)
 
 
@@ -425,7 +431,8 @@ def decompress_zstd_tensor_pack(
                 raise ValueError("zstd tensor pack has trailing compressed data")
             if decoded + len(output) > expected_size:
                 raise ValueError(f"decoded tensor pack exceeds expected {expected_size} bytes")
-            destination.write(output)
+            if destination.write(output) != len(output):
+                raise ValueError("short decoded tensor destination write")
             decoded += len(output)
     finally:
         reader.close()
@@ -601,7 +608,7 @@ async def _open_binary_file(path: Path) -> BinaryIO:
         raise
 
 
-def _close_completed_file(task: "asyncio.Task[BinaryIO]") -> None:
+def _close_completed_file(task: asyncio.Task[BinaryIO]) -> None:
     try:
         task.result().close()
     except BaseException:

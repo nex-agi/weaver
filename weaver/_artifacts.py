@@ -266,6 +266,12 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
         ValueError: On a malformed descriptor or an unsafe file name.
     """
     payload = descriptor if isinstance(descriptor, dict) else {}
+    managed = payload.get("managed_read")
+    if managed is not None and (
+        not isinstance(managed, dict) or set(managed) != {"version"}
+        or type(managed["version"]) is not int or managed["version"] != 1
+    ):
+        raise ValueError("unsupported managed artifact read protocol")
     raw_files = lookup_case_insensitive(payload, "files")
     if not isinstance(raw_files, list) or not raw_files:
         raise ValueError("artifact download descriptor contains no files")
@@ -276,7 +282,7 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
             raise ValueError(f"malformed descriptor file entry: {raw!r}")
         name = str(lookup_case_insensitive(raw, "name") or "")
         url = str(lookup_case_insensitive(raw, "url") or "")
-        if not name or not url:
+        if not name or (not url and managed is None):
             raise ValueError(f"descriptor file entry missing name or url: {raw!r}")
         if "\\" in name:
             # PurePosixPath treats backslashes as ordinary characters, but the
@@ -311,6 +317,11 @@ def descriptor_files(descriptor: Any) -> List[ArtifactFile]:
         size = lookup_case_insensitive(raw, "size")
         sha256 = lookup_case_insensitive(raw, "sha256")
         expires = lookup_case_insensitive(raw, "url_expires_at")
+        if managed is not None and (
+            url or type(size) is not int or size < 0 or size > 9007199254740991
+            or not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None
+        ):
+            raise ValueError("invalid managed artifact file descriptor")
         files.append(
             ArtifactFile(
                 name=name,

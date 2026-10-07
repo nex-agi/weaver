@@ -22,6 +22,12 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, overload
 from transformers import PreTrainedTokenizer
 
 from . import _sampling_utils as _su
+from ._http import WeaverAPIError
+from ._ref_storage import (
+    prepare_ref_storage,
+    sample_result_validator,
+    verify_ref_storage_capability,
+)
 from ._utils import lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
 from .operations import AsyncOperationHandle
@@ -66,6 +72,7 @@ class AsyncSamplingClient:
         sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
+        ref_storage_backend: str | None = None,
         wait: "Literal[True]" = True,
     ) -> Dict[str, Any]: ...
 
@@ -82,6 +89,7 @@ class AsyncSamplingClient:
         sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
+        ref_storage_backend: str | None = None,
         wait: "Literal[False]",
     ) -> AsyncOperationHandle: ...
 
@@ -97,8 +105,18 @@ class AsyncSamplingClient:
         sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
+        ref_storage_backend: str | None = None,
         wait: bool = True,
     ) -> AsyncOperationHandle | Dict[str, Any]:
+        """Sample with the legacy GPFS backend by default.
+
+        ``ref_storage_backend="artifact"`` selects managed mask/distribution/router
+        refs for model-bound sessions. Mask/distribution require full-FT;
+        Router Replay also supports LoRA when the server advertises MoE shapes.
+        It requires fresh server capability; failures never fall back to GPFS.
+        ``"gpfs"`` explicitly retains the legacy path. Returned refs stay opaque
+        and require no object-store credentials in the public client.
+        """
         body = _su.build_sample_body(
             prompt=prompt,
             sampling_params=sampling_params,
@@ -110,33 +128,30 @@ class AsyncSamplingClient:
             return_old_logprob=return_old_logprob,
             return_moe_topk_indices=return_moe_topk_indices,
         )
-        sc_options = body.get("score_centering", {})
-        sc_head_size = sc_options.get("head_size", 0)
-        sc_transport = sc_options.get("transport", "inline")
-        handle = await self._service.enqueue_operation(
-            f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
-            body,
-        )
-        if sc_head_size:
-            from .score_centering import validate_sampler_result
-
-            handle._result_validator = (  # pylint: disable=protected-access
-                lambda result: validate_sampler_result(result, sc_head_size, sc_transport)
-            )
-        if sampling_mask_transport == "ref":
-            from .sampling_masks import validate_mask_result
-
-            handle._result_validator = validate_mask_result  # pylint: disable=protected-access
+        kind, scope = prepare_ref_storage(body, ref_storage_backend, self.model_id, self.model_path)
+        path = f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples"
+        if ref_storage_backend == "artifact":
+            try:
+                capabilities = await self._service.http.get(
+                    f"/api/v1/models/{scope}/storage-capabilities"
+                )
+            except WeaverAPIError as exc:
+                if exc.status_code in (404, 405):
+                    raise RuntimeError("Server does not support managed sampling refs") from exc
+                raise
+            verify_ref_storage_capability(capabilities, kind)
+            path += "/managed-refs"
+        validator = sample_result_validator(body, ref_storage_backend, scope)
+        handle = await self._service.enqueue_operation(path, body)
+        if validator is not None:
+            handle._result_validator = validator  # pylint: disable=protected-access
         if not wait:
             return handle
         raw_result = await handle.result()
-        # Resolve the tokenizer source up front so result normalization (which
-        # may need to decode token ids) stays synchronous.
+        if validator is not None:
+            validator(raw_result)
+        # Resolve the tokenizer source before synchronous result normalization.
         await self._ensure_tokenizer_source()
-        if sc_head_size:
-            validate_sampler_result(raw_result, sc_head_size, sc_transport)
-        if sampling_mask_transport == "ref":
-            validate_mask_result(raw_result)
         return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)  # type: ignore[return-value]
 
     async def compute_logprobs(

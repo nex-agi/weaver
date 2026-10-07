@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, 
 
 from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
+from ._checkpoint_storage import validate_storage_backend, verify_checkpoint_storage_capability
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
@@ -563,6 +564,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         ttl_seconds: int | None = ...,
         wait: Literal[True] = True,
     ) -> Checkpoint: ...
@@ -573,6 +575,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         ttl_seconds: int | None = ...,
         wait: Literal[False],
     ) -> OperationHandle: ...
@@ -582,6 +585,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         checkpoint_type: str = "weight",
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         ttl_seconds: int | None | _UnsetType = UNSET,
         wait: bool = True,
     ) -> Checkpoint | OperationHandle:
@@ -594,6 +598,9 @@ class TrainingClient:
             name: Human-readable checkpoint label (e.g. ``"step-100"``).
                 The server generates the full storage path incorporating
                 the model ID automatically.
+            storage_backend: Omit for the historical GPFS behavior, or choose
+                ``"gpfs"`` / ``"artifact"`` per save. Managed storage requires
+                server support; an unsupported request fails before enqueue.
             checkpoint_type: ``"weight"`` (default), ``"weight_and_optimizer"``,
                 or ``"sampling"``.
             ttl_seconds: Time-to-live in seconds for the checkpoint. When
@@ -610,7 +617,20 @@ class TrainingClient:
             A :class:`~weaver.types.Checkpoint` when *wait* is True, else
             an :class:`OperationHandle`.
         """
+        validate_storage_backend(storage_backend)
+        if storage_backend == "artifact":
+            try:
+                capabilities = self._service.http.get(
+                    f"/api/v1/models/{self.model_id}/storage-capabilities"
+                )
+            except WeaverAPIError as exc:
+                if exc.status_code in (404, 405):
+                    raise RuntimeError("Server does not support managed checkpoint saves") from exc
+                raise
+            verify_checkpoint_storage_capability(capabilities)
         body: Dict[str, Any] = {"type": checkpoint_type}
+        if storage_backend is not None:
+            body["storage_backend"] = storage_backend
         if name is not None:
             body["name"] = name
         if not isinstance(ttl_seconds, _UnsetType):
@@ -626,7 +646,8 @@ class TrainingClient:
             else set()
         )
         handle = self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/checkpoints",
+            f"/api/v1/models/{self.model_id}/checkpoints"
+            + ("/managed" if storage_backend == "artifact" else ""),
             body,
         )
         if not wait:

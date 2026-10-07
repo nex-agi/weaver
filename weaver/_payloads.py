@@ -314,3 +314,175 @@ def build_surrogate_data(
         loss_fn_inputs["surrogate_weights"] = logprob_tensor.grad.detach().tolist()
         surrogate_data.append(datum.with_loss_fn_inputs(loss_fn_inputs))
     return surrogate_data
+
+
+def remote_tensor_upload_route(path: str) -> tuple[str, str] | None:
+    """Return the canonical model upload route and training action, if eligible."""
+    import re
+    from uuid import UUID
+
+    match = re.fullmatch(r"/api/v1/models/([^/]+)/(forward-passes|forward-backward-passes)", path)
+    if match is None:
+        return None
+    try:
+        model = UUID(match[1])
+        if str(model) != match[1] or model.int == 0:
+            return None
+    except ValueError:
+        return None
+    action = "forward" if match[2] == "forward-passes" else "forward_backward"
+    return f"/api/v1/models/{model}/tensor-uploads", action
+
+
+def remote_tensor_prepare_body(record: dict[str, Any]) -> dict[str, Any]:
+    """Build identical sync/async metadata from a frozen local recovery record."""
+    from uuid import UUID
+
+    route = remote_tensor_upload_route(record["path"])
+    if route is None or str(UUID(record["upload_id"])) != record["upload_id"]:
+        raise ValueError("invalid remote input recovery identity")
+    request = record["request"]
+    if not isinstance(request, dict) or "tensor_input_upload_id" in request:
+        raise ValueError("invalid remote input original request")
+    return {
+        "version": 1,
+        "upload_id": record["upload_id"],
+        "job_type": route[1],
+        "request": request,
+        "tensor_pack": record["tensor_pack"],
+    }
+
+
+def validate_remote_tensor_view(
+    view: dict[str, Any], record: dict[str, Any], previous: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Validate source, session and operation bindings before any external byte IO."""
+    from uuid import UUID
+
+    try:
+        session = view["session"]
+        expected = {
+            "schema": "weaver-tensor-input-pack/v1/" + record["tensor_pack"]["codec"],
+            "size_bytes": record["tensor_pack"]["size_bytes"],
+            "sha256": record["tensor_pack"]["sha256"],
+        }
+        size, part = expected["size_bytes"], session["part_size"]
+        identifiers = [view["operation_id"], session["upload_session_id"], session["operation_id"]]
+        tail = session["ref"].removeprefix("artifact://").rsplit("/", 1)[1]
+        identifiers.extend(tail.split("@"))
+        valid = (
+            type(view["version"]) is int
+            and view["version"] == 1
+            and view["upload_id"] == record["upload_id"]
+            and type(view["ready"]) is bool
+            and view["state"] in {"REMOTE_PREPARED", "REMOTE_PUBLISHED", "BOUND"}
+            and session["state"] in {"UPLOADING", "COMPLETING", "VERIFYING", "VERIFIED", "DURABLE"}
+            and session["blob"] == expected
+            and type(part) is int
+            and 4 << 20 <= part <= 1 << 30
+            and type(session["part_count"]) is int
+            and session["part_count"] == (size + part - 1) // part
+            and 1 <= session["part_count"] <= 1000
+            and len(identifiers) == 5
+            and session["ref"].startswith("artifact://")
+            and all(str(UUID(value)) == value and UUID(value).int != 0 for value in identifiers)
+            and bool(view["tos_hosts"])
+            and isinstance(view["tos_hosts"], list)
+            and all(
+                isinstance(host, str)
+                and host == host.lower()
+                and "/" not in host
+                and ":" not in host
+                and "@" not in host
+                for host in view["tos_hosts"]
+            )
+            and (not view["ready"] or session["state"] == "DURABLE")
+            and view["ready"] == (view["state"] in {"REMOTE_PUBLISHED", "BOUND"})
+        )
+        if previous is not None:
+            valid = valid and view["operation_id"] == previous["operation_id"]
+            valid = valid and view["tos_hosts"] == previous["tos_hosts"]
+            valid = valid and all(
+                session[key] == previous["session"][key]
+                for key in (
+                    "upload_session_id",
+                    "operation_id",
+                    "ref",
+                    "blob",
+                    "part_size",
+                    "part_count",
+                )
+            )
+        if not valid:
+            raise ValueError
+    except (KeyError, ValueError, TypeError, AttributeError, IndexError):
+        raise ValueError("remote tensor upload binding changed") from None
+    return view
+
+
+def validate_remote_tensor_part(
+    part: dict[str, Any],
+    view: dict[str, Any],
+    number: int,
+    size: int,
+    md5: str,
+    previous_cloud_id: str | None,
+) -> str:
+    """Check signed part authority and exact headers without forwarding API auth."""
+    from datetime import datetime, timezone
+    from urllib.parse import parse_qs, urlsplit
+
+    try:
+        parsed = urlsplit(part["url"])
+        query = {key.lower(): value for key, value in parse_qs(parsed.query).items()}
+        cloud_id = query["uploadid"][0]
+        expires = int(query["x-tos-expires"][0])
+        date = datetime.strptime(query["x-tos-date"][0], "%Y%m%dT%H%M%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        elapsed = (datetime.now(timezone.utc) - date).total_seconds()
+        valid = (
+            parsed.scheme == "https"
+            and parsed.hostname in view["tos_hosts"]
+            and parsed.netloc == parsed.hostname
+            and not parsed.fragment
+            and len(part["url"]) <= 16384
+            and parsed.path.startswith("/")
+            and query["partnumber"] == [str(number)]
+            and len(query["uploadid"]) == 1
+            and bool(cloud_id)
+            and (previous_cloud_id is None or cloud_id == previous_cloud_id)
+            and 1 <= expires <= 900
+            and -60 <= elapsed < expires
+            and part["upload_session_id"] == view["session"]["upload_session_id"]
+            and type(part["part_number"]) is int
+            and part["part_number"] == number
+            and type(part["size_bytes"]) is int
+            and part["size_bytes"] == size
+            and part["headers"] == {"Content-Length": str(size), "Content-MD5": md5}
+            and type(part["remaining_seconds"]) is int
+            and 1 <= part["remaining_seconds"] <= 3600
+        )
+        if not valid:
+            raise ValueError
+    except (KeyError, ValueError, TypeError, AttributeError, IndexError):
+        raise ValueError("invalid remote tensor part authority") from None
+    return cloud_id
+
+
+def remote_tensor_fallback(response: Any, *, first_attempt: bool) -> bool:
+    """Allow legacy transport only after a definitive pre-allocation rejection."""
+    if not first_attempt:
+        return False
+    if response.status_code == 404 and response.content.strip() == b"404 page not found":
+        return True
+    if response.status_code == 409:
+        try:
+            value = response.json()
+            return (
+                value.get("error") == "tensor_remote_upload_disabled"
+                and value.get("retryable") is False
+            )
+        except (ValueError, AttributeError):
+            return False
+    return False
