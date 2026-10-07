@@ -27,6 +27,7 @@ import httpx
 import pytest
 
 from weaver import _tensor_upload as transport
+from weaver import get_tensor_upload_recovery_path
 from weaver._async_http import AsyncAPIClient
 from weaver._http import APIClient
 from weaver.config import WeaverConfig
@@ -400,11 +401,14 @@ def test_async_cancel_after_admission_keeps_valid_recovery(tmp_path, monkeypatch
             with pytest.raises(asyncio.CancelledError) as caught:
                 await task
             fixture.pack.close()
-            recovery = getattr(caught.value, "recovery_path", None)
+            recovery = get_tensor_upload_recovery_path(caught.value)
             assert (
                 recovery is not None and recovery.is_file()
             ), "cancelled delivery needs a real resume journal"
             assert fixture.pack.path.is_file()
+            assert fixture.pack.path.read_bytes() == fixture.wire
+            assert fixture.pack._remote_recovery == recovery
+            assert recovery.stat().st_mode & 0o777 == 0o600
             assert json.loads(recovery.read_text())["upload_id"] == fixture.upload_id
             recovered = await client.resume_tensor_upload(str(recovery))
             assert recovered["id"] == fixture.operation
@@ -416,6 +420,22 @@ def test_async_cancel_after_admission_keeps_valid_recovery(tmp_path, monkeypatch
             await client.aclose()
 
     asyncio.run(asyncio.wait_for(exercise(), timeout=12))
+
+
+def test_recovery_path_handles_wrappers_and_exception_cycles(tmp_path):
+    journal = tmp_path / "journal.json"
+    interrupted = TensorUploadInterrupted(journal, tmp_path / "source", "nonce")
+    cancellation = asyncio.CancelledError()
+    cancellation.__context__ = interrupted
+    interrupted.__cause__ = cancellation
+    assert get_tensor_upload_recovery_path(cancellation) == journal
+    interrupted.__cause__ = None
+    cancellation.__context__ = None
+    cancellation.__cause__ = interrupted
+    assert get_tensor_upload_recovery_path(cancellation) == journal
+    interrupted.recovery_path = "invalid"  # type: ignore[assignment]
+    interrupted.__context__ = cancellation
+    assert get_tensor_upload_recovery_path(cancellation) is None
 
 
 @pytest.mark.timeout(20)

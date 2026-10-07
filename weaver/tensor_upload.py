@@ -17,6 +17,36 @@
 from pathlib import Path
 
 
+def get_tensor_upload_recovery_path(error: BaseException) -> Path | None:
+    """Find a tensor upload journal across exception propagation wrappers.
+
+    Python 3.10 may replace a task's cancellation exception and retain the
+    original as its context. This helper supports that behavior without
+    changing cancellation semantics.
+
+    Args:
+        error: Upload failure or cancellation caught by the caller.
+
+    Returns:
+        The retained journal path, or None when no upload journal was recorded.
+    """
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        recovery = getattr(current, "recovery_path", None)
+        if isinstance(recovery, Path):
+            return recovery
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return None
+
+
 class TensorUploadInterrupted(RuntimeError):
     """A remote submission failed while its original source remains recoverable.
 

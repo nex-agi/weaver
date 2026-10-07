@@ -97,8 +97,10 @@ except TensorUploadInterrupted as interrupted:
 ```
 
 `AsyncServiceClient` supports `await client.resume_tensor_upload(path)`. Async cancellation
-also preserves the source and journal; the raised `CancelledError` has `recovery_path`
-when a journal was created. Resume returns a handle for the original operation,
+also preserves the source and journal. Use `get_tensor_upload_recovery_path(error)`
+from `weaver` on the caught `CancelledError` to retrieve a recorded journal; Python 3.10
+may retain the original cancellation exception in its context. The helper returns `None`
+when no journal was created. Resume returns a handle for the original operation,
 including when its admission succeeded but the response was lost. The SDK removes
 its pack and journal only after receiving that operation's admission acknowledgement.
 The private journal includes training metadata and should stay on protected storage.
