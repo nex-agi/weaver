@@ -35,6 +35,8 @@ def _chart_key(point: MetricObservation) -> str:
             key += f"/{label}_{quote(point.labels[label], safe='-_')}"
     if "layer" in point.labels:
         key += "/" + quote(point.labels["layer"], safe="/-_")
+    if point.name == "grad/norm/per_parameter" and "parameter" in point.labels:
+        key += "/" + quote(point.labels["parameter"], safe=".-_")
     return key
 
 

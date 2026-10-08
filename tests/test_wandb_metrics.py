@@ -139,6 +139,18 @@ def test_forward_only_does_not_invent_optimizer_step(run):
     assert "step" not in values
 
 
+def test_parameter_gradient_series_do_not_collapse_into_layer_series(run):
+    raw = envelope(
+        point("grad/norm/per_parameter", 3.0, layer="decoder/7", parameter="attention.weight"),
+        point("grad/norm/per_parameter", 4.0, layer="decoder/7", parameter="mlp.weight"),
+    )
+    WandbMetricView(run).log("op", raw, commit=True)
+    values = run.rows[-1][0]
+    assert values["grad/norm/per_parameter/decoder/7/attention.weight"] == 3.0
+    assert values["grad/norm/per_parameter/decoder/7/mlp.weight"] == 4.0
+    assert raw.points[0].labels["parameter"] == "attention.weight"
+
+
 def test_per_layer_values_are_scalar_time_series_with_sparse_steps(run):
     view = WandbMetricView(run)
     for step in (5, 11):
