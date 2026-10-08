@@ -34,3 +34,27 @@ def verify_checkpoint_storage_capability(capabilities: Any) -> None:
         or "artifact" not in capabilities["save_state_backends"]
     ):
         raise RuntimeError("Server does not currently allow managed checkpoint saves")
+
+
+def preferred_permanent_checkpoint_backend(capabilities: Any) -> str | None:
+    """Negotiate upgraded saves without changing historical omitted payloads."""
+    if (
+        not isinstance(capabilities, dict)
+        or type(capabilities.get("protocol_version")) is not int
+        or capabilities["protocol_version"] != 1
+        or capabilities.get("default_backend") != "gpfs"
+        or not isinstance(capabilities.get("save_state_backends"), list)
+        or "gpfs" not in capabilities["save_state_backends"]
+    ):
+        raise RuntimeError("Server checkpoint storage preference is invalid")
+    field = "preferred_permanent_checkpoint_backend"
+    if field not in capabilities:
+        return None  # Older capability responses preserve the historical default.
+    if (
+        type(capabilities.get("protocol_version")) is not int
+        or capabilities["protocol_version"] != 1
+        or capabilities.get("default_backend") != "gpfs"
+        or capabilities[field] not in ("gpfs", "artifact")
+    ):
+        raise RuntimeError("Server checkpoint storage preference is invalid")
+    return "artifact" if capabilities[field] == "artifact" else None

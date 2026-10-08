@@ -29,7 +29,11 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Sequence, 
 
 from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validate_resource_id
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
-from ._checkpoint_storage import validate_storage_backend, verify_checkpoint_storage_capability
+from ._checkpoint_storage import (
+    preferred_permanent_checkpoint_backend,
+    validate_storage_backend,
+    verify_checkpoint_storage_capability,
+)
 from ._deployments import build_create_deployment_body, translate_deployment_error
 from ._http import WeaverAPIError
 from ._payloads import (
@@ -598,9 +602,10 @@ class TrainingClient:
             name: Human-readable checkpoint label (e.g. ``"step-100"``).
                 The server generates the full storage path incorporating
                 the model ID automatically.
-            storage_backend: Omit for the historical GPFS behavior, or choose
-                ``"gpfs"`` / ``"artifact"`` per save. Managed storage requires
-                server support; an unsupported request fails before enqueue.
+            storage_backend: Omit to negotiate the server's preference for
+                permanent checkpoints, or choose ``"gpfs"`` / ``"artifact"``
+                per save. Older servers and TTL-based saves retain GPFS defaults.
+                Managed storage requires server support before enqueue.
             checkpoint_type: ``"weight"`` (default), ``"weight_and_optimizer"``,
                 or ``"sampling"``.
             ttl_seconds: Time-to-live in seconds for the checkpoint. When
@@ -618,16 +623,30 @@ class TrainingClient:
             an :class:`OperationHandle`.
         """
         validate_storage_backend(storage_backend)
-        if storage_backend == "artifact":
+        negotiate_default = storage_backend is None and (
+            ttl_seconds is None
+            or (
+                isinstance(ttl_seconds, _UnsetType)
+                and checkpoint_type in ("weight", "weight_and_optimizer")
+            )
+        )
+        if storage_backend == "artifact" or negotiate_default:
+            route_missing = False
             try:
                 capabilities = self._service.http.get(
                     f"/api/v1/models/{self.model_id}/storage-capabilities"
                 )
             except WeaverAPIError as exc:
-                if exc.status_code in (404, 405):
+                if exc.status_code not in (404, 405):
+                    raise
+                if storage_backend == "artifact":
                     raise RuntimeError("Server does not support managed checkpoint saves") from exc
-                raise
-            verify_checkpoint_storage_capability(capabilities)
+                route_missing = True
+                capabilities = None
+            if negotiate_default and not route_missing:
+                storage_backend = preferred_permanent_checkpoint_backend(capabilities)
+            if storage_backend == "artifact":
+                verify_checkpoint_storage_capability(capabilities)
         body: Dict[str, Any] = {"type": checkpoint_type}
         if storage_backend is not None:
             body["storage_backend"] = storage_backend
