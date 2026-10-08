@@ -48,6 +48,8 @@ from ._payloads import (
 from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
 from .async_service_client import AsyncServiceClient
+from .online_bench.async_client import AsyncOnlineBench
+from .online_bench.config import ConfigSource
 from .operations import AsyncOperationHandle, build_async_operation_handle
 from .tensor_transport import PreparedOperationBody
 from .types import AdamParams, Datum
@@ -116,6 +118,15 @@ class AsyncTrainingClient:
         self.debug_info = debug_info
         self._tokenizer: Any = None
 
+    async def configure_online_bench(self, config: ConfigSource = None) -> AsyncOnlineBench:
+        """Prepare independent online monitoring before entering the training loop.
+
+        The config contains a fixed ``online_bench`` policy. GPU resources come
+        from this run's registered model, not the metrics or benchmark config.
+        Keep the returned hook and call ``after_step``/``finish`` on it.
+        """
+        return await AsyncOnlineBench.configure(self, config)
+
     @property
     def training_run_id(self) -> str:
         """Canonical identifier for this Training Run; model_id is retained."""
@@ -162,7 +173,13 @@ class AsyncTrainingClient:
                 f"/api/v1/sessions/{self.session_id}/metrics", json={"metrics": points}
             )
 
+    def _check_online_bench(self) -> None:
+        guard = getattr(self._service, "_online_bench_guards", {}).get(self.model_id)
+        if guard is not None:
+            guard()
+
     def _next_seq(self) -> int:
+        self._check_online_bench()
         return self._service.next_operation_seq(self.model_id)
 
     async def resolve_sample_ref_lengths(self, refs: Sequence[SampleRef]) -> List[SampleRefLength]:
@@ -658,6 +675,7 @@ class AsyncTrainingClient:
         include_optimizer: bool,
         wait: bool,
     ) -> AsyncOperationHandle | Dict[str, Any]:
+        self._check_online_bench()
         checkpoint_path = path.path if isinstance(path, Checkpoint) else path
         body: Dict[str, Any] = {
             "path": checkpoint_path,

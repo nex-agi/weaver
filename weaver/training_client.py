@@ -42,6 +42,8 @@ from ._payloads import (
 )
 from ._sampling_utils import parse_model_id_from_weaver_path
 from ._utils import DEFAULT_SAMPLER_TTL_SECONDS, UNSET, _UnsetType, lookup_case_insensitive
+from .online_bench.client import OnlineBench
+from .online_bench.config import ConfigSource
 from .operations import OperationHandle, build_operation_handle
 from .service_client import ServiceClient
 from .tensor_transport import PreparedOperationBody
@@ -84,6 +86,15 @@ class TrainingClient:
         self.session_id = session_id
         self.tokenizer_path = tokenizer_path
         self.debug_info = debug_info
+
+    def configure_online_bench(self, config: ConfigSource = None) -> OnlineBench:
+        """Prepare independent online monitoring before entering the training loop.
+
+        The config contains a fixed ``online_bench`` policy. GPU resources come
+        from this run's registered model, not the metrics or benchmark config.
+        Keep the returned hook and call ``after_step``/``finish`` on it.
+        """
+        return OnlineBench.configure(self, config)
 
     @property
     def training_run_id(self) -> str:
@@ -139,7 +150,13 @@ class TrainingClient:
                 f"/api/v1/sessions/{self.session_id}/metrics", json={"metrics": points}
             )
 
+    def _check_online_bench(self) -> None:
+        guard = getattr(self._service, "_online_bench_guards", {}).get(self.model_id)
+        if guard is not None:
+            guard()
+
     def _next_seq(self) -> int:
+        self._check_online_bench()
         return self._service.next_operation_seq(self.model_id)
 
     def resolve_sample_ref_lengths(self, refs: Sequence[SampleRef]) -> List[SampleRefLength]:
@@ -737,6 +754,7 @@ class TrainingClient:
         include_optimizer: bool,
         wait: bool,
     ) -> OperationHandle | Dict[str, Any]:
+        self._check_online_bench()
         checkpoint_path = path.path if isinstance(path, Checkpoint) else path
         body: Dict[str, Any] = {
             "path": checkpoint_path,

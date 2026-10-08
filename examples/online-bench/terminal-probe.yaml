@@ -1,0 +1,45 @@
+# Native Harbor configuration. Task revisions are examples, not server rules.
+n_concurrent_trials: 3
+n_attempts: 1
+retry:
+  max_retries: 0
+environment:
+  type: e2b
+  delete: true
+  suppress_override_warnings: true
+  env: {}
+  override_cpus: 8
+agents:
+- override_timeout_sec: 1800
+  kwargs:
+    version: 2.1.139
+    max_turns: 100
+    reasoning_effort: xhigh
+    disallowed_tools: WebFetch,WebSearch,AskUserQuestion,EnterPlanMode,ExitPlanMode,EnterWorktree,ExitWorktree,CronCreate,CronDelete,CronList,Task,TaskOutput,TaskStop,NotebookEdit,ScheduleWakeup
+    instruction_suffix: '
+
+
+      <system-reminder>You are an autonomous coding agent running inside a sandboxed
+      Linux environment. You are solving a self-contained task end-to-end with no
+      human in the loop. After making changes, you must run or write appropriate tests
+      to verify that your fix works correctly and does not introduce regressions.</system-reminder>'
+    system_prompt_path: configs/harness/systemprompt_claude_code2.md
+  import_path: nexau_agent.claude_code_direct:ClaudeCodeDirect
+  env: {}
+datasets: []
+artifacts: []
+verifier:
+  override_timeout_sec: 600
+tasks:
+- name: terminal-bench/fix-git
+  ref: sha256:16948b980df9d96de616a205f5acca1c5d395de83ff4f8ffabcafacb93226f2e
+- name: terminal-bench/git-multibranch
+  ref: sha256:7759a92a373c967dd31535975bad8659410644025673fe62385444fd2605c5fa
+- name: terminal-bench/log-summary-date-ranges
+  ref: sha256:27b074a2f10fff7606e096f3abd8dced418ad8fda0f53d88acbe477f2d9ceaf6
+- name: terminal-bench/nginx-request-logging
+  ref: sha256:9d1b8bebd989ea0bc8080c3b159480068caf183c5fd61385868b2574b206e097
+- name: terminal-bench/openssl-selfsigned-cert
+  ref: sha256:d4afa2bd2a9ba1420db8d6cfde42ffdb4873ae2d955c35014e8da94444c83302
+metrics:
+- type: mean

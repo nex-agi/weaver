@@ -28,6 +28,9 @@ from ._http import WeaverAPIError  # noqa: F401
 from .async_sampling_client import AsyncSamplingClient  # noqa: F401
 from .async_service_client import AsyncServiceClient  # noqa: F401
 from .async_training_client import AsyncTrainingClient  # noqa: F401
+from .online_bench.async_client import AsyncOnlineBench  # noqa: F401
+from .online_bench.client import OnlineBench  # noqa: F401
+from .online_bench.config import OnlineBenchConfig, OnlineBenchSuite  # noqa: F401
 from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
 from .training_outputs import align_training_outputs, attach_loss_fn_outputs  # noqa: F401
@@ -49,6 +52,10 @@ from .types.supported_model import (  # noqa: F401
 from .types.weights_artifact import WeightsArtifact  # noqa: F401
 
 __all__ = [
+    "OnlineBench",
+    "AsyncOnlineBench",
+    "OnlineBenchConfig",
+    "OnlineBenchSuite",
     "ServiceClient",
     "OperationHandle",
     "AsyncServiceClient",

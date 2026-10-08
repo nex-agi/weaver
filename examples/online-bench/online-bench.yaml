@@ -1,0 +1,14 @@
+# Use with a 20-step training run: four rounds, ten tasks per round.
+online_bench:
+  enabled: true
+  checkpoint_keep_last: 1
+  every_n_steps: 5
+  results_path: ./weaver/.logs
+  save_artifacts: true
+  suites:
+  - name: swe_probe
+    harbor_config: swe-probe.yaml
+    timeout_seconds: 5400
+  - name: terminal_probe
+    harbor_config: terminal-probe.yaml
+    timeout_seconds: 3600
