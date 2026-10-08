@@ -31,6 +31,7 @@ from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validat
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
 from ._checkpoint_storage import (
     preferred_permanent_checkpoint_backend,
+    select_sampler_export_backend,
     validate_storage_backend,
     verify_checkpoint_storage_capability,
 )
@@ -403,12 +404,33 @@ class TrainingClient:
         )
         return handle.result() if wait else handle
 
+    def _sampler_export_backend(
+        self, backend: str | None, ttl_seconds: int | None
+    ) -> str | None:
+        validate_storage_backend(backend)
+        if backend == "artifact" and ttl_seconds is not None:
+            raise ValueError("Managed sampler exports require ttl_seconds=None")
+        if backend == "gpfs" or (backend is None and ttl_seconds is not None):
+            return backend
+        try:
+            capabilities = self._service.http.get(
+                f"/api/v1/models/{self.model_id}/storage-capabilities"
+            )
+        except WeaverAPIError as exc:
+            if exc.status_code not in (404, 405):
+                raise
+            if backend == "artifact":
+                raise RuntimeError("Server does not support managed sampler exports") from exc
+            return None
+        return select_sampler_export_backend(capabilities, backend)
+
     @overload
     def save_weights_for_sampler(
         self,
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: Literal[True] = True,
     ) -> str: ...
 
@@ -418,6 +440,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -426,19 +449,23 @@ class TrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: bool = True,
     ) -> str | OperationHandle:
         """Export model weights for sampling.
 
         Sampler weights are intended for short-lived RL weight-sync use, so
         the default TTL is **1 hour (3600 s)**.  Pass ``ttl_seconds=None`` to
-        keep the exported checkpoint permanently (use ``save_state`` if you
-        need a durable checkpoint instead).
+        keep the exported checkpoint permanently. Permanent saves negotiate
+        managed storage when the server supports it.
 
         Args:
             name: Optional custom path name for the exported weights
             ttl_seconds: Time-to-live in seconds for the exported checkpoint.
                 Defaults to ``3600`` (1 hour).  Pass ``None`` for permanent.
+            storage_backend: Select ``"gpfs"`` or ``"artifact"`` explicitly.
+                Managed sampler exports require permanent retention (``None`` TTL).
+                Omitted permanent exports negotiate server capabilities.
             wait: If True (default), waits for export to complete and returns path.
                   If False, returns an OperationHandle immediately.
 
@@ -448,13 +475,17 @@ class TrainingClient:
         Raises:
             RuntimeError: If export response is missing model path
         """
+        storage_backend = self._sampler_export_backend(storage_backend, ttl_seconds)
         body: Dict[str, Any] = {"seq_id": self._next_seq()}
+        if storage_backend is not None:
+            body["storage_backend"] = storage_backend
         if name:
             body["path"] = name
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
         handle = self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/export-sampler",
+            f"/api/v1/models/{self.model_id}/export-sampler"
+            + ("/managed" if storage_backend == "artifact" else ""),
             body,
         )
         if not wait:
@@ -473,6 +504,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: Literal[True] = True,
     ) -> "SamplingClient": ...
 
@@ -482,6 +514,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: Literal[False],
     ) -> OperationHandle: ...
 
@@ -490,6 +523,7 @@ class TrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: bool = True,
     ) -> "SamplingClient" | OperationHandle:
         """Export model weights and create a sampling client.
@@ -505,6 +539,9 @@ class TrainingClient:
             name: Optional custom path name for the exported weights
             ttl_seconds: Time-to-live in seconds for the exported checkpoint.
                 Defaults to ``3600`` (1 hour).  Pass ``None`` for permanent.
+            storage_backend: Select ``"gpfs"`` or ``"artifact"`` explicitly.
+                Managed sampler exports require permanent retention (``None`` TTL).
+                Omitted permanent exports negotiate server capabilities.
             wait: If True (default), waits for export and returns SamplingClient.
                   If False, returns an OperationHandle immediately.
 
@@ -514,13 +551,17 @@ class TrainingClient:
         Raises:
             RuntimeError: If export response is missing required information
         """
+        storage_backend = self._sampler_export_backend(storage_backend, ttl_seconds)
         body: Dict[str, Any] = {"seq_id": self._next_seq()}
+        if storage_backend is not None:
+            body["storage_backend"] = storage_backend
         if name:
             body["path"] = name
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
         handle = self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/export-sampler",
+            f"/api/v1/models/{self.model_id}/export-sampler"
+            + ("/managed" if storage_backend == "artifact" else ""),
             body,
         )
         if not wait:

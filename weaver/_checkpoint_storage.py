@@ -58,3 +58,21 @@ def preferred_permanent_checkpoint_backend(capabilities: Any) -> str | None:
     ):
         raise RuntimeError("Server checkpoint storage preference is invalid")
     return "artifact" if capabilities[field] == "artifact" else None
+
+
+def select_sampler_export_backend(capabilities: Any, requested: str | None) -> str | None:
+    """Require a distinct sampler route capability before selecting managed saves."""
+    preferred = preferred_permanent_checkpoint_backend(capabilities)
+    backends = capabilities.get("sampler_export_backends")
+    if backends is None and "sampler_export_backends" not in capabilities:
+        if requested == "artifact":
+            raise RuntimeError("Server does not support managed sampler exports")
+        return None
+    if not isinstance(backends, list) or "gpfs" not in backends:
+        raise RuntimeError("Server sampler export capability is invalid")
+    selected = requested or (preferred if "artifact" in backends else None)
+    if selected == "artifact":
+        if "artifact" not in backends:
+            raise RuntimeError("Server does not currently allow managed sampler exports")
+        verify_checkpoint_storage_capability(capabilities)
+    return selected

@@ -37,6 +37,7 @@ from ._async_http import _await_blocking_io
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
 from ._checkpoint_storage import (
     preferred_permanent_checkpoint_backend,
+    select_sampler_export_backend,
     validate_storage_backend,
     verify_checkpoint_storage_capability,
 )
@@ -409,12 +410,33 @@ class AsyncTrainingClient:
         )
         return await handle.result() if wait else handle
 
+    async def _sampler_export_backend(
+        self, backend: str | None, ttl_seconds: int | None
+    ) -> str | None:
+        validate_storage_backend(backend)
+        if backend == "artifact" and ttl_seconds is not None:
+            raise ValueError("Managed sampler exports require ttl_seconds=None")
+        if backend == "gpfs" or (backend is None and ttl_seconds is not None):
+            return backend
+        try:
+            capabilities = await self._service.http.get(
+                f"/api/v1/models/{self.model_id}/storage-capabilities"
+            )
+        except WeaverAPIError as exc:
+            if exc.status_code not in (404, 405):
+                raise
+            if backend == "artifact":
+                raise RuntimeError("Server does not support managed sampler exports") from exc
+            return None
+        return select_sampler_export_backend(capabilities, backend)
+
     @overload
     async def save_weights_for_sampler(
         self,
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: "Literal[True]" = True,
     ) -> str: ...
 
@@ -424,6 +446,7 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: "Literal[False]",
     ) -> AsyncOperationHandle: ...
 
@@ -432,6 +455,7 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: bool = True,
     ) -> str | AsyncOperationHandle:
         """Export model weights for sampling.
@@ -440,13 +464,17 @@ class AsyncTrainingClient:
         Returns the model path (str) when *wait* is True, else an
         ``AsyncOperationHandle``.
         """
+        storage_backend = await self._sampler_export_backend(storage_backend, ttl_seconds)
         body: Dict[str, Any] = {"seq_id": self._next_seq()}
+        if storage_backend is not None:
+            body["storage_backend"] = storage_backend
         if name:
             body["path"] = name
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
         handle = await self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/export-sampler",
+            f"/api/v1/models/{self.model_id}/export-sampler"
+            + ("/managed" if storage_backend == "artifact" else ""),
             body,
         )
         if not wait:
@@ -465,6 +493,7 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: "Literal[True]" = True,
     ) -> "AsyncSamplingClient": ...
 
@@ -474,6 +503,7 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: "Literal[False]",
     ) -> AsyncOperationHandle: ...
 
@@ -482,19 +512,24 @@ class AsyncTrainingClient:
         *,
         name: str | None = None,
         ttl_seconds: int | None = DEFAULT_SAMPLER_TTL_SECONDS,
+        storage_backend: Literal["gpfs", "artifact"] | None = None,
         wait: bool = True,
     ) -> "AsyncSamplingClient | AsyncOperationHandle":
         """Export model weights and create an async sampling client.
 
         See :meth:`weaver.training_client.TrainingClient.save_weights_and_get_sampling_client`.
         """
+        storage_backend = await self._sampler_export_backend(storage_backend, ttl_seconds)
         body: Dict[str, Any] = {"seq_id": self._next_seq()}
+        if storage_backend is not None:
+            body["storage_backend"] = storage_backend
         if name:
             body["path"] = name
         if ttl_seconds is not None:
             body["ttl_seconds"] = ttl_seconds
         handle = await self._service.enqueue_operation(
-            f"/api/v1/models/{self.model_id}/export-sampler",
+            f"/api/v1/models/{self.model_id}/export-sampler"
+            + ("/managed" if storage_backend == "artifact" else ""),
             body,
         )
         if not wait:
