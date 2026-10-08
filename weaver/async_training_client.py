@@ -37,6 +37,7 @@ from ._async_http import _await_blocking_io
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
 from ._checkpoint_storage import (
     preferred_permanent_checkpoint_backend,
+    select_hf_export_source_backend,
     select_sampler_export_backend,
     validate_storage_backend,
     verify_checkpoint_storage_capability,
@@ -773,6 +774,7 @@ class AsyncTrainingClient:
         merge_adapter: bool = False,
         ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
         force: bool = False,
+        source_storage_backend: str | None = None,
         wait: "Literal[True]" = True,
     ) -> WeightsArtifact: ...
 
@@ -784,6 +786,7 @@ class AsyncTrainingClient:
         merge_adapter: bool = False,
         ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
         force: bool = False,
+        source_storage_backend: str | None = None,
         wait: "Literal[False]",
     ) -> WeightsArtifact | AsyncOperationHandle: ...
 
@@ -794,6 +797,7 @@ class AsyncTrainingClient:
         merge_adapter: bool = False,
         ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
         force: bool = False,
+        source_storage_backend: str | None = None,
         wait: bool = True,
     ) -> WeightsArtifact | AsyncOperationHandle:
         """Export model weights in HuggingFace format.
@@ -802,12 +806,32 @@ class AsyncTrainingClient:
         Returns a :class:`~weaver.types.WeightsArtifact` when *wait* is True
         (or on an idempotent completed hit), else an ``AsyncOperationHandle``.
         """
+        validate_storage_backend(source_storage_backend)
+        if checkpoint is not None and source_storage_backend is not None:
+            raise ValueError("source_storage_backend applies only to one-step exports")
         body: Dict[str, Any] = {
             "format": "huggingface",
             "merge_adapter": merge_adapter,
             "ttl_seconds": ttl_seconds,
         }
         if checkpoint is None:
+            selected = source_storage_backend
+            if selected != "gpfs":
+                try:
+                    capabilities = await self._service.http.get(
+                        f"/api/v1/models/{self.model_id}/storage-capabilities"
+                    )
+                except WeaverAPIError as exc:
+                    if exc.status_code not in (404, 405):
+                        raise
+                    if selected == "artifact":
+                        raise RuntimeError(
+                            "Server does not support managed HF export sources"
+                        ) from exc
+                else:
+                    selected = select_hf_export_source_backend(capabilities, selected)
+            if selected is not None:
+                body["source_storage_backend"] = selected
             path = f"/api/v1/models/{self.model_id}/export-hf"
         else:
             checkpoint_id = await self._resolve_checkpoint_id(checkpoint)

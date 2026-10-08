@@ -76,3 +76,24 @@ def select_sampler_export_backend(capabilities: Any, requested: str | None) -> s
             raise RuntimeError("Server does not currently allow managed sampler exports")
         verify_checkpoint_storage_capability(capabilities)
     return selected
+
+
+def select_hf_export_source_backend(capabilities: Any, requested: str | None) -> str | None:
+    """Select a one-step export source only when its route is advertised."""
+    if not isinstance(capabilities, dict):
+        raise RuntimeError("Server HF export source capability is invalid")
+    preferred = preferred_permanent_checkpoint_backend(capabilities)
+    field = "hf_export_source_backends"
+    if field not in capabilities:
+        if requested == "artifact":
+            raise RuntimeError("Server does not support managed HF export sources")
+        return requested
+    backends = capabilities[field]
+    if not isinstance(backends, list) or "gpfs" not in backends:
+        raise RuntimeError("Server HF export source capability is invalid")
+    selected = requested or (preferred if "artifact" in backends else None)
+    if selected == "artifact":
+        if "artifact" not in backends:
+            raise RuntimeError("Server does not currently allow managed HF export sources")
+        verify_checkpoint_storage_capability(capabilities)
+    return selected

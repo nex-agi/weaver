@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
+from weaver._http import WeaverAPIError
 from weaver.async_training_client import AsyncTrainingClient
 from weaver.cli import cli
 from weaver.operations import AsyncOperationHandle, OperationHandle
@@ -56,6 +57,11 @@ def _make_training_client() -> TrainingClient:
     """Create a TrainingClient with a mocked ServiceClient."""
     service = MagicMock()
     service.next_operation_seq.return_value = 1
+    service.http.get.return_value = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs"],
+    }
     return TrainingClient(
         service=service,
         model_id="mdl-123",
@@ -69,7 +75,13 @@ def _make_async_training_client() -> AsyncTrainingClient:
     service = MagicMock()
     service.next_operation_seq.return_value = 1
     service.http.post = AsyncMock()
-    service.http.get = AsyncMock()
+    service.http.get = AsyncMock(
+        return_value={
+            "protocol_version": 1,
+            "default_backend": "gpfs",
+            "save_state_backends": ["gpfs"],
+        }
+    )
     return AsyncTrainingClient(
         service=service,
         model_id="mdl-123",
@@ -407,3 +419,138 @@ class TestExportCLIIdGuard:
             result = CliRunner().invoke(cli, ["checkpoint", "export", raw, "--no-wait"])
         assert result.exit_code != 0
         client.http.post.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "requested,backends,preferred,expected",
+    [
+        (None, ["gpfs", "artifact"], "artifact", "artifact"),
+        (None, ["gpfs"], "artifact", None),
+        (None, None, "artifact", None),
+        (None, ["gpfs", "artifact"], "gpfs", None),
+        ("gpfs", ["gpfs", "artifact"], "artifact", "gpfs"),
+        ("artifact", ["gpfs", "artifact"], "gpfs", "artifact"),
+    ],
+)
+def test_hf_one_step_source_negotiates_without_changing_explicit_gpfs(
+    asynchronous, requested, backends, preferred, expected
+):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    caps = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+        "preferred_permanent_checkpoint_backend": preferred,
+    }
+    if backends is not None:
+        caps["hf_export_source_backends"] = backends
+    client._service.http.get.return_value = caps
+    client._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
+    result = client.export_weights(source_storage_backend=requested, wait=False)
+    if asynchronous:
+        asyncio.run(result)
+    body = client._service.http.post.call_args.kwargs["json"]
+    if expected is None:
+        assert "source_storage_backend" not in body
+    else:
+        assert body["source_storage_backend"] == expected
+    if requested == "gpfs":
+        client._service.http.get.assert_not_called()
+    else:
+        client._service.http.get.assert_called_once_with(
+            "/api/v1/models/mdl-123/storage-capabilities"
+        )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("fault", ["disabled", "old", "invalid", "non_one_step"])
+def test_hf_source_rejection_performs_no_export(asynchronous, fault):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    caps = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+        "preferred_permanent_checkpoint_backend": "artifact",
+        "hf_export_source_backends": ["gpfs"],
+    }
+    if fault == "old":
+        caps.pop("hf_export_source_backends")
+    if fault == "invalid":
+        caps["hf_export_source_backends"] = True
+    client._service.http.get.return_value = caps
+    kwargs = {"source_storage_backend": "artifact", "wait": False}
+    if fault == "non_one_step":
+        kwargs["checkpoint"] = CHECKPOINT_UUID
+    with pytest.raises((RuntimeError, ValueError)):
+        result = client.export_weights(**kwargs)
+        if asynchronous:
+            asyncio.run(result)
+    client._service.http.post.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_hf_source_preference_is_rechecked_after_rollback(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    base = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+        "preferred_permanent_checkpoint_backend": "artifact",
+    }
+    client._service.http.get.side_effect = [
+        {**base, "hf_export_source_backends": ["gpfs", "artifact"]},
+        {**base, "hf_export_source_backends": ["gpfs"]},
+    ]
+    client._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
+    for _ in range(2):
+        result = client.export_weights(wait=False)
+        if asynchronous:
+            asyncio.run(result)
+    calls = client._service.http.post.call_args_list
+    assert calls[0].kwargs["json"]["source_storage_backend"] == "artifact"
+    assert "source_storage_backend" not in calls[1].kwargs["json"]
+    assert client._service.http.get.call_count == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "caps",
+    [
+        {},
+        {"protocol_version": True, "default_backend": "gpfs", "save_state_backends": ["gpfs"]},
+        {"protocol_version": 2, "default_backend": "gpfs", "save_state_backends": ["gpfs"]},
+        {"protocol_version": 1, "default_backend": "artifact", "save_state_backends": ["gpfs"]},
+        {"protocol_version": 1, "default_backend": "gpfs", "save_state_backends": "gpfs"},
+        {"protocol_version": 1, "default_backend": "gpfs", "save_state_backends": []},
+    ],
+)
+def test_hf_invalid_legacy_capability_never_falls_back_to_gpfs(asynchronous, caps):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.return_value = caps
+    with pytest.raises(RuntimeError):
+        result = client.export_weights(wait=False)
+        if asynchronous:
+            asyncio.run(result)
+    client._service.http.post.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("status", [404, 405, 401, 503])
+@pytest.mark.parametrize("requested", [None, "artifact"])
+def test_hf_capability_route_fallback_is_limited_to_old_routes(asynchronous, status, requested):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.side_effect = WeaverAPIError(status, "test", "test", False)
+    client._service.http.post.return_value = _done_operation(ARTIFACT_PAYLOAD)
+    if requested is None and status in (404, 405):
+        result = client.export_weights(wait=False)
+        if asynchronous:
+            asyncio.run(result)
+        client._service.http.post.assert_called_once()
+        assert "source_storage_backend" not in client._service.http.post.call_args.kwargs["json"]
+    else:
+        with pytest.raises((WeaverAPIError, RuntimeError)):
+            result = client.export_weights(source_storage_backend=requested, wait=False)
+            if asynchronous:
+                asyncio.run(result)
+        client._service.http.post.assert_not_called()

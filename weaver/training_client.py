@@ -31,6 +31,7 @@ from ._artifacts import DEFAULT_EXPORT_TTL_SECONDS, is_artifact_payload, validat
 from ._checkpoint_recovery import CHECKPOINT_RECOVERY_DELAYS, select_recovered_checkpoint
 from ._checkpoint_storage import (
     preferred_permanent_checkpoint_backend,
+    select_hf_export_source_backend,
     select_sampler_export_backend,
     validate_storage_backend,
     verify_checkpoint_storage_capability,
@@ -404,9 +405,7 @@ class TrainingClient:
         )
         return handle.result() if wait else handle
 
-    def _sampler_export_backend(
-        self, backend: str | None, ttl_seconds: int | None
-    ) -> str | None:
+    def _sampler_export_backend(self, backend: str | None, ttl_seconds: int | None) -> str | None:
         validate_storage_backend(backend)
         if backend == "artifact" and ttl_seconds is not None:
             raise ValueError("Managed sampler exports require ttl_seconds=None")
@@ -880,6 +879,7 @@ class TrainingClient:
         merge_adapter: bool = False,
         ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
         force: bool = False,
+        source_storage_backend: str | None = None,
         wait: Literal[True] = True,
     ) -> WeightsArtifact: ...
 
@@ -891,6 +891,7 @@ class TrainingClient:
         merge_adapter: bool = False,
         ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
         force: bool = False,
+        source_storage_backend: str | None = None,
         wait: Literal[False],
     ) -> WeightsArtifact | OperationHandle: ...
 
@@ -901,6 +902,7 @@ class TrainingClient:
         merge_adapter: bool = False,
         ttl_seconds: int | None = DEFAULT_EXPORT_TTL_SECONDS,
         force: bool = False,
+        source_storage_backend: str | None = None,
         wait: bool = True,
     ) -> WeightsArtifact | OperationHandle:
         """Export model weights in HuggingFace format.
@@ -925,6 +927,10 @@ class TrainingClient:
                 already exists (the old artifact is soft-deleted). Only
                 meaningful with an explicit *checkpoint*; ignored for the
                 one-step export, which always creates a fresh checkpoint.
+            source_storage_backend: Storage for the one-step export's source.
+                ``None`` negotiates with the server; ``"gpfs"`` preserves a
+                direct filesystem save, and ``"artifact"`` requires managed storage.
+                Only valid when *checkpoint* is omitted.
             wait: If True (default), blocks until the export completes and
                 returns a :class:`~weaver.types.WeightsArtifact`.
 
@@ -939,12 +945,32 @@ class TrainingClient:
             ValueError: If a ``weaver://`` *checkpoint* path cannot be
                 resolved to a checkpoint of this model.
         """
+        validate_storage_backend(source_storage_backend)
+        if checkpoint is not None and source_storage_backend is not None:
+            raise ValueError("source_storage_backend applies only to one-step exports")
         body: Dict[str, Any] = {
             "format": "huggingface",
             "merge_adapter": merge_adapter,
             "ttl_seconds": ttl_seconds,
         }
         if checkpoint is None:
+            selected = source_storage_backend
+            if selected != "gpfs":
+                try:
+                    capabilities = self._service.http.get(
+                        f"/api/v1/models/{self.model_id}/storage-capabilities"
+                    )
+                except WeaverAPIError as exc:
+                    if exc.status_code not in (404, 405):
+                        raise
+                    if selected == "artifact":
+                        raise RuntimeError(
+                            "Server does not support managed HF export sources"
+                        ) from exc
+                else:
+                    selected = select_hf_export_source_backend(capabilities, selected)
+            if selected is not None:
+                body["source_storage_backend"] = selected
             path = f"/api/v1/models/{self.model_id}/export-hf"
         else:
             checkpoint_id = self._resolve_checkpoint_id(checkpoint)
