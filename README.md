@@ -75,6 +75,82 @@ public response shape automatically. `Datum` construction, training calls, and r
 handling therefore do not need to change. Keep the `default` transport when connecting
 to an older Weaver server/trainer deployment that does not support binary tensor packs.
 
+### Trainer metric persistence
+
+Completed v1 metric observations are persisted by the SDK in JSONL by default.
+Configure local storage with `metrics_store=MetricsStoreConfig(enabled=True, path=None)`.
+`path=None` selects `./weaver/.logs` relative to the client construction directory,
+while an explicit path selects a different parent directory. The layout is
+`metrics-<model-id>/<metric path>/observations.jsonl`. To publish the same
+observations to an existing W&B run, pass its run URL as `wandb_link`; the SDK
+uses a matching active run in the current process when one already exists and
+never finishes a caller-owned run.
+
+```python
+from weaver import MetricsStoreConfig, ServiceClient
+
+with ServiceClient(
+    wandb_link="https://wandb.ai/<entity>/<project>/runs/<run-id>",
+    metrics_store=MetricsStoreConfig(),  # enabled at ./weaver/.logs by default
+) as client:
+    ...
+```
+
+When an outer training framework owns logging and persistence, explicitly disable
+the SDK's sinks (the same options apply to `AsyncServiceClient`):
+
+```python
+client = ServiceClient(
+    metrics_store=MetricsStoreConfig(enabled=False),
+    wandb_link=None,
+)
+```
+
+Disabling local storage skips Weaver JSONL writes and ignores `path`; it does not
+change metric collection, transport, returned observations, or W&B publishing.
+`wandb_link=None` independently disables SDK W&B publishing, even when a caller
+has an active W&B run. The SDK does not initialize, log to, or finish that run.
+W&B's own cache and the outer application's logs are outside this local-storage
+switch. No framework detection or automatic configuration override is performed.
+
+The existing `metrics_path=...` argument remains a compatibility shorthand for
+`metrics_store=MetricsStoreConfig(path=...)`. Do not supply a non-None
+`metrics_path` together with `metrics_store`; conflicting inputs raise `ValueError`.
+
+W&B support is optional (`pip install nex-weaver[wandb]`); version 0.19.8 is supported.
+The run URL identifies the destination, not the credentials. Configure a W&B API
+key via `WANDB_API_KEY` (or `WANDB_KEY`) or an existing W&B login. A self-hosted
+run URL selects that server. Use the client as a context
+manager, or close it explicitly, to flush an SDK-owned W&B run.
+
+**Local record fields:** `step` is the model's training-step counter in this
+trainer run, including skipped optimizer updates. Sampled metrics can have gaps
+(for example, steps 5, 10, 15). It is not a count of successful updates.
+`trainer_run_id` identifies the trainer lifetime so that step 5 before a restart
+is not confused with step 5 afterward. It is an opaque ID, **not a dataset epoch**.
+Use `(model_id, trainer_run_id, step)` to identify a training window and
+`operation_id` to distinguish its forward/backward and optimizer results.
+Forward-only results have `step: null`. The server wire names remain `attempt`
+and `epoch`; older local files also use those names. Existing files are not rewritten.
+
+**W&B presentation:** scalar charts use names such as `grad/norm/total` and the
+`step` axis. Booleans become 0/1 for plotting; local records retain booleans.
+Reasons and unavailable statuses appear in `metrics/status`, a table—not broken
+scalar/media panels. Descriptive labels and model/run IDs live in W&B run config,
+not chart titles. Additional models/restarts get short `model_2/` or `restart_2/`
+prefixes to prevent mixing independent counters.
+
+Per-layer diagnostics use ordinary scalar time-series, for example
+`grad/norm/per_layer/decoder/0`, rather than custom snapshot charts. Router expert
+counts use one native W&B histogram per layer: bin `[i, i+1)` identifies expert
+`i`, and its height is that expert's assignment count. This is not a histogram
+of count values, which would lose expert identity. W&B 0.19.8 allows at most 512
+bins; oversized, incomplete or ambiguous observations remain in a table instead
+of being dropped, merged or filled with invented zeros. No plotting library is
+required. Local JSONL retains all original scalar observations and labels.
+Use a fresh W&B run when changing chart layouts; existing runs/panels are not
+silently rewritten.
+
 ## Quickstart
 
 ```python
