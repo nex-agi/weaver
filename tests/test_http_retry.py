@@ -78,8 +78,8 @@ class TestPostMaxRetriesOverride:
         with pytest.raises(httpx.ReadTimeout):
             client.post("/api/v1/sessions", json={})
 
-        # Client was created with max_retries=3
-        assert client._client.request.call_count == 3
+        # An unprotected POST may already have been accepted.
+        assert client._client.request.call_count == 1
 
     def test_post_max_retries_success_on_second_attempt(self, client):
         """POST with default retries succeeds if second attempt works."""
@@ -96,7 +96,9 @@ class TestPostMaxRetriesOverride:
             ok_response,
         ]
 
-        result = client.post("/api/v1/sessions", json={})
+        result = client.post(
+            "/api/v1/sessions", json={}, headers={"Idempotency-Key": "key"}, replay_safe=True
+        )
 
         assert result == {"id": "op-1"}
         assert client._client.request.call_count == 2
@@ -159,8 +161,8 @@ class TestPostMaxRetriesOverride:
 class TestConnectionErrorRetry:
     """Connection-level errors are retried regardless of max_retries."""
 
-    def test_connection_error_retried_with_max_retries_1(self, client):
-        """OSError (Bad file descriptor) retries even with max_retries=1."""
+    def test_connect_timeout_retried_with_max_retries_1(self, client):
+        """A connect timeout precedes request submission."""
         ok_response = MagicMock()
         ok_response.is_success = True
         ok_response.status_code = 200
@@ -170,7 +172,7 @@ class TestConnectionErrorRetry:
         client._client = MagicMock()
         client._client.headers = {}
         client._client.request.side_effect = [
-            OSError(9, "Bad file descriptor"),
+            httpx.ConnectTimeout("connect timeout"),
             ok_response,
         ]
 
@@ -179,8 +181,8 @@ class TestConnectionErrorRetry:
         assert result == {"id": "op-1"}
         assert client._client.request.call_count == 2
 
-    def test_connection_reset_retried_with_max_retries_1(self, client):
-        """ConnectionResetError retries even with max_retries=1."""
+    def test_pool_timeout_retried_with_max_retries_1(self, client):
+        """A pool timeout precedes request submission."""
         ok_response = MagicMock()
         ok_response.is_success = True
         ok_response.status_code = 200
@@ -190,7 +192,7 @@ class TestConnectionErrorRetry:
         client._client = MagicMock()
         client._client.headers = {}
         client._client.request.side_effect = [
-            ConnectionResetError("Connection reset by peer"),
+            httpx.PoolTimeout("pool exhausted"),
             ok_response,
         ]
 
@@ -225,13 +227,13 @@ class TestConnectionErrorRetry:
 
         client._client = MagicMock()
         client._client.headers = {}
-        client._client.request.side_effect = OSError(9, "Bad file descriptor")
+        client._client.request.side_effect = httpx.ConnectError("refused")
 
         with pytest.raises(WeaverAPIError, match="transport_unavailable") as exc_info:
             client.post("/api/v1/models/m1/operations", json={}, max_retries=1)
 
         assert exc_info.value.retryable is True
-        assert isinstance(exc_info.value.__cause__, OSError)
+        assert isinstance(exc_info.value.__cause__, httpx.ConnectError)
         assert client._client.request.call_count == DEFAULT_CONNECTION_RETRIES
 
     def test_non_connection_error_not_retried_with_max_retries_1(self, client):
@@ -246,7 +248,7 @@ class TestConnectionErrorRetry:
         assert client._client.request.call_count == 1
 
     def test_remote_protocol_error_retried(self, client):
-        """httpx.RemoteProtocolError retries even with max_retries=1."""
+        """Ambiguous protocol failures replay only a protected request."""
         ok_response = MagicMock()
         ok_response.is_success = True
         ok_response.status_code = 200
@@ -260,7 +262,13 @@ class TestConnectionErrorRetry:
             ok_response,
         ]
 
-        result = client.post("/api/v1/models/m1/operations", json={}, max_retries=1)
+        result = client.post(
+            "/api/v1/models/m1/operations",
+            json={},
+            max_retries=3,
+            headers={"Idempotency-Key": "key"},
+            replay_safe=True,
+        )
 
         assert result == {"ok": True}
         assert client._client.request.call_count == 2
@@ -285,17 +293,17 @@ class TestIsConnectionError:
     """_is_connection_error correctly classifies exceptions."""
 
     def test_direct_oserror(self):
-        assert _is_connection_error(OSError(9, "Bad file descriptor"))
+        assert not _is_connection_error(OSError(9, "Bad file descriptor"))
 
     def test_direct_connect_error(self):
         assert _is_connection_error(httpx.ConnectError("refused"))
 
     def test_direct_remote_protocol_error(self):
-        assert _is_connection_error(httpx.RemoteProtocolError("reset"))
+        assert not _is_connection_error(httpx.RemoteProtocolError("reset"))
 
     def test_read_error_with_oserror_cause_is_connection_error(self):
         """Matches the actual traceback reported by NexRL."""
-        assert _is_connection_error(_make_read_error_with_cause())
+        assert not _is_connection_error(_make_read_error_with_cause())
 
     def test_read_error_with_nested_cause_chain(self):
         """Walk multi-level __cause__ chains (httpx -> httpcore -> OSError)."""
@@ -307,7 +315,7 @@ class TestIsConnectionError:
             outer = httpx.ReadError("read error")
             outer.__cause__ = mid
 
-        assert _is_connection_error(outer)
+        assert not _is_connection_error(outer)
 
     def test_read_error_without_cause_is_not_connection_error(self):
         """A ReadError with no OSError in its chain is NOT retryable."""
@@ -328,7 +336,7 @@ class TestIsConnectionError:
             except OSError:
                 raise httpx.ReadError("wrapped")  # sets __context__ implicitly
         except httpx.ReadError as e:
-            assert _is_connection_error(e)
+            assert not _is_connection_error(e)
 
     def test_cycle_in_cause_chain_terminates(self):
         """A pathological __cause__ cycle must not infinite-loop."""
@@ -343,7 +351,7 @@ class TestReadErrorWithCauseRetried:
     """httpx.ReadError wrapping an OSError (the NexRL bug) is retried."""
 
     def test_read_error_ebadf_retried_with_max_retries_1(self, client):
-        """Reproduces the exact NexRL traceback: ReadError[EBADF] must retry."""
+        """An OSError cause does not prove this POST was never accepted."""
         ok_response = MagicMock()
         ok_response.is_success = True
         ok_response.status_code = 200
@@ -357,10 +365,9 @@ class TestReadErrorWithCauseRetried:
             ok_response,
         ]
 
-        result = client.post("/api/v1/models/m1/operations", json={}, max_retries=1)
-
-        assert result == {"id": "op-1"}
-        assert client._client.request.call_count == 2
+        with pytest.raises(httpx.ReadError):
+            client.post("/api/v1/models/m1/operations", json={}, max_retries=1)
+        assert client._client.request.call_count == 1
 
     def test_bare_read_error_respects_max_retries_1(self, client):
         """A ReadError with no OSError in its chain should NOT be force-retried."""
@@ -524,3 +531,43 @@ class TestForkE2E:
             assert second == {"pid_ok": True}
         finally:
             client.close()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ReadError("headers lost"),
+        httpx.WriteError("partial write"),
+        httpx.RemoteProtocolError("EOF"),
+    ],
+)
+def test_unkeyed_post_ambiguous_transport_never_replayed(client, error):
+    client._client = MagicMock()
+    client._client.headers = {}
+    client._client.request.side_effect = error
+    with pytest.raises(type(error)):
+        client.post("/api/v1/sampling-sessions/session/samples", json={})
+    assert client._client.request.call_count == 1
+
+
+def test_protected_post_replays_identical_key_and_payload(client, monkeypatch):
+    monkeypatch.setattr("weaver._http.time.sleep", lambda _: None)
+    client._client = MagicMock()
+    client._client.headers = {"X-WEAVER-API-KEY": "test-auth"}
+    accepted = httpx.Response(202, json={"id": "same-operation"})
+    client._client.request.side_effect = [httpx.ReadError("lost accepted response"), accepted]
+    body = {"prompt": {"tokens": [1]}, "sampling_params": {"max_new_tokens": 2}}
+    result = client.post(
+        "/api/v1/sampling-sessions/session/samples",
+        json=body,
+        headers={"Idempotency-Key": "same-logical-call"},
+        replay_safe=True,
+        max_retries=3,
+    )
+    assert result["id"] == "same-operation"
+    sends = client._client.request.call_args_list
+    assert len(sends) == 2
+    for sent in sends:
+        assert sent.kwargs["headers"]["Idempotency-Key"] == "same-logical-call"
+        assert sent.kwargs["headers"]["X-WEAVER-API-KEY"] == "test-auth"
+        assert sent.kwargs["json"] == body

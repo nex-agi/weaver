@@ -395,3 +395,33 @@ def test_create_model_omits_performance_tier_when_absent():
     client.create_model(base_model="Qwen/Qwen3-8B", training_mode="full_ft")
 
     assert "performance_tier" not in _posted_payload(client)
+
+
+@pytest.mark.parametrize("capability", [True, False, None, "true"])
+def test_existing_sampling_session_reads_recovery_capability(capability):
+    client = ServiceClient()
+    client._http = MagicMock()
+    client._http.get.return_value = {"id": "existing-sampler", "sampling_idempotency": capability}
+    sampler = client.create_sampling_client(
+        sampling_session_id="existing-sampler", tokenizer_path="known-tokenizer"
+    )
+    assert sampler._sampling_idempotency is (capability is True)
+    client._http.get.assert_called_once_with("/api/v1/sampling-sessions/existing-sampler")
+
+
+@pytest.mark.parametrize("capability", [True, False, None, "true"])
+def test_async_existing_sampling_session_reads_recovery_capability(capability):
+    async def run():
+        client = AsyncServiceClient()
+        client._http = MagicMock()
+        client._http.get = AsyncMock(
+            return_value={"id": "existing-sampler", "sampling_idempotency": capability}
+        )
+        client._ensure_connected = AsyncMock()
+        sampler = await client.create_sampling_client(
+            sampling_session_id="existing-sampler", tokenizer_path="known-tokenizer"
+        )
+        assert sampler._sampling_idempotency is (capability is True)
+        client._http.get.assert_awaited_once_with("/api/v1/sampling-sessions/existing-sampler")
+
+    asyncio.run(run())

@@ -330,3 +330,20 @@ to continuously evolve without a local GPU.
 ## Deep Dive
 
 For more technical details, see [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver).
+
+### Recovering sampling transport failures
+
+The sampling client assigns one `Idempotency-Key` per logical sample or
+logprobs request. When the sampling-session response advertises
+`sampling_idempotency: true`, a lost response can be recovered by retrying the
+same key and body; the server returns the original operation. Without that
+capability, a read/write/protocol error on POST is propagated after one send.
+Only connection establishment and pool-acquisition failures are safe to retry
+without server support. Operation polling retries transport failures against
+the same operation ID within its configured error budget.
+
+For callers that need to retain the accepted operation explicitly, submit
+`sample(wait=False)` and pass the returned handle to `wait_for_sample(handle)`.
+This preserves result normalization while preventing a polling failure from
+starting another generation. Multipart training requests retain their separate
+transport contract and reject sampling idempotency options.

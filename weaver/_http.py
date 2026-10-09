@@ -51,9 +51,9 @@ TENSOR_PACK_CHUNK_BYTES = 8 * 1024 * 1024
 INITIAL_RETRY_DELAY = 0.5
 MAX_RETRY_DELAY = 10.0
 
-# Transport-layer errors that indicate the request never reached the server.
-# Safe to retry regardless of idempotency because no server-side state was created.
-CONNECTION_ERRORS = (OSError, httpx.ConnectError, httpx.RemoteProtocolError)
+# These failures happen before an HTTP request can be sent. Read, write, and
+# protocol failures can occur after acceptance, even with an OSError cause.
+CONNECTION_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
 # Artifact file downloads stream multi-GB safetensors shards; chunks are
 # written to disk as they arrive so memory stays flat.
@@ -65,27 +65,8 @@ logger = logging.getLogger(__name__)
 
 
 def _is_connection_error(exc: BaseException) -> bool:
-    """Return True if *exc* represents a transport-level failure.
-
-    Either the exception itself is in :data:`CONNECTION_ERRORS`, or its
-    ``__cause__``/``__context__`` chain contains an :class:`OSError`. httpx
-    wraps low-level OS errors into :class:`httpx.ReadError` / ``WriteError``
-    via ``raise mapped_exc(...) from original_oserror``, so walking the chain
-    recovers that signal. Treating those as connection errors is safe: an
-    OSError on the client socket (e.g. ``EBADF`` after fork, ``EPIPE`` on a
-    dead keep-alive) means the request bytes never left the process, so
-    retrying cannot duplicate non-idempotent server-side effects.
-    """
-    if isinstance(exc, CONNECTION_ERRORS):
-        return True
-    seen: set[int] = set()
-    cur: BaseException | None = exc.__cause__ or exc.__context__
-    while cur is not None and id(cur) not in seen:
-        if isinstance(cur, OSError):
-            return True
-        seen.add(id(cur))
-        cur = cur.__cause__ or cur.__context__
-    return False
+    """Return whether failure is known to precede HTTP request submission."""
+    return isinstance(exc, CONNECTION_ERRORS)
 
 
 class WeaverAPIError(RuntimeError):
@@ -469,8 +450,18 @@ class APIClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
         max_retries: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        replay_safe: bool = False,
     ) -> Any:
-        return self._request("POST", path, params=params, json=json, max_retries=max_retries)
+        return self._request(
+            "POST",
+            path,
+            params=params,
+            json=json,
+            max_retries=max_retries,
+            headers=headers,
+            replay_safe=replay_safe,
+        )
 
     def post_tensor_multipart(
         self,
@@ -596,6 +587,8 @@ class APIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        replay_safe: bool = False,
     ) -> Any:
         # Extract model_id from path if present (e.g., /api/v1/models/{model_id}/...)
         model_id = self._extract_model_id_from_path(path)
@@ -632,7 +625,14 @@ class APIClient:
 
             # Execute the request with retries
             return self._request_with_retries(
-                span, method, path, params=params, json=json, max_retries=max_retries
+                span,
+                method,
+                path,
+                params=params,
+                json=json,
+                max_retries=max_retries,
+                headers=headers,
+                replay_safe=replay_safe,
             )
 
     def _extract_model_id_from_path(self, path: str) -> str | None:
@@ -647,10 +647,12 @@ class APIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        replay_safe: bool = False,
     ) -> Any:
         """Execute HTTP request with retry logic and trace context injection.
 
-        Connection-level errors (stale sockets, refused connections) are retried
+        Connect and pool-acquisition failures known to precede sending are retried
         up to ``DEFAULT_CONNECTION_RETRIES`` times regardless of *max_retries*
         because the request never reached the server and is therefore safe to
         retry even for non-idempotent methods.
@@ -668,6 +670,9 @@ class APIClient:
         last_exception: Exception | None = None
         request_attempt = 0
         connection_error_count = 0
+        request_headers = dict(headers or {})
+        idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
+        can_replay = idempotent_method or replay_safe
 
         while request_attempt < effective_max_retries:
             try:
@@ -677,6 +682,7 @@ class APIClient:
 
                 # Inject trace context into HTTP headers
                 headers = dict(self._client.headers or {})
+                headers.update(request_headers)
                 inject(headers)  # Adds 'traceparent' header with trace context
 
                 # Make the HTTP request
@@ -701,12 +707,19 @@ class APIClient:
 
             except WeaverAPIError as e:
                 # Retry server-declared retryable errors for idempotent methods
-                # and for 503 responses. A retryable 503 means the server did
-                # not accept the request, so operation POSTs are safe to repeat.
+                # or when the server confirms rejection before admission.
+                # A generic 503 does not prove that a POST was never accepted.
                 last_exception = e
                 span.record_exception(e)
                 request_attempt += 1
-                retryable_503 = e.status_code == httpx.codes.SERVICE_UNAVAILABLE
+                rejected_before_admission = e.code in {
+                    "server_draining",
+                    "operation_engine_unavailable",
+                    "rate_limited",
+                }
+                retryable_503 = (
+                    e.status_code == httpx.codes.SERVICE_UNAVAILABLE and rejected_before_admission
+                )
                 if retryable_503 and max_retries is None:
                     effective_max_retries = max(effective_max_retries, self._max_retries)
                 is_last_attempt = request_attempt >= effective_max_retries
@@ -714,7 +727,7 @@ class APIClient:
 
                 if (
                     (not e.retryable)
-                    or (not idempotent_method and not retryable_503)
+                    or (not can_replay and not rejected_before_admission)
                     or is_last_attempt
                 ):
                     span.set_status(Status(StatusCode.ERROR, "API error"))
@@ -781,6 +794,10 @@ class APIClient:
                     logger.debug("Retrying in %.1fs...", delay)
                     time.sleep(delay)
                     continue
+
+                if not can_replay or not isinstance(e, httpx.TransportError):
+                    span.set_status(Status(StatusCode.ERROR, "Request outcome is unknown"))
+                    raise
 
                 request_attempt += 1
                 is_last_attempt = request_attempt >= effective_max_retries

@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Mapping, Optional
 
+import httpx
+
 from ._http import APIClient, WeaverAPIError, backoff_delays
 from ._utils import extract_id, lookup_case_insensitive
 from .tensor_transport import (
@@ -74,7 +76,13 @@ def _operation_poll_transient_retries() -> int:
     return _nonnegative_int_env("WEAVER_OPERATION_POLL_TRANSIENT_RETRIES", 20)
 
 
-def _is_transient_operation_poll_error(exc: WeaverAPIError) -> bool:
+def _is_transient_operation_poll_error(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.NetworkError, httpx.TimeoutException, httpx.RemoteProtocolError)):
+        # Refresh is a GET for an already admitted operation. Repeating it
+        # preserves the operation identity and cannot submit another sample.
+        return True
+    if not isinstance(exc, WeaverAPIError):
+        return False
     if exc.retryable:
         return True
     if exc.status_code >= 500:
@@ -246,7 +254,7 @@ class OperationHandle(_OperationHandleMixin):
             time.sleep(delay)
             try:
                 self.refresh()
-            except WeaverAPIError as exc:
+            except (WeaverAPIError, httpx.TransportError) as exc:
                 if (
                     transient_error_count < max_transient_errors
                     and _is_transient_operation_poll_error(exc)
@@ -369,7 +377,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
             await asyncio.sleep(delay)
             try:
                 await self.refresh()
-            except WeaverAPIError as exc:
+            except (WeaverAPIError, httpx.TransportError) as exc:
                 if (
                     transient_error_count < max_transient_errors
                     and _is_transient_operation_poll_error(exc)

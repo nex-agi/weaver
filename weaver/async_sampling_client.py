@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, overload
+from uuid import uuid4
 
 from transformers import PreTrainedTokenizer
 
@@ -37,6 +38,7 @@ class AsyncSamplingClient:
         *,
         service: AsyncServiceClient,
         sampling_session_id: str,
+        sampling_idempotency: bool = False,
         base_model: str | None = None,
         model_path: str | None = None,
         model_id: str | None = None,
@@ -44,6 +46,7 @@ class AsyncSamplingClient:
     ) -> None:
         self._service = service
         self.sampling_session_id = sampling_session_id
+        self._sampling_idempotency = sampling_idempotency
         self.base_model = base_model
         self.model_path = model_path
         self.model_id = model_id
@@ -66,6 +69,7 @@ class AsyncSamplingClient:
         sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
+        idempotency_key: str | None = None,
         wait: "Literal[True]" = True,
     ) -> Dict[str, Any]: ...
 
@@ -82,6 +86,7 @@ class AsyncSamplingClient:
         sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
+        idempotency_key: str | None = None,
         wait: "Literal[False]",
     ) -> AsyncOperationHandle: ...
 
@@ -97,6 +102,7 @@ class AsyncSamplingClient:
         sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
+        idempotency_key: str | None = None,
         wait: bool = True,
     ) -> AsyncOperationHandle | Dict[str, Any]:
         body = _su.build_sample_body(
@@ -116,6 +122,8 @@ class AsyncSamplingClient:
         handle = await self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
             body,
+            idempotency_key=idempotency_key if idempotency_key is not None else str(uuid4()),
+            replay_safe=self._sampling_idempotency,
         )
         if sc_head_size:
             from .score_centering import validate_sampler_result
@@ -139,6 +147,12 @@ class AsyncSamplingClient:
             validate_mask_result(raw_result)
         return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)  # type: ignore[return-value]
 
+    async def wait_for_sample(self, handle: AsyncOperationHandle) -> Dict[str, Any]:
+        """Wait on an accepted sample without submitting another generation."""
+        raw_result = await handle.result()
+        await self._ensure_tokenizer_source()
+        return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)
+
     async def compute_logprobs(
         self,
         *,
@@ -154,6 +168,8 @@ class AsyncSamplingClient:
         handle = await self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/logprobs",
             body,
+            idempotency_key=str(uuid4()),
+            replay_safe=self._sampling_idempotency,
         )
         payload = await handle.result()
         logprobs = _su.normalize_prompt_logprobs(prompt, payload)
