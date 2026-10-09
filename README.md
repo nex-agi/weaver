@@ -330,3 +330,28 @@ to continuously evolve without a local GPU.
 ## Deep Dive
 
 For more technical details, see [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver).
+
+## Feedback while an operation is pending
+
+`OperationHandle.wait()` and `AsyncOperationHandle.wait()` emit a warning after
+30 seconds of queueing, including the operation ID, wait duration, and the server's
+wait explanation. Confirmed scheduling/resource waits are reported immediately.
+An unchanged explanation repeats at most once per minute; a changed explanation
+is reported on the next successful poll. Short queues stay quiet.
+
+A server with pending diagnostics can distinguish trainer provisioning, scheduling,
+startup, and model residency waits. When available, the log also includes the
+requested node/GPU counts and trainer memory per node (excluding provider sidecars).
+The latest structured feedback is available without another HTTP call:
+
+```python
+handle.refresh()  # use `await handle.refresh()` for an async handle
+print(handle.pending_info)
+# {"code": "waiting_for_scheduling", "wait_seconds": 4200, ...}
+result = handle.result()  # use `await handle.result()` for an async handle
+```
+
+Older servers remain supported: the SDK reports a generic queue wait using locally
+elapsed time, and `pending_info` is `None`. Feedback does not fail, retry, or cancel
+the operation, and it does not estimate queue position or start time. Applications
+can suppress these warnings through the `weaver.operations` logger's level.
