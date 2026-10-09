@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List
+from uuid import uuid4
 
 from transformers import PreTrainedTokenizer
 
@@ -34,6 +35,7 @@ class SamplingClient:
         *,
         service: ServiceClient,
         sampling_session_id: str,
+        sampling_idempotency: bool = False,
         base_model: str | None = None,
         model_path: str | None = None,
         model_id: str | None = None,
@@ -41,6 +43,7 @@ class SamplingClient:
     ) -> None:
         self._service = service
         self.sampling_session_id = sampling_session_id
+        self._sampling_idempotency = sampling_idempotency
         self.base_model = base_model
         self.model_path = model_path
         self.model_id = model_id
@@ -62,6 +65,7 @@ class SamplingClient:
         sampling_mask_transport: str = "inline",
         return_old_logprob: bool = False,
         return_moe_topk_indices: bool = False,
+        idempotency_key: str | None = None,
         wait: bool = True,
     ) -> OperationHandle | Dict[str, Any]:
         body = _su.build_sample_body(
@@ -81,6 +85,8 @@ class SamplingClient:
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/samples",
             body,
+            idempotency_key=idempotency_key if idempotency_key is not None else str(uuid4()),
+            replay_safe=self._sampling_idempotency,
         )
         if sc_head_size:
             from .score_centering import validate_sampler_result
@@ -100,6 +106,10 @@ class SamplingClient:
         if sampling_mask_transport == "ref":
             validate_mask_result(raw_result)
         return _su.normalize_sample_result(raw_result, self._ensure_tokenizer)  # type: ignore[return-value]
+
+    def wait_for_sample(self, handle: OperationHandle) -> Dict[str, Any]:
+        """Wait on an accepted sample without submitting another generation."""
+        return _su.normalize_sample_result(handle.result(), self._ensure_tokenizer)
 
     def compute_logprobs(
         self,
@@ -131,6 +141,8 @@ class SamplingClient:
         handle = self._service.enqueue_operation(
             f"/api/v1/sampling-sessions/{self.sampling_session_id}/logprobs",
             body,
+            idempotency_key=str(uuid4()),
+            replay_safe=self._sampling_idempotency,
         )
         payload = handle.result()
         logprobs = _su.normalize_prompt_logprobs(prompt, payload)

@@ -234,8 +234,18 @@ class AsyncAPIClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
         max_retries: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        replay_safe: bool = False,
     ) -> Any:
-        return await self._request("POST", path, params=params, json=json, max_retries=max_retries)
+        return await self._request(
+            "POST",
+            path,
+            params=params,
+            json=json,
+            max_retries=max_retries,
+            headers=headers,
+            replay_safe=replay_safe,
+        )
 
     async def post_tensor_multipart(
         self,
@@ -362,6 +372,8 @@ class AsyncAPIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        replay_safe: bool = False,
     ) -> Any:
         model_id = extract_model_id_from_path(path)
 
@@ -376,7 +388,14 @@ class AsyncAPIClient:
         ) as span:
             apply_request_span_attributes(span, method, path, model_id)
             return await self._request_with_retries(
-                span, method, path, params=params, json=json, max_retries=max_retries
+                span,
+                method,
+                path,
+                params=params,
+                json=json,
+                max_retries=max_retries,
+                headers=headers,
+                replay_safe=replay_safe,
             )
 
     async def _request_with_retries(
@@ -388,24 +407,32 @@ class AsyncAPIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        headers: Mapping[str, str] | None = None,
+        replay_safe: bool = False,
     ) -> Any:
         """Async mirror of :meth:`APIClient._request_with_retries`.
 
-        Connection-level errors are retried up to ``DEFAULT_CONNECTION_RETRIES``
+        Pre-send connect and pool-acquisition failures are retried up to
+        ``DEFAULT_CONNECTION_RETRIES``
         regardless of *max_retries* (the request never reached the server, so it
         is safe even for non-idempotent methods). Server-declared retryable
-        errors are retried for idempotent methods and 503 responses.
+        errors are retried for safe methods, confirmed pre-admission rejections,
+        or requests protected by server idempotency.
         """
         effective_max_retries = max_retries if max_retries is not None else self._max_retries
         last_exception: Exception | None = None
         request_attempt = 0
         connection_error_count = 0
+        request_headers = dict(headers or {})
+        idempotent_method = method.upper() in {"GET", "HEAD", "OPTIONS"}
+        can_replay = idempotent_method or replay_safe
 
         while request_attempt < effective_max_retries:
             try:
                 self._ensure_fresh_client()
 
                 headers = dict(self._client.headers or {})
+                headers.update(request_headers)
                 inject(headers)  # Adds 'traceparent' header with trace context
 
                 response = await self._client.request(
@@ -429,7 +456,14 @@ class AsyncAPIClient:
                 last_exception = e
                 span.record_exception(e)
                 request_attempt += 1
-                retryable_503 = e.status_code == httpx.codes.SERVICE_UNAVAILABLE
+                rejected_before_admission = e.code in {
+                    "server_draining",
+                    "operation_engine_unavailable",
+                    "rate_limited",
+                }
+                retryable_503 = (
+                    e.status_code == httpx.codes.SERVICE_UNAVAILABLE and rejected_before_admission
+                )
                 if retryable_503 and max_retries is None:
                     effective_max_retries = max(effective_max_retries, self._max_retries)
                 is_last_attempt = request_attempt >= effective_max_retries
@@ -437,7 +471,7 @@ class AsyncAPIClient:
 
                 if (
                     (not e.retryable)
-                    or (not idempotent_method and not retryable_503)
+                    or (not can_replay and not rejected_before_admission)
                     or is_last_attempt
                 ):
                     span.set_status(Status(StatusCode.ERROR, "API error"))
@@ -486,12 +520,22 @@ class AsyncAPIClient:
                             path,
                             str(e),
                         )
-                        raise
+                        transport_error = WeaverAPIError(
+                            503,
+                            "transport_unavailable",
+                            f"{method} {path} failed after {connection_error_count} connection attempts",
+                            True,
+                        )
+                        raise transport_error from e
 
                     delay = compute_retry_delay(connection_error_count)
                     logger.debug("Retrying in %.1fs...", delay)
                     await asyncio.sleep(delay)
                     continue
+
+                if not can_replay or not isinstance(e, httpx.TransportError):
+                    span.set_status(Status(StatusCode.ERROR, "Request outcome is unknown"))
+                    raise
 
                 request_attempt += 1
                 is_last_attempt = request_attempt >= effective_max_retries

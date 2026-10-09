@@ -69,3 +69,36 @@ def test_operation_error_surfaces_structured_reason() -> None:
     assert error.message == payload["error_message"]
     assert error.details == payload["error_details"]
     assert str(error) == f"Operation failed: context_length_exceeded: {payload['error_message']}"
+
+
+@pytest.mark.parametrize("kind", ["read", "connect", "protocol"])
+def test_poll_transport_recovery_keeps_original_operation_id(monkeypatch, kind):
+    import httpx
+
+    from weaver import operations
+
+    errors = {
+        "read": httpx.ReadError("status disconnected"),
+        "connect": httpx.ConnectTimeout("connect timed out"),
+        "protocol": httpx.RemoteProtocolError("EOF"),
+    }
+
+    class PollClient:
+        def __init__(self):
+            self.paths = []
+
+        def get(self, path):
+            self.paths.append(path)
+            if len(self.paths) == 1:
+                raise errors[kind]
+            return {"id": "original-operation", "status": "done", "response": {"result": 1}}
+
+    client = PollClient()
+    monkeypatch.setattr(operations.time, "sleep", lambda _: None)
+    handle = OperationHandle(
+        client=client,
+        operation_id="original-operation",
+        _cached={"id": "original-operation", "status": "pending"},
+    )
+    handle.result()
+    assert client.paths == ["/api/v1/operations/original-operation"] * 2

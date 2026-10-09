@@ -89,7 +89,7 @@ class TestAsyncRetry:
             client._client = MagicMock()
             client._client.headers = {}
             client._client.request = AsyncMock(
-                side_effect=[OSError(9, "Bad file descriptor"), _ok_response({"id": "op-1"})]
+                side_effect=[httpx.ConnectTimeout("connect timeout"), _ok_response({"id": "op-1"})]
             )
             result = await client.post("/api/v1/models/m1/operations", json={}, max_retries=1)
             assert result == {"id": "op-1"}

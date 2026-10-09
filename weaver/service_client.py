@@ -508,6 +508,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
     ) -> "SamplingClient":
         from .sampling_client import SamplingClient  # local import to avoid cycles
 
+        sampling_idempotency = False
         if sampling_session_id is None:
             if model_id and not model_path:
                 raise ValueError("model_path is required when model_id is provided")
@@ -564,6 +565,7 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                 # Standard 201 response: body is the SamplingSession directly
                 session = resp
 
+            sampling_idempotency = lookup_case_insensitive(session, "sampling_idempotency") is True
             sampling_session_id = extract_id(session)
             # Extract tokenizer_path from response if provided by server
             if tokenizer_path is None:
@@ -577,8 +579,12 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
                     resource = config.get("resource", {})
                     tokenizer_config = resource.get("tokenizer", {})
                     tokenizer_path = tokenizer_config.get("path")
+        else:
+            session = self.http.get(f"/api/v1/sampling-sessions/{sampling_session_id}")
+            sampling_idempotency = lookup_case_insensitive(session, "sampling_idempotency") is True
         return SamplingClient(
             service=self,
+            sampling_idempotency=sampling_idempotency,
             sampling_session_id=sampling_session_id,
             base_model=base_model,
             model_path=model_path,
@@ -624,9 +630,31 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         payload: Dict[str, Any],
         *,
         tensor_pack: TensorPack | None = None,
+        idempotency_key: str | None = None,
+        replay_safe: bool = False,
     ) -> OperationHandle:
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str)
+            or not idempotency_key.strip()
+            or len(idempotency_key.encode("utf-8")) > 255
+            or any(ord(char) < 32 or ord(char) > 126 for char in idempotency_key)
+        ):
+            raise ValueError(
+                "Idempotency key must be a nonempty ASCII header value of at most 255 bytes"
+            )
+        if tensor_pack is not None and (idempotency_key is not None or replay_safe):
+            raise ValueError("Idempotent recovery is supported only for JSON operations")
         if tensor_pack is None:
-            response = self.http.post(path, json=payload, max_retries=1)
+            if idempotency_key is None:
+                response = self.http.post(path, json=payload, max_retries=1)
+            else:
+                response = self.http.post(
+                    path,
+                    json=payload,
+                    max_retries=3 if replay_safe else 1,
+                    headers={"Idempotency-Key": idempotency_key},
+                    replay_safe=replay_safe,
+                )
         else:
             response = self.http.post_tensor_multipart(
                 path,

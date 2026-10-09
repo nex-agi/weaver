@@ -112,7 +112,13 @@ def server(monkeypatch):
     monkeypatch.setenv("NO_PROXY", loopback_no_proxy)
     monkeypatch.setenv("no_proxy", loopback_no_proxy)
     _Handler.reset()
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+
+    class BurstHTTPServer(ThreadingHTTPServer):
+        # Support the fixture's 200 simultaneous TCP opens. The stdlib default
+        # backlog is too small and turns this liveness test into lost POSTs.
+        request_queue_size = 512
+
+    httpd = BurstHTTPServer(("127.0.0.1", 0), _Handler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     host, port = httpd.server_address
@@ -148,6 +154,7 @@ def test_high_concurrency_no_deadlock(server):
     results = asyncio.run(run())
     assert len(results) == 200
     assert all(r["op"].startswith("op-") for r in results)
+    assert _Handler.op_counter == 200
     assert len({r["op"] for r in results}) == 200  # no cross-talk between ops
 
 
