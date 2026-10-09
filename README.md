@@ -333,23 +333,31 @@ For more technical details, see [Deep Dive into Weaver](https://dawning-road.git
 
 ## Feedback while an operation is pending
 
-`OperationHandle.wait()` and `AsyncOperationHandle.wait()` emit a warning after
-30 seconds of queueing, including the operation ID, wait duration, and the server's
-wait explanation. Confirmed scheduling/resource waits are reported immediately.
-An unchanged explanation repeats at most once per minute; a changed explanation
-is reported on the next successful poll. Short queues stay quiet.
-
-A server with pending diagnostics can distinguish trainer provisioning, scheduling,
-startup, and model residency waits. When available, the log also includes the
-requested node/GPU counts and trainer memory per node (excluding provider sidecars).
-The latest structured feedback is available without another HTTP call:
+The SDK automatically logs pending feedback inside its existing operation polling
+loop. Ordinary training calls with the default `wait=True` use this behavior;
+no explicit `refresh()`, `pending_info` access, `print()`, or callback is required:
 
 ```python
-handle.refresh()  # use `await handle.refresh()` for an async handle
-print(handle.pending_info)
-# {"code": "waiting_for_scheduling", "wait_seconds": 4200, ...}
-result = handle.result()  # use `await handle.result()` for an async handle
+result = training_client.forward_backward(data, "cross_entropy")
+# The SDK polls internally and automatically logs prolonged waits.
+
+# The asyncio client does the same:
+result = await async_training_client.forward_backward(data, "cross_entropy")
 ```
+
+Internally, both synchronous and asynchronous operation handles emit a warning
+after 30 seconds of queueing, including the operation ID, wait duration, and the
+server's wait explanation. Confirmed scheduling/resource waits are reported
+immediately. An unchanged explanation repeats at most once per minute; a changed
+explanation is reported on the next successful poll. Short queues stay quiet.
+Calls using `wait=False` receive this feedback when the handle is subsequently
+awaited or its result is requested, which starts polling.
+
+A server with pending diagnostics can distinguish trainer provisioning,
+scheduling, startup, and model residency waits. When available, the log also
+includes the requested node/GPU counts and trainer memory per node (excluding
+provider sidecars). For programmatic inspection, the latest optional structured
+snapshot is also available as `handle.pending_info`; it is not needed for logging.
 
 Older servers remain supported: the SDK reports a generic queue wait using locally
 elapsed time, and `pending_info` is `None`. Feedback does not fail, retry, or cancel
