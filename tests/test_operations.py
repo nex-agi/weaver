@@ -14,9 +14,11 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
-from weaver.operations import OperationHandle, WeaverOperationError
+from weaver.operations import AsyncOperationHandle, OperationHandle, WeaverOperationError
 
 
 class _NoPollClient:
@@ -68,4 +70,81 @@ def test_operation_error_surfaces_structured_reason() -> None:
     assert error.code == "context_length_exceeded"
     assert error.message == payload["error_message"]
     assert error.details == payload["error_details"]
-    assert str(error) == f"Operation failed: context_length_exceeded: {payload['error_message']}"
+    assert str(error) == (
+        f"Operation failed: context_length_exceeded: {payload['error_message']} (operation_id=op-1)"
+    )
+
+
+def test_operation_error_displays_diagnostic_and_correlation_context() -> None:
+    error = WeaverOperationError(
+        {
+            "id": "op-checkpoint",
+            "error": "operation_failed",
+            "error_code": "export_checkpoint_source_missing",
+            "error_message": "checkpoint files are no longer available to the converter",
+            "retryable": False,
+            "error_details": {
+                "diagnostic_message": "ExportError: source_path does not exist: /gpfs/checkpoint",
+                "stage": "export_checkpoint",
+            },
+        }
+    )
+    assert error.operation_id == "op-checkpoint"
+    assert error.retryable is False
+    assert "source_path does not exist: /gpfs/checkpoint" in str(error)
+    assert "operation_id=op-checkpoint" in str(error)
+    assert "stage=export_checkpoint" in str(error)
+
+
+def test_operation_error_avoids_repeating_diagnostic() -> None:
+    diagnostic = "cancelled: trainer stopped; no trainer will claim this operation"
+    error = WeaverOperationError(
+        {
+            "id": "op-stopped",
+            "error": "operation_failed",
+            "error_message": "The forward/backward operation failed: " + diagnostic,
+            "error_details": {"diagnostic_message": diagnostic},
+        }
+    )
+    assert str(error).count(diagnostic) == 1
+
+
+def test_operation_error_falls_back_when_old_server_has_no_details() -> None:
+    handle = OperationHandle(
+        client=_NoPollClient(),
+        operation_id="op-legacy",
+        _cached={"status": "error", "error": "operation_failed"},
+    )
+    with pytest.raises(WeaverOperationError) as caught:
+        handle.result()
+    assert "did not return a detailed failure reason" in str(caught.value)
+    assert "operation_id=op-legacy" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "details", [None, [], "invalid", {"diagnostic_message": [1, 2]}, {"diagnostic_message": "  \n"}]
+)
+def test_operation_error_handles_missing_or_malformed_details(details) -> None:
+    error = WeaverOperationError({"error": "operation_failed", "error_details": details})
+    assert "did not return a detailed failure reason" in str(error)
+
+
+def test_async_operation_error_includes_handle_id_and_diagnostic() -> None:
+    async def fail():
+        handle = AsyncOperationHandle(
+            client=None,
+            operation_id="op-async",
+            _cached={
+                "status": "error",
+                "error": "operation_failed",
+                "error_details": {
+                    "diagnostic_message": "CUDA out of memory: requested 12 GiB, available 4 GiB",
+                },
+            },
+        )
+        await handle.result()
+
+    with pytest.raises(WeaverOperationError) as caught:
+        asyncio.run(fail())
+    assert "requested 12 GiB, available 4 GiB" in str(caught.value)
+    assert "operation_id=op-async" in str(caught.value)

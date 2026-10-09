@@ -327,6 +327,26 @@ backend. By setting `rl.backend=weaver`, MetaClaw turns every live conversation 
 learning signal and uses Weaver for cloud-based LoRA training, enabling personal agents
 to continuously evolve without a local GPU.
 
+## Operation failure diagnostics
+
+Operation failures automatically raise `weaver.operations.WeaverOperationError`
+from ordinary training calls, handle results, and awaited async operations. The
+exception text includes the server's readable reason, any bounded internal
+diagnostic summary, and the operation ID (plus execution stage when available).
+No explicit logging or diagnostic lookup is required. For example:
+
+```text
+Operation failed: operation_failed: The forward/backward training operation failed:
+CUDA out of memory: requested 12 GiB, available 4 GiB (operation_id=...)
+```
+
+The exception exposes `operation_id`, `code`, `message`, `diagnostic_message`,
+`details`, `retryable`, and the original `payload` for programmatic handling. An
+older server that returns only `operation_failed` produces an explicit
+"no detailed failure reason" message with the handle's operation ID. The SDK
+does not automatically retry failed operations; a partial execution may have
+already changed model state.
+
 ## Deep Dive
 
 For more technical details, see [Deep Dive into Weaver](https://dawning-road.github.io/blog/deep-dive-weaver).

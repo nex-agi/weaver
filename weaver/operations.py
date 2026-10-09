@@ -106,18 +106,43 @@ def _operation_poll_delays() -> Iterator[float]:
 
 
 class WeaverOperationError(RuntimeError):
-    def __init__(self, payload: Dict[str, Any]):
+    def __init__(self, payload: Dict[str, Any], *, operation_id: Optional[str] = None):
         self.code = str(
             lookup_case_insensitive(payload, "error_code")
             or lookup_case_insensitive(payload, "error")
             or "operation_failed"
         )
-        reason = lookup_case_insensitive(payload, "error_message")
-        self.message = str(reason) if reason else None
         self.details = lookup_case_insensitive(payload, "error_details")
-        rendered = f"Operation failed: {self.code}"
-        if self.message:
-            rendered += f": {self.message}"
+        details = self.details if isinstance(self.details, Mapping) else {}
+        identity = (
+            operation_id
+            or lookup_case_insensitive(payload, "id")
+            or lookup_case_insensitive(details, "operation_id")
+        )
+        self.operation_id = str(identity) if identity is not None else None
+        retryable = lookup_case_insensitive(payload, "retryable")
+        self.retryable = retryable if isinstance(retryable, bool) else None
+        diagnostic = lookup_case_insensitive(details, "diagnostic_message")
+        self.diagnostic_message = (
+            diagnostic.strip() if isinstance(diagnostic, str) and diagnostic.strip() else None
+        )
+        reason = lookup_case_insensitive(payload, "error_message")
+        self.message = (
+            reason.strip()
+            if isinstance(reason, str) and reason.strip()
+            else (self.diagnostic_message or "The server did not return a detailed failure reason.")
+        )
+        rendered = f"Operation failed: {self.code}: {self.message}"
+        if self.diagnostic_message and self.diagnostic_message not in self.message:
+            rendered += f"; diagnostic: {self.diagnostic_message}"
+        context = []
+        if self.operation_id:
+            context.append(f"operation_id={self.operation_id}")
+        stage = lookup_case_insensitive(details, "stage")
+        if isinstance(stage, str) and stage:
+            context.append(f"stage={stage}")
+        if context:
+            rendered += " (" + ", ".join(context) + ")"
         super().__init__(rendered)
         self.payload = payload
 
@@ -181,7 +206,7 @@ class _OperationHandleMixin:
 
     def _raise_if_failed(self) -> None:
         if self.status == "error":
-            raise WeaverOperationError(self._cached)
+            raise WeaverOperationError(self._cached, operation_id=self.operation_id)
 
 
 @dataclass
