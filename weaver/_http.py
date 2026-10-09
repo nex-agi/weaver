@@ -22,7 +22,8 @@ import os
 import re
 import tempfile
 import time
-from typing import Any, BinaryIO, Mapping, MutableMapping
+from collections.abc import Mapping, MutableMapping
+from typing import Any, BinaryIO
 
 import httpx
 from opentelemetry import baggage, context, trace
@@ -446,7 +447,7 @@ class APIClient:
         self._client = self._build_client()
         self._pid = current_pid
 
-    def __enter__(self) -> "APIClient":
+    def __enter__(self) -> APIClient:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -469,8 +470,11 @@ class APIClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
         max_retries: int | None = None,
+        deadline: float | None = None,
     ) -> Any:
-        return self._request("POST", path, params=params, json=json, max_retries=max_retries)
+        return self._request(
+            "POST", path, params=params, json=json, max_retries=max_retries, deadline=deadline
+        )
 
     def post_tensor_multipart(
         self,
@@ -596,6 +600,7 @@ class APIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        deadline: float | None = None,
     ) -> Any:
         # Extract model_id from path if present (e.g., /api/v1/models/{model_id}/...)
         model_id = self._extract_model_id_from_path(path)
@@ -632,7 +637,13 @@ class APIClient:
 
             # Execute the request with retries
             return self._request_with_retries(
-                span, method, path, params=params, json=json, max_retries=max_retries
+                span,
+                method,
+                path,
+                params=params,
+                json=json,
+                max_retries=max_retries,
+                deadline=deadline,
             )
 
     def _extract_model_id_from_path(self, path: str) -> str | None:
@@ -647,6 +658,7 @@ class APIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Execute HTTP request with retry logic and trace context injection.
 
@@ -680,9 +692,17 @@ class APIClient:
                 inject(headers)  # Adds 'traceparent' header with trace context
 
                 # Make the HTTP request
+                request_options: dict[str, Any] = {}
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("HTTP request deadline exceeded")
+                    request_options["timeout"] = remaining
                 response = self._client.request(
-                    method, path, params=params, json=json, headers=headers
+                    method, path, params=params, json=json, headers=headers, **request_options
                 )
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("HTTP request deadline exceeded")
 
                 # Record response status
                 span.set_attribute("http.status_code", response.status_code)
@@ -737,6 +757,11 @@ class APIClient:
                 last_exception = e
                 span.record_exception(e)
 
+                if deadline is not None:
+                    # The caller owns deadline/readiness retry policy. Do not add
+                    # hidden transport retries or backoff to a bounded request.
+                    raise
+
                 if _is_connection_error(e):
                     # Connection-level error — the request never reached the
                     # server, so it is safe to retry regardless of max_retries.
@@ -769,7 +794,8 @@ class APIClient:
                         transport_error = WeaverAPIError(
                             503,
                             "transport_unavailable",
-                            f"{method} {path} failed after {connection_error_count} connection attempts",
+                            f"{method} {path} failed after "
+                            f"{connection_error_count} connection attempts",
                             True,
                         )
                         raise transport_error from e

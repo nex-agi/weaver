@@ -197,6 +197,15 @@ Requests may pass request metadata and caller-owned
 supplies `model_input`, `target_tokens`, `loss_mask`, and `weights`, so callers cannot
 use those names in a managed datum's `loss_fn_inputs`.
 
+For a cold managed dataset, `service.datasets.prepare_sample_ref_lengths(...)`
+prepares only the references you request, using `base_model` and the exact
+`training_max_sequence_length` you will use for model creation. This call uses a
+session and does not create a GPU-backed model. Sync and async clients support
+the same `wait`, `timeout` and `poll_interval` controls. Use bounded batch or
+lookahead windows; preparing every reference upfront defeats dynamic cold start.
+Authorization, failed preprocessing and protocol errors fail immediately;
+explicit retryable preparation states are waited for within the deadline.
+
 A protected response carries a server-resolved `content_visibility="protected"`; any
 token-identity array contains only the response-only `-8` sentinel at the true length, and
 label-dependent per-token outputs such as logprobs and elementwise loss are rejected.

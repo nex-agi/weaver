@@ -19,7 +19,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, overload
 
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizerBase
 
 from . import _sampling_utils as _su
 from ._utils import lookup_case_insensitive
@@ -48,7 +48,7 @@ class AsyncSamplingClient:
         self.model_path = model_path
         self.model_id = model_id
         self.tokenizer_path = tokenizer_path
-        self._tokenizer: PreTrainedTokenizer | None = None
+        self._tokenizer: PreTrainedTokenizerBase | None = None
         # Cached result of the generation-control eligibility check; a model's
         # training mode is fixed at creation, so one confirmation is enough.
         self._is_full_ft = False
@@ -241,7 +241,7 @@ class AsyncSamplingClient:
             raise RuntimeError("sampling session is missing base_model")
         self.base_model = str(base_model)
 
-    def _ensure_tokenizer(self) -> PreTrainedTokenizer:
+    def _ensure_tokenizer(self) -> PreTrainedTokenizerBase:
         if self._tokenizer is not None:
             return self._tokenizer
         from transformers import AutoTokenizer

@@ -24,7 +24,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from transformers import PreTrainedTokenizer
+from transformers import PreTrainedTokenizerBase
 
 from ._utils import lookup_case_insensitive
 from .score_centering import REF_FIELD, SAMPLER_FIELDS
@@ -34,7 +34,7 @@ from .types.sampling_control import coerce_pause_mode
 if TYPE_CHECKING:
     from .types import PauseMode
 
-TokenizerProvider = Callable[[], PreTrainedTokenizer]
+TokenizerProvider = Callable[[], PreTrainedTokenizerBase]
 
 
 def sampling_prompt_payload(prompt: ModelInput) -> Dict[str, Any]:
@@ -253,7 +253,7 @@ def sequences_from_result(
     existing_sequences = result.get("sequences")
     sequences: List[Dict[str, Any]] = []
     if isinstance(existing_sequences, list):
-        tokenizer: Optional[PreTrainedTokenizer] = None
+        tokenizer: Optional[PreTrainedTokenizerBase] = None
         for raw in existing_sequences:
             if not isinstance(raw, dict):
                 continue
