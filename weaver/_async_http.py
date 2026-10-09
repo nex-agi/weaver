@@ -27,7 +27,9 @@ import hashlib
 import logging
 import os
 import tempfile
-from typing import Any, BinaryIO, Mapping, MutableMapping
+import time
+from collections.abc import Mapping, MutableMapping
+from typing import Any, BinaryIO
 
 import httpx
 from opentelemetry import baggage, context, trace
@@ -161,7 +163,7 @@ async def _open_temporary_file() -> BinaryIO:
         raise
 
 
-def _close_completed_file(task: "asyncio.Task[BinaryIO]") -> None:
+def _close_completed_file(task: asyncio.Task[BinaryIO]) -> None:
     try:
         task.result().close()
     except BaseException:
@@ -212,7 +214,7 @@ class AsyncAPIClient:
         self._client = self._build_client()
         self._pid = current_pid
 
-    async def __aenter__(self) -> "AsyncAPIClient":
+    async def __aenter__(self) -> AsyncAPIClient:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -234,8 +236,11 @@ class AsyncAPIClient:
         json: Any = None,
         params: Mapping[str, Any] | None = None,
         max_retries: int | None = None,
+        deadline: float | None = None,
     ) -> Any:
-        return await self._request("POST", path, params=params, json=json, max_retries=max_retries)
+        return await self._request(
+            "POST", path, params=params, json=json, max_retries=max_retries, deadline=deadline
+        )
 
     async def post_tensor_multipart(
         self,
@@ -362,6 +367,7 @@ class AsyncAPIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        deadline: float | None = None,
     ) -> Any:
         model_id = extract_model_id_from_path(path)
 
@@ -376,7 +382,13 @@ class AsyncAPIClient:
         ) as span:
             apply_request_span_attributes(span, method, path, model_id)
             return await self._request_with_retries(
-                span, method, path, params=params, json=json, max_retries=max_retries
+                span,
+                method,
+                path,
+                params=params,
+                json=json,
+                max_retries=max_retries,
+                deadline=deadline,
             )
 
     async def _request_with_retries(
@@ -388,6 +400,7 @@ class AsyncAPIClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         max_retries: int | None = None,
+        deadline: float | None = None,
     ) -> Any:
         """Async mirror of :meth:`APIClient._request_with_retries`.
 
@@ -408,9 +421,17 @@ class AsyncAPIClient:
                 headers = dict(self._client.headers or {})
                 inject(headers)  # Adds 'traceparent' header with trace context
 
+                request_options: dict[str, Any] = {}
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("HTTP request deadline exceeded")
+                    request_options["timeout"] = remaining
                 response = await self._client.request(
-                    method, path, params=params, json=json, headers=headers
+                    method, path, params=params, json=json, headers=headers, **request_options
                 )
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("HTTP request deadline exceeded")
 
                 span.set_attribute("http.status_code", response.status_code)
 
@@ -458,6 +479,11 @@ class AsyncAPIClient:
             except Exception as e:  # pylint: disable=broad-except
                 last_exception = e
                 span.record_exception(e)
+
+                if deadline is not None:
+                    # The caller owns deadline/readiness retry policy. Do not add
+                    # hidden transport retries or backoff to a bounded request.
+                    raise
 
                 if _is_connection_error(e):
                     connection_error_count += 1

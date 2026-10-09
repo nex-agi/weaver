@@ -16,14 +16,31 @@
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+import asyncio
+import builtins
+import time
+from collections.abc import Mapping, Sequence
+from typing import Any
 from urllib.parse import quote
 
+import httpx
+
+from ._http import WeaverAPIError
+from ._managed_preparation import (
+    PREPARATION_CHUNK_ITEMS,
+    preparation_remaining,
+    preparation_request,
+    preparation_retry_delay,
+    validate_preparation_wait,
+)
 from .types.managed_dataset import (
     ManagedDatasetInfo,
     ManagedDatasetPage,
+    SampleRef,
+    SampleRefLength,
     _dataset_name,
     _dataset_version,
+    parse_sample_ref_lengths,
 )
 
 
@@ -101,6 +118,85 @@ class ManagedDatasetsClient:
             raise ValueError("managed dataset response does not match the requested version")
         return info
 
+    def prepare_sample_ref_lengths(
+        self,
+        refs: Sequence[SampleRef],
+        *,
+        base_model: str,
+        training_max_sequence_length: int,
+        wait: bool = True,
+        timeout: float = 300.0,
+        poll_interval: float = 1.0,
+    ) -> builtins.list[SampleRefLength]:
+        """Prepare requested samples before creating a GPU-backed training model.
+
+        Args:
+            refs: Current batch or bounded lookahead references.
+            base_model: Exact model registry name.
+            training_max_sequence_length: Exact subsequent training budget.
+            wait: Wait for explicitly retryable preparation states.
+            timeout: Preparation deadline in seconds, including session setup.
+                Async cancels in-flight calls; sync caps each socket phase to
+                remaining time and rejects late replies.
+            poll_interval: Minimum retry delay, in seconds.
+
+        Returns:
+            Authoritative lengths in reference order; no token arrays or private IDs.
+        """
+        requested = list(refs)
+        validate_preparation_wait(wait=wait, timeout=timeout, poll_interval=poll_interval)
+        if not requested:
+            return []
+        # Validate before even initializing a session or submitting CPU work.
+        preparation_request(
+            requested[:PREPARATION_CHUNK_ITEMS],
+            base_model=base_model,
+            training_max_sequence_length=training_max_sequence_length,
+        )
+        if not all(isinstance(ref, SampleRef) for ref in requested):
+            raise TypeError("refs must contain only SampleRef values")
+        deadline = time.monotonic() + timeout
+        self._service.ensure_session()
+        preparation_remaining(deadline, time.monotonic())
+        path = f"/api/v1/sessions/{self._service.session_id}/managed-dataset-sample-lengths"
+        results: builtins.list[SampleRefLength] = []
+        known: dict[SampleRef, int] = {}
+        for start in range(0, len(requested), PREPARATION_CHUNK_ITEMS):
+            chunk = requested[start : start + PREPARATION_CHUNK_ITEMS]
+            body = preparation_request(
+                chunk,
+                base_model=base_model,
+                training_max_sequence_length=training_max_sequence_length,
+            )
+            while True:
+                try:
+                    preparation_remaining(deadline, time.monotonic())
+                    payload = self._service.http.post(
+                        path, json=body, max_retries=1, deadline=deadline
+                    )
+                    preparation_remaining(deadline, time.monotonic())
+                    break
+                except httpx.TimeoutException as error:
+                    raise TimeoutError("Timed out preparing managed samples") from error
+                except WeaverAPIError as error:
+                    delay = preparation_retry_delay(
+                        error,
+                        wait=wait,
+                        remaining=deadline - time.monotonic(),
+                        poll_interval=poll_interval,
+                    )
+                    time.sleep(delay)
+            parsed = parse_sample_ref_lengths(chunk, payload)
+            for item in parsed:
+                if (
+                    item.input_token_count >= training_max_sequence_length
+                    or known.setdefault(item.sample_ref, item.input_token_count)
+                    != item.input_token_count
+                ):
+                    raise ValueError("prepared sample lengths violate their exact contract")
+            results.extend(parsed)
+        return results
+
 
 class AsyncManagedDatasetsClient:
     """Authorized managed-dataset catalog bound to an asynchronous service."""
@@ -140,3 +236,85 @@ class AsyncManagedDatasetsClient:
         if (info.name, info.version) != expected:
             raise ValueError("managed dataset response does not match the requested version")
         return info
+
+    async def prepare_sample_ref_lengths(
+        self,
+        refs: Sequence[SampleRef],
+        *,
+        base_model: str,
+        training_max_sequence_length: int,
+        wait: bool = True,
+        timeout: float = 300.0,
+        poll_interval: float = 1.0,
+    ) -> builtins.list[SampleRefLength]:
+        """Prepare a bounded sample window without allocating a training model.
+
+        Args:
+            refs: Current batch or bounded lookahead references.
+            base_model: Exact model registry name.
+            training_max_sequence_length: Exact subsequent training budget.
+            wait: Wait for explicitly retryable preparation states.
+            timeout: Preparation deadline in seconds, including session setup.
+                Async cancels in-flight calls; sync caps each socket phase to
+                remaining time and rejects late replies.
+            poll_interval: Minimum retry delay, in seconds.
+
+        Returns:
+            Authoritative lengths in reference order.
+        """
+        requested = list(refs)
+        validate_preparation_wait(wait=wait, timeout=timeout, poll_interval=poll_interval)
+        if not requested:
+            return []
+        preparation_request(
+            requested[:PREPARATION_CHUNK_ITEMS],
+            base_model=base_model,
+            training_max_sequence_length=training_max_sequence_length,
+        )
+        if not all(isinstance(ref, SampleRef) for ref in requested):
+            raise TypeError("refs must contain only SampleRef values")
+        deadline = time.monotonic() + timeout
+        remaining = preparation_remaining(deadline, time.monotonic())
+        try:
+            await asyncio.wait_for(self._service.ensure_session(), timeout=remaining)
+        except asyncio.TimeoutError as error:
+            raise TimeoutError("Timed out preparing managed samples") from error
+        path = f"/api/v1/sessions/{self._service.session_id}/managed-dataset-sample-lengths"
+        results: builtins.list[SampleRefLength] = []
+        known: dict[SampleRef, int] = {}
+        for start in range(0, len(requested), PREPARATION_CHUNK_ITEMS):
+            chunk = requested[start : start + PREPARATION_CHUNK_ITEMS]
+            body = preparation_request(
+                chunk,
+                base_model=base_model,
+                training_max_sequence_length=training_max_sequence_length,
+            )
+            while True:
+                try:
+                    remaining = preparation_remaining(deadline, time.monotonic())
+                    payload = await asyncio.wait_for(
+                        self._service.http.post(path, json=body, max_retries=1, deadline=deadline),
+                        timeout=remaining,
+                    )
+                    preparation_remaining(deadline, time.monotonic())
+                    break
+                except (httpx.TimeoutException, asyncio.TimeoutError) as error:
+                    raise TimeoutError("Timed out preparing managed samples") from error
+                except WeaverAPIError as error:
+                    delay = preparation_retry_delay(
+                        error,
+                        wait=wait,
+                        remaining=deadline - time.monotonic(),
+                        poll_interval=poll_interval,
+                    )
+                    await asyncio.sleep(delay)
+            parsed = parse_sample_ref_lengths(chunk, payload)
+            for item in parsed:
+                if (
+                    item.input_token_count >= training_max_sequence_length
+                    or known.setdefault(item.sample_ref, item.input_token_count)
+                    != item.input_token_count
+                ):
+                    raise ValueError("prepared sample lengths violate their exact contract")
+            results.extend(parsed)
+        return results
