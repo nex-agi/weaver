@@ -275,7 +275,10 @@ class AsyncManagedDatasetsClient:
             raise TypeError("refs must contain only SampleRef values")
         deadline = time.monotonic() + timeout
         remaining = preparation_remaining(deadline, time.monotonic())
-        await asyncio.wait_for(self._service.ensure_session(), timeout=remaining)
+        try:
+            await asyncio.wait_for(self._service.ensure_session(), timeout=remaining)
+        except asyncio.TimeoutError as error:
+            raise TimeoutError("Timed out preparing managed samples") from error
         path = f"/api/v1/sessions/{self._service.session_id}/managed-dataset-sample-lengths"
         results: builtins.list[SampleRefLength] = []
         known: dict[SampleRef, int] = {}
@@ -295,7 +298,7 @@ class AsyncManagedDatasetsClient:
                     )
                     preparation_remaining(deadline, time.monotonic())
                     break
-                except httpx.TimeoutException as error:
+                except (httpx.TimeoutException, asyncio.TimeoutError) as error:
                     raise TimeoutError("Timed out preparing managed samples") from error
                 except WeaverAPIError as error:
                     delay = preparation_retry_delay(
