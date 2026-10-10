@@ -24,6 +24,7 @@ import pytest
 
 import weaver.async_training_client as async_training_client_module
 import weaver.training_client as training_client_module
+from weaver._http import WeaverAPIError
 from weaver._utils import DEFAULT_SAMPLER_TTL_SECONDS
 from weaver.async_training_client import AsyncTrainingClient
 from weaver.operations import AsyncOperationHandle, OperationHandle
@@ -35,10 +36,15 @@ from weaver.types.checkpoint import Checkpoint
 # ---------------------------------------------------------------------------
 
 
+def _legacy_checkpoint_capabilities():
+    return {"protocol_version": 1, "default_backend": "gpfs", "save_state_backends": ["gpfs"]}
+
+
 def _make_training_client() -> TrainingClient:
     """Create a TrainingClient with a mocked ServiceClient."""
     service = MagicMock()
     service.next_operation_seq.return_value = 1
+    service.http.get.return_value = _legacy_checkpoint_capabilities()
     return TrainingClient(
         service=service,
         model_id="mdl-123",
@@ -58,7 +64,7 @@ def _make_async_training_client() -> AsyncTrainingClient:
     service = MagicMock()
     service.next_operation_seq.return_value = 1
     service.enqueue_operation = AsyncMock()
-    service.http.get = AsyncMock()
+    service.http.get = AsyncMock(return_value=_legacy_checkpoint_capabilities())
     return AsyncTrainingClient(
         service=service,
         model_id="mdl-123",
@@ -159,6 +165,7 @@ class TestSaveState:
         tc = _make_training_client()
         tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": []},
             {"items": [_checkpoint_payload("ckpt-race")]},
         ]
@@ -174,6 +181,7 @@ class TestSaveState:
         old = _checkpoint_payload("ckpt-old")
         new = _checkpoint_payload("ckpt-new")
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": [old]},
             {"items": [old, new]},
         ]
@@ -188,6 +196,7 @@ class TestSaveState:
         tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
         old = _checkpoint_payload("ckpt-old")
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": [old]},
             {
                 "items": [
@@ -206,6 +215,7 @@ class TestSaveState:
         tc = _make_training_client()
         tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": []},  # pre-save snapshot
             {"items": []},  # first recovery poll
             {"items": [_checkpoint_payload("ckpt-later")]},
@@ -214,12 +224,13 @@ class TestSaveState:
         checkpoint = tc.save_state(name="step-race")
 
         assert checkpoint.id == "ckpt-later"
-        assert tc._service.http.get.call_count == 3
+        assert tc._service.http.get.call_count == 4
 
     def test_save_state_uses_partial_operation_id(self):
         tc = _make_training_client()
         tc._service.enqueue_operation.return_value = _make_handle({"id": "ckpt-new"})
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": [_checkpoint_payload("ckpt-old")]},
             {
                 "items": [
@@ -237,7 +248,11 @@ class TestSaveState:
         monkeypatch.setattr(training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0,))
         tc = _make_training_client()
         tc._service.enqueue_operation.return_value = _make_handle({"saved": True})
-        tc._service.http.get.return_value = {"items": []}
+        tc._service.http.get.side_effect = lambda path: (
+            _legacy_checkpoint_capabilities()
+            if path.endswith("/storage-capabilities")
+            else {"items": []}
+        )
 
         with pytest.raises(RuntimeError, match="returned no checkpoint metadata"):
             tc.save_state(name="missing")
@@ -250,6 +265,7 @@ class TestAsyncSaveState:
         handle.result = AsyncMock(return_value={"saved": True})
         tc._service.enqueue_operation.return_value = handle
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": []},
             {"items": [_checkpoint_payload("ckpt-race")]},
         ]
@@ -267,6 +283,7 @@ class TestAsyncSaveState:
         old = _checkpoint_payload("ckpt-old")
         new = _checkpoint_payload("ckpt-new")
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": [old]},
             {"items": [old, new]},
         ]
@@ -282,6 +299,7 @@ class TestAsyncSaveState:
         handle.result = AsyncMock(return_value={"saved": True})
         tc._service.enqueue_operation.return_value = handle
         tc._service.http.get.side_effect = [
+            _legacy_checkpoint_capabilities(),  # New permanent-save preference negotiation.
             {"items": []},
             {"items": []},
             {"items": [_checkpoint_payload("ckpt-later")]},
@@ -290,7 +308,7 @@ class TestAsyncSaveState:
         checkpoint = asyncio.run(tc.save_state(name="step-race"))
 
         assert checkpoint.id == "ckpt-later"
-        assert tc._service.http.get.await_count == 3
+        assert tc._service.http.get.await_count == 4
 
     def test_recovery_polling_remains_cancellation_responsive(self, monkeypatch):
         monkeypatch.setattr(async_training_client_module, "CHECKPOINT_RECOVERY_DELAYS", (0.0, 60.0))
@@ -305,6 +323,8 @@ class TestAsyncSaveState:
 
             async def list_empty(_path):
                 nonlocal listing_count
+                if _path.endswith("/storage-capabilities"):
+                    return _legacy_checkpoint_capabilities()
                 listing_count += 1
                 if listing_count == 2:
                     second_listing_finished.set()
@@ -325,7 +345,11 @@ class TestAsyncSaveState:
         handle = MagicMock(spec=AsyncOperationHandle)
         handle.result = AsyncMock(return_value={"saved": True})
         tc._service.enqueue_operation.return_value = handle
-        tc._service.http.get.return_value = {"items": []}
+        tc._service.http.get.side_effect = lambda path: (
+            _legacy_checkpoint_capabilities()
+            if path.endswith("/storage-capabilities")
+            else {"items": []}
+        )
 
         with pytest.raises(RuntimeError, match="returned no checkpoint metadata"):
             asyncio.run(tc.save_state(name="missing"))
@@ -716,3 +740,235 @@ class TestSetCheckpointTTL:
         body = tc._service.http.patch.call_args[1]["json"]
         assert body["path"] == "weaver://ckpt-1"
         assert body["ttl_seconds"] == 3600
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("backend", [None, "gpfs", "artifact"])
+def test_checkpoint_backend_selection_compatible_defaults(asynchronous, backend):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.return_value = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+    }
+    if asynchronous:
+        asyncio.run(client.save_state(name="mixed", storage_backend=backend, wait=False))
+    else:
+        client.save_state(name="mixed", storage_backend=backend, wait=False)
+    args = client._service.enqueue_operation.call_args[0]
+    assert args[0] == "/api/v1/models/mdl-123/checkpoints" + (
+        "/managed" if backend == "artifact" else ""
+    )
+    body = args[1]
+    assert body == (
+        {"name": "mixed", "type": "weight"}
+        if backend is None
+        else {"name": "mixed", "type": "weight", "storage_backend": backend}
+    )
+    if backend in (None, "artifact"):
+        client._service.http.get.assert_called_once_with(
+            "/api/v1/models/mdl-123/storage-capabilities"
+        )
+    else:
+        client._service.http.get.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        None,
+        {},
+        {"protocol_version": True, "default_backend": "gpfs", "save_state_backends": ["artifact"]},
+        {"protocol_version": 1, "default_backend": "gpfs", "save_state_backends": ["gpfs"]},
+        "old server response",
+    ],
+)
+def test_managed_checkpoint_requires_explicit_capability(asynchronous, capabilities):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.return_value = capabilities
+    with pytest.raises(RuntimeError, match="managed checkpoint saves"):
+        if asynchronous:
+            asyncio.run(client.save_state(name="managed", storage_backend="artifact", wait=False))
+        else:
+            client.save_state(name="managed", storage_backend="artifact", wait=False)
+    client._service.enqueue_operation.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_old_server_rejects_explicit_managed_before_post(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.side_effect = WeaverAPIError(404, "not_found", "old server", False)
+    with pytest.raises(RuntimeError, match="does not support"):
+        if asynchronous:
+            asyncio.run(client.save_state(name="managed", storage_backend="artifact", wait=False))
+        else:
+            client.save_state(name="managed", storage_backend="artifact", wait=False)
+    client._service.enqueue_operation.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_storage_rollback_rechecks_capability_each_save(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.side_effect = [
+        {
+            "protocol_version": 1,
+            "default_backend": "gpfs",
+            "save_state_backends": ["gpfs", "artifact"],
+        },
+        {"protocol_version": 1, "default_backend": "gpfs", "save_state_backends": ["gpfs"]},
+    ]
+
+    def save(name):
+        if asynchronous:
+            return asyncio.run(client.save_state(name=name, storage_backend="artifact", wait=False))
+        return client.save_state(name=name, storage_backend="artifact", wait=False)
+
+    save("before-rollback")
+    with pytest.raises(RuntimeError, match="does not currently allow"):
+        save("after-rollback")
+    assert client._service.enqueue_operation.call_count == 1
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_invalid_checkpoint_backend_has_no_io(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    with pytest.raises(ValueError, match="storage_backend"):
+        if asynchronous:
+            asyncio.run(client.save_state(storage_backend="unknown", wait=False))
+        else:
+            client.save_state(storage_backend="unknown", wait=False)
+    client._service.http.get.assert_not_called()
+    client._service.enqueue_operation.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_new_capability_old_writer_rollout_cannot_silently_write_gpfs(asynchronous):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    client._service.http.get.return_value = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+    }
+    # An old server has no managed route. It must fail before accepting a write,
+    # even if capability discovery happened on a different, upgraded server.
+    client._service.enqueue_operation.side_effect = WeaverAPIError(
+        404, "not_found", "old writer", False
+    )
+    with pytest.raises(WeaverAPIError):
+        if asynchronous:
+            asyncio.run(
+                client.save_state(name="mixed-rollout", storage_backend="artifact", wait=False)
+            )
+        else:
+            client.save_state(name="mixed-rollout", storage_backend="artifact", wait=False)
+    assert client._service.enqueue_operation.call_args[0][0].endswith("/checkpoints/managed")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "selection",
+    [
+        "preferred",
+        "legacy_response",
+        "rollback",
+        "explicit_gpfs",
+        "ttl",
+        "sampling_ttl",
+        "sampling_permanent",
+        "bad_preference",
+        "unsupported",
+        "old_server",
+        "denied",
+        "null_response",
+        "empty_response",
+    ],
+)
+def test_permanent_checkpoint_preference_negotiation_and_legacy_compatibility(
+    asynchronous, selection
+):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    caps = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+        "preferred_permanent_checkpoint_backend": "artifact",
+    }
+    kwargs = {"wait": False}
+    if selection == "legacy_response":
+        caps.pop("preferred_permanent_checkpoint_backend")
+    if selection == "rollback":
+        caps["preferred_permanent_checkpoint_backend"] = "gpfs"
+    if selection == "explicit_gpfs":
+        kwargs["storage_backend"] = "gpfs"
+    if selection == "ttl":
+        kwargs["ttl_seconds"] = 3600
+    if selection == "sampling_ttl":
+        kwargs["checkpoint_type"] = "sampling"
+    if selection == "sampling_permanent":
+        kwargs.update(checkpoint_type="sampling", ttl_seconds=None)
+    if selection == "bad_preference":
+        caps["preferred_permanent_checkpoint_backend"] = True
+    if selection == "unsupported":
+        caps["save_state_backends"] = ["gpfs"]
+    client._service.http.get.return_value = (
+        None if selection == "null_response" else {} if selection == "empty_response" else caps
+    )
+    if selection == "old_server":
+        client._service.http.get.side_effect = WeaverAPIError(404, "not_found", "old server", False)
+    if selection == "denied":
+        client._service.http.get.side_effect = WeaverAPIError(403, "forbidden", "denied", False)
+
+    def save():
+        return (
+            asyncio.run(client.save_state(**kwargs))
+            if asynchronous
+            else client.save_state(**kwargs)
+        )
+
+    if selection in ("bad_preference", "unsupported", "denied", "null_response", "empty_response"):
+        with pytest.raises(WeaverAPIError if selection == "denied" else RuntimeError):
+            save()
+        client._service.enqueue_operation.assert_not_called()
+        return
+    save()
+    path, body = client._service.enqueue_operation.call_args[0]
+    managed = selection in ("preferred", "sampling_permanent")
+    assert path.endswith("/checkpoints/managed" if managed else "/checkpoints")
+    assert body.get("storage_backend") == (
+        "artifact" if managed else "gpfs" if selection == "explicit_gpfs" else None
+    )
+    if selection == "sampling_permanent":
+        assert body["ttl_seconds"] is None
+    if selection in ("ttl", "sampling_ttl"):
+        assert body["ttl_seconds"] == DEFAULT_SAMPLER_TTL_SECONDS
+    assert client._service.http.get.call_count == (
+        0 if selection in ("explicit_gpfs", "ttl", "sampling_ttl") else 1
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_checkpoint_preference_refreshes_after_rollback_without_changing_previous_request(
+    asynchronous,
+):
+    client = _make_async_training_client() if asynchronous else _make_training_client()
+    base = {
+        "protocol_version": 1,
+        "default_backend": "gpfs",
+        "save_state_backends": ["gpfs", "artifact"],
+    }
+    client._service.http.get.side_effect = [
+        {**base, "preferred_permanent_checkpoint_backend": "artifact"},
+        {**base, "preferred_permanent_checkpoint_backend": "gpfs"},
+    ]
+    for _ in range(2):
+        if asynchronous:
+            asyncio.run(client.save_state(wait=False))
+        else:
+            client.save_state(wait=False)
+    calls = client._service.enqueue_operation.call_args_list
+    assert (
+        calls[0].args[0].endswith("/managed") and calls[0].args[1]["storage_backend"] == "artifact"
+    )
+    assert not calls[1].args[0].endswith("/managed") and "storage_backend" not in calls[1].args[1]
+    assert client._service.http.get.call_count == 2

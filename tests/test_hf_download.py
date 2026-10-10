@@ -28,11 +28,7 @@ import pytest
 from click.testing import CliRunner
 
 from weaver import _async_http, _http, _safeio, async_service_client, service_client
-from weaver._artifacts import (
-    descriptor_files,
-    parse_download_target,
-    select_artifact_payload,
-)
+from weaver._artifacts import descriptor_files, parse_download_target, select_artifact_payload
 from weaver._http import DownloadURLExpiredError, stream_download_to_file
 from weaver.async_service_client import AsyncServiceClient
 from weaver.cli import cli

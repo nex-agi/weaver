@@ -30,6 +30,7 @@ from .async_service_client import AsyncServiceClient  # noqa: F401
 from .async_training_client import AsyncTrainingClient  # noqa: F401
 from .operations import AsyncOperationHandle, OperationHandle  # noqa: F401
 from .service_client import ServiceClient  # noqa: F401
+from .tensor_upload import TensorUploadInterrupted, get_tensor_upload_recovery_path  # noqa: F401
 from .training_outputs import align_training_outputs, attach_loss_fn_outputs  # noqa: F401
 from .types.deployment import Deployment  # noqa: F401
 from .types.managed_dataset import (  # noqa: F401
@@ -56,6 +57,8 @@ __all__ = [
     "AsyncSamplingClient",
     "AsyncOperationHandle",
     "WeaverAPIError",
+    "TensorUploadInterrupted",
+    "get_tensor_upload_recovery_path",
     "WEAVER_REDACTED_TOKEN_ID",
     "ManagedDatasetInfo",
     "ManagedDatasetPage",

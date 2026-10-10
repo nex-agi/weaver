@@ -27,7 +27,10 @@ import hashlib
 import logging
 import os
 import tempfile
-from typing import Any, BinaryIO, Mapping, MutableMapping
+import time
+from collections.abc import Mapping, MutableMapping
+from typing import Any, BinaryIO
+from uuid import uuid4
 
 import httpx
 from opentelemetry import baggage, context, trace
@@ -55,6 +58,8 @@ from ._http import (
     raise_for_response,
 )
 from ._telemetry import get_tracer
+from ._tensor_read import READ_MEDIA_TYPE, async_direct_result_stream, decode_read_metadata
+from ._tensor_upload import FALLBACK, async_resume_remote_tensor, async_submit_remote_tensor
 from .config import TensorCompression, WeaverConfig
 from .tensor_transport import MultipartLayout, TensorPack, decompress_zstd_tensor_pack
 
@@ -161,7 +166,7 @@ async def _open_temporary_file() -> BinaryIO:
         raise
 
 
-def _close_completed_file(task: "asyncio.Task[BinaryIO]") -> None:
+def _close_completed_file(task: asyncio.Task[BinaryIO]) -> None:
     try:
         task.result().close()
     except BaseException:
@@ -212,7 +217,7 @@ class AsyncAPIClient:
         self._client = self._build_client()
         self._pid = current_pid
 
-    async def __aenter__(self) -> "AsyncAPIClient":
+    async def __aenter__(self) -> AsyncAPIClient:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
@@ -246,6 +251,10 @@ class AsyncAPIClient:
     ) -> Any:
         """Submit one non-retryable operation with a binary tensor attachment."""
 
+        remote = await async_submit_remote_tensor(self, path, request, tensor_pack)
+        if remote is not FALLBACK:
+            return remote
+
         layout = MultipartLayout(request, tensor_pack)
         model_id = extract_model_id_from_path(path)
         with self._tracer.start_as_current_span("weaver.post", kind=trace.SpanKind.CLIENT) as span:
@@ -275,6 +284,17 @@ class AsyncAPIClient:
                 span.set_status(Status(StatusCode.ERROR, str(exc)))
                 raise
 
+    async def resume_tensor_upload(self, recovery_path: str) -> Any:
+        """Resume an interrupted upload with its original owner/model/nonce.
+
+        Args:
+            recovery_path: Private local journal from TensorUploadInterrupted.
+
+        Returns:
+            The original admitted operation JSON.
+        """
+        return await async_resume_remote_tensor(self, recovery_path)
+
     async def download_tensor_pack(
         self,
         operation_id: str,
@@ -298,8 +318,11 @@ class AsyncAPIClient:
         with self._tracer.start_as_current_span("weaver.get", kind=trace.SpanKind.CLIENT) as span:
             apply_request_span_attributes(span, "GET", path, None)
             self._ensure_fresh_client()
-            headers = dict(self._client.headers or {})
+            headers = httpx.Headers(self._client.headers)
             headers["Accept-Encoding"] = "identity"
+            headers["Accept"] = READ_MEDIA_TYPE
+            headers["X-Weaver-Tensor-Read-ID"] = str(uuid4())
+            started_at = time.monotonic()
             inject(headers)
             try:
                 async with self._client.stream("GET", path, headers=headers) as response:
@@ -308,20 +331,46 @@ class AsyncAPIClient:
                         await response.aread()
                         span.set_status(Status(StatusCode.ERROR, f"HTTP {response.status_code}"))
                         raise_for_response(response)
-                    _validate_tensor_pack_response_length(response, size_bytes)
-                    _validate_tensor_pack_response_metadata(
-                        response,
-                        codec=codec,
-                        decoded_size_bytes=expected_decoded_size,
-                    )
-                    async for chunk in response.aiter_raw(chunk_size=TENSOR_PACK_CHUNK_BYTES):
-                        if received + len(chunk) > size_bytes:
-                            raise ValueError(
-                                f"downloaded tensor pack exceeds expected {size_bytes} bytes"
-                            )
-                        await _await_blocking_io(wire_destination.write, chunk)
-                        digest.update(chunk)
-                        received += len(chunk)
+
+                    async def copy_chunks(chunks):
+                        nonlocal received
+                        async for chunk in chunks:
+                            if received + len(chunk) > size_bytes:
+                                raise ValueError(
+                                    f"downloaded tensor pack exceeds expected {size_bytes} bytes"
+                                )
+                            written = await _await_blocking_io(wire_destination.write, chunk)
+                            if written != len(chunk):
+                                raise ValueError("short tensor destination write")
+                            digest.update(chunk)
+                            received += len(chunk)
+
+                    if response.headers.get("content-type", "").split(";")[0] == READ_MEDIA_TYPE:
+                        raw = bytearray()
+                        async for chunk in response.aiter_raw(4096):
+                            raw.extend(chunk)
+                            if len(raw) > 32768:
+                                raise ValueError("result read metadata exceeds bound")
+                        plan = decode_read_metadata(bytes(raw))
+                        await response.aclose()
+                        pack = {
+                            "size_bytes": size_bytes,
+                            "sha256": expected_digest,
+                            "codec": codec,
+                            "decoded_size_bytes": expected_decoded_size,
+                        }
+                        async with async_direct_result_stream(
+                            self, plan, operation_id, pack, started_at
+                        ) as chunks:
+                            await copy_chunks(chunks)
+                    else:
+                        _validate_tensor_pack_response_length(response, size_bytes)
+                        _validate_tensor_pack_response_metadata(
+                            response,
+                            codec=codec,
+                            decoded_size_bytes=expected_decoded_size,
+                        )
+                        await copy_chunks(response.aiter_raw(chunk_size=TENSOR_PACK_CHUNK_BYTES))
                 if received != size_bytes:
                     raise ValueError(
                         f"downloaded tensor pack has {received} bytes, expected {size_bytes}"

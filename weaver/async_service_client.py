@@ -662,6 +662,18 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
             tokenizer_path=tokenizer_path,
         )
 
+    async def resume_tensor_upload(self, recovery_path: str) -> AsyncOperationHandle:
+        """Resume an interrupted input upload without allocating a new operation.
+
+        Args:
+            recovery_path: Private journal from ``TensorUploadInterrupted``.
+
+        Returns:
+            A handle for the original admitted operation.
+        """
+        response = await self.http.resume_tensor_upload(recovery_path)
+        return build_async_operation_handle(self.http, response)
+
     async def enqueue_operation(
         self,
         path: str,
@@ -942,7 +954,29 @@ class AsyncServiceClient:  # pylint: disable=too-many-public-methods
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         descriptor_path = f"/api/v1/artifacts/{artifact_id}/download"
-        files = descriptor_files(await self.http.get(descriptor_path))
+        descriptor = await self.http.get(descriptor_path)
+        files = descriptor_files(descriptor)
+        if descriptor.get("managed_read") is not None:
+            from ._artifact_read import async_download_managed_file
+
+            semaphore = asyncio.Semaphore(min(max_concurrency, len(files)))
+
+            async def managed_download(entry: ArtifactFile) -> None:
+                async with semaphore:
+                    await async_download_managed_file(self.http, artifact_id, entry, dest_dir)
+
+            tasks = [asyncio.create_task(managed_download(entry)) for entry in files]
+            try:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            return dest_dir
         urls = {entry.name: entry.url for entry in files}
         urls_lock = asyncio.Lock()
 

@@ -618,6 +618,18 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             tokenizer_path=tokenizer_path,
         )
 
+    def resume_tensor_upload(self, recovery_path: str) -> OperationHandle:
+        """Resume an interrupted input upload without allocating a new operation.
+
+        Args:
+            recovery_path: Private journal from ``TensorUploadInterrupted``.
+
+        Returns:
+            A handle for the original admitted operation.
+        """
+        response = self.http.resume_tensor_upload(recovery_path)
+        return build_operation_handle(self.http, response)
+
     def enqueue_operation(
         self,
         path: str,
@@ -957,8 +969,8 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
             dest: Directory the files are written into (created if missing).
             kind: Artifact kind (``"hf_model"`` or ``"hf_adapter"``) to select
                 when *target* is a checkpoint URI with several artifacts.
-            verify: If True (default), verify each file's sha256 against the
-                download manifest.
+            verify: Verify each legacy file's sha256 (default True). Managed
+                downloads always verify the immutable size and sha256.
             max_concurrency: Maximum number of files downloaded in parallel.
 
         Returns:
@@ -979,7 +991,19 @@ class ServiceClient:  # pylint: disable=too-many-public-methods
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         descriptor_path = f"/api/v1/artifacts/{artifact_id}/download"
-        files = descriptor_files(self.http.get(descriptor_path))
+        descriptor = self.http.get(descriptor_path)
+        files = descriptor_files(descriptor)
+        if descriptor.get("managed_read") is not None:
+            from ._artifact_read import download_managed_file
+
+            with ThreadPoolExecutor(max_workers=min(max_concurrency, len(files))) as pool:
+                futures = [
+                    pool.submit(download_managed_file, self.http, artifact_id, entry, dest_dir)
+                    for entry in files
+                ]
+                for future in futures:
+                    future.result()
+            return dest_dir
         urls = {entry.name: entry.url for entry in files}
         urls_lock = threading.Lock()
 

@@ -75,6 +75,36 @@ public response shape automatically. `Datum` construction, training calls, and r
 handling therefore do not need to change. Keep the `default` transport when connecting
 to an older Weaver server/trainer deployment that does not support binary tensor packs.
 
+When the server enables remote tensor uploads, `http-binary` prepares the upload
+with Weaver and sends tensor bytes directly to TOS. Weaver verifies persistence
+before admitting the original training operation. An older server or an explicit
+initial disabled response uses the existing multipart transport. After an ambiguous
+upload response, the SDK preserves the original upload rather than switching transports.
+
+If submission fails, `TensorUploadInterrupted` provides `recovery_path`, `source_path`
+and `upload_id`. Keep both local files and resume with the same endpoint and authorized
+identity; the private journal contains the original request and nonce, but no API key
+or signed URL:
+
+```python
+from weaver import ServiceClient, TensorUploadInterrupted
+
+try:
+    operation = training.forward_backward(data, loss_fn="cross_entropy", wait=False)
+except TensorUploadInterrupted as interrupted:
+    with ServiceClient() as client:
+        operation = client.resume_tensor_upload(str(interrupted.recovery_path))
+```
+
+`AsyncServiceClient` supports `await client.resume_tensor_upload(path)`. Async cancellation
+also preserves the source and journal. Use `get_tensor_upload_recovery_path(error)`
+from `weaver` on the caught `CancelledError` to retrieve a recorded journal; Python 3.10
+may retain the original cancellation exception in its context. The helper returns `None`
+when no journal was created. Resume returns a handle for the original operation,
+including when its admission succeeded but the response was lost. The SDK removes
+its pack and journal only after receiving that operation's admission acknowledgement.
+The private journal includes training metadata and should stay on protected storage.
+
 ## Quickstart
 
 ```python
@@ -212,6 +242,28 @@ preparation, LoRA / full fine-tuning, sampling, and checkpoint management.
 For a complete runnable script, see [`examples/pig_latin.py`](examples/pig_latin.py).
 For large packed datasets, [`examples/streaming_sft.py`](examples/streaming_sft.py)
 shows bounded token-budget batching and submit-ahead.
+
+### Sampling ref storage
+
+Sampling keeps the historical GPFS backend by default. Model-bound clients can
+explicitly request `ref_storage_backend="artifact"` for one supported ref output;
+the client checks the server's current model capability before submitting. Mask
+and distribution refs require full fine-tuning. Router Replay also supports LoRA
+when the server provides the model's routing dimensions:
+
+```python
+result = sampling_client.sample(
+    prompt=prompt,
+    return_moe_topk_indices=True,
+    ref_storage_backend="artifact",
+)
+router_ref = result["sequences"][0]["moe_topk_indices_ref"]
+```
+
+The returned ref is opaque and requires no object-store credentials in the public
+SDK. Immediate and deferred results validate the selected backend and model
+scope. Managed failures never retry as GPFS; use `"gpfs"` to explicitly retain the
+historical route. Sync and async clients expose the same options.
 
 ### Generation control (full fine-tuning only)
 
