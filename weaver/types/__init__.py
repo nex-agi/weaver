@@ -15,6 +15,23 @@
 """Public type helpers re-exported for ergonomic imports."""
 
 from .checkpoint import Checkpoint
+
+# Router-replay / payload-ref types are an internal protocol shared by NexRL and
+# weaver-trainer, not part of the SDK's public surface. They are re-exported here
+# only so those privileged consumers keep working, and are deliberately excluded
+# from __all__ below so a general SDK user never sees router-replay / ref
+# machinery. New consumers should import them from the submodule directly
+# (weaver.types.router_replay / weaver.types.payload_ref / weaver.types.composite_ref).
+from .composite_ref import (
+    COMPOSITE_REF_KIND,
+    COMPOSITE_REF_SCHEMA,
+    MAX_COMPOSITE_SEGMENTS,
+    CompositeRef,
+    CompositeSegment,
+    is_composite_ref,
+    merge_router_replay_prefix,
+    ref_meta,
+)
 from .datum import Datum
 from .deployment import Deployment
 from .logprobs import LogprobsParams
@@ -30,14 +47,13 @@ from .managed_dataset import (
 )
 from .model_input import ModelInput, ModelInputChunk
 from .optim import AdamParams
-
-# Router-replay / payload-ref types are an internal protocol shared by NexRL and
-# weaver-trainer, not part of the SDK's public surface. They are re-exported here
-# only so those privileged consumers keep working, and are deliberately excluded
-# from __all__ below so a general SDK user never sees router-replay / ref
-# machinery. New consumers should import them from the submodule directly
-# (weaver.types.router_replay / weaver.types.payload_ref).
-from .payload_ref import PayloadRef, PayloadRefMaterializationError, materialize_payload_ref
+from .payload_ref import (
+    PayloadRef,
+    PayloadRefMaterializationError,
+    PayloadRefMeta,
+    materialize_payload_ref,
+    parse_moe_topk_indices_ref,
+)
 from .router_replay import (
     ROUTER_REPLAY_DATUM_SCHEMA,
     ROUTER_REPLAY_FORMAT_TOKEN_LAYER_TOPK,
