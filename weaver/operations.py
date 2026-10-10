@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -156,6 +157,8 @@ class _OperationHandleMixin:
     _cached: Dict[str, Any]
     _response_cache: Any
     _response_source: Any
+    _pending_log_signature: Any
+    _pending_log_at: float
 
     @property
     def status(self) -> Optional[str]:
@@ -200,6 +203,53 @@ class _OperationHandleMixin:
         err = lookup_case_insensitive(self._cached, "error")
         return str(err) if err else None
 
+    @property
+    def pending_info(self) -> dict[str, Any] | None:
+        """Latest server-provided wait reason; absent on older servers."""
+        value = lookup_case_insensitive(self._cached, "pending_info")
+        return dict(value) if self.status == "pending" and isinstance(value, Mapping) else None
+
+    def _report_pending(self, started_at: float) -> None:
+        if self.status != "pending":
+            self._pending_log_signature = None
+            return
+        info = self.pending_info or {}
+        code = str(info.get("code") or "queued")
+        message = str(info.get("message") or "Operation is queued and has not started.")
+        elapsed = max(0, int(time.monotonic() - started_at))
+        reported = info.get("wait_seconds")
+        if isinstance(reported, (int, float)) and math.isfinite(reported) and reported >= 0:
+            elapsed = max(elapsed, int(reported))
+        # Short queues stay quiet. Confirmed scheduling waits are useful at once.
+        if (
+            elapsed < 30
+            and self._pending_log_signature is None
+            and code not in {"waiting_for_scheduling", "waiting_for_resources"}
+        ):
+            return
+        resources = info.get("resources")
+        resource_text = ""
+        if isinstance(resources, Mapping):
+            resource_text = (
+                f" Requested trainer resources: {resources.get('nodes', '?')} nodes, "
+                f"{resources.get('gpus_per_node', '?')} GPUs/node, "
+                f"{resources.get('trainer_memory_gib_per_node', '?')} GiB trainer memory/node."
+            )
+        signature = (code, message, resource_text)
+        now = time.monotonic()
+        if signature == self._pending_log_signature and now - self._pending_log_at < 60:
+            return
+        logger.warning(
+            "Operation %s pending for %ds [%s]: %s%s",
+            self.operation_id,
+            elapsed,
+            code,
+            message,
+            resource_text,
+        )
+        self._pending_log_signature = signature
+        self._pending_log_at = now
+
     def done(self) -> bool:
         status = self.status
         return status in {"done", "error"}
@@ -216,6 +266,8 @@ class OperationHandle(_OperationHandleMixin):
     _cached: Dict[str, Any]
     _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
     _response_source: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _pending_log_signature: Any = field(default=None, init=False, repr=False, compare=False)
+    _pending_log_at: float = field(default=0.0, init=False, repr=False, compare=False)
     _response_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False, compare=False
     )
@@ -267,6 +319,8 @@ class OperationHandle(_OperationHandleMixin):
             self._raise_if_failed()
             self._materialize_response()
             return self._cached
+        started_at = time.monotonic()
+        self._report_pending(started_at)
         for delay in _operation_poll_delays():
             time.sleep(delay)
             try:
@@ -286,6 +340,7 @@ class OperationHandle(_OperationHandleMixin):
                     )
                     continue
                 raise
+            self._report_pending(started_at)
             if self.done():
                 break
         if not self.done():
@@ -330,6 +385,8 @@ class AsyncOperationHandle(_OperationHandleMixin):
     _cached: Dict[str, Any]
     _response_cache: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
     _response_source: Any = field(default=_RESPONSE_UNSET, init=False, repr=False, compare=False)
+    _pending_log_signature: Any = field(default=None, init=False, repr=False, compare=False)
+    _pending_log_at: float = field(default=0.0, init=False, repr=False, compare=False)
     _response_lock: asyncio.Lock = field(
         default_factory=asyncio.Lock, init=False, repr=False, compare=False
     )
@@ -390,6 +447,8 @@ class AsyncOperationHandle(_OperationHandleMixin):
             self._raise_if_failed()
             await self._materialize_response()
             return self._cached
+        started_at = time.monotonic()
+        self._report_pending(started_at)
         for delay in _operation_poll_delays():
             await asyncio.sleep(delay)
             try:
@@ -409,6 +468,7 @@ class AsyncOperationHandle(_OperationHandleMixin):
                     )
                     continue
                 raise
+            self._report_pending(started_at)
             if self.done():
                 break
         if not self.done():
